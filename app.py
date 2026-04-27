@@ -678,6 +678,11 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
     # array) to keep the JS payload small. The modal pulls them on demand.
     _STATE["po_lines_by_key"] = {k: list(rec["po_lines"]) for k, rec in items.items()}
 
+    log_event(
+        "extract_rfq_list",
+        f"{kpis['item_count']:,} items / ${kpis['total_spend']:,.0f} total / difficulty {difficulty.get('score','?')}/100 {difficulty.get('level','')}",
+        related=_STATE.get("supplier_name", ""),
+    )
     return {"kpis": kpis, "items": out_items, "annual_spend": annual_out, "difficulty": difficulty}
 
 
@@ -1566,6 +1571,12 @@ def ingest_supplier_bid(file_bytes, supplier_name: str) -> dict:
     if "bids" not in _STATE or not isinstance(_STATE.get("bids"), dict):
         _STATE["bids"] = {}
     _STATE["bids"][supplier_name] = parsed
+    s = parsed.get("summary", {})
+    log_event(
+        "ingest_supplier_bid",
+        f"{s.get('n_lines',0):,} lines / {s.get('n_priced',0):,} priced / ${s.get('total_quoted_value',0):,.0f} quoted",
+        related=supplier_name,
+    )
     return parsed
 
 
@@ -1587,6 +1598,7 @@ def remove_supplier_bid(supplier_name: str) -> bool:
     if supplier_name in bids:
         del bids[supplier_name]
         _STATE["bids"] = bids
+        log_event("remove_supplier_bid", "bid removed", related=supplier_name)
         return True
     return False
 
@@ -2036,8 +2048,14 @@ def get_thresholds() -> dict:
 def set_thresholds(updates: dict) -> dict:
     """Update one or more thresholds. Returns the new merged state."""
     current = _STATE.get("thresholds", {}) or {}
-    current.update({k: v for k, v in (updates or {}).items() if k in DEFAULT_THRESHOLDS})
+    keys_changed = []
+    for k, v in (updates or {}).items():
+        if k in DEFAULT_THRESHOLDS and current.get(k) != v:
+            current[k] = v
+            keys_changed.append(k)
     _STATE["thresholds"] = current
+    if keys_changed:
+        log_event("set_thresholds", f"changed: {', '.join(keys_changed)}")
     return get_thresholds()
 
 
@@ -3011,7 +3029,46 @@ def serialize_state() -> dict:
         "difficulty_history":   _STATE.get("difficulty_history", []),
         "supplier_name":        _STATE.get("supplier_name", ""),
         "data_anchor_date":     _STATE.get("data_anchor_date"),
+        "audit_log":            _STATE.get("audit_log", []),
     }
+
+
+# ---------------------------------------------------------------------------
+# Audit log — discrete action-level event trail.
+#
+# Per the brief: every important action gets a row. Useful for:
+#   - "What did I do last Tuesday on the McMaster RFQ?" (period-end recap)
+#   - Director conversations: "show me the trail for this award decision"
+#   - Debugging: "why is the difficulty score 64 — when did it change?"
+# ---------------------------------------------------------------------------
+
+AUDIT_MAX_ENTRIES = 500
+
+
+def log_event(action_type: str, action_detail: str = "", related: str = "") -> None:
+    """Append an audit-log entry. action_type is short (verb + noun).
+    related is a free-form id (rfq_id, supplier_name, scenario_name, etc.)."""
+    if not action_type:
+        return
+    log = _STATE.setdefault("audit_log", [])
+    log.append({
+        "timestamp": datetime.now().isoformat(),
+        "action_type": action_type,
+        "action_detail": action_detail,
+        "related": related,
+    })
+    if len(log) > AUDIT_MAX_ENTRIES:
+        del log[:len(log) - AUDIT_MAX_ENTRIES]
+
+
+def list_audit_log(limit: int = None) -> list:
+    log = list(_STATE.get("audit_log", []))
+    log.reverse()  # most recent first
+    return log[:limit] if limit else log
+
+
+def clear_audit_log() -> None:
+    _STATE["audit_log"] = []
 
 
 def restore_state(payload: dict) -> None:
@@ -3086,6 +3143,7 @@ def delete_award_scenario(name: str) -> bool:
     sc = _get_scenarios()
     if name in sc:
         del sc[name]
+        log_event("delete_award_scenario", "scenario removed", related=name)
         return True
     return False
 
@@ -3300,6 +3358,11 @@ def save_award_scenario(name: str, strategy: str, parameters: dict = None,
                     "award_total", "historical_total", "savings_total",
                     "savings_pct", "award_by_supplier")},
     }
+    log_event(
+        "save_award_scenario",
+        f"strategy={strategy} / award_total=${evaluated['award_total']:,.0f} / savings=${evaluated['savings_total']:,.0f}",
+        related=name,
+    )
     return sc[name]
 
 
@@ -3539,6 +3602,11 @@ def gen_award_letter_xlsx(scenario_name: str, supplier_name: str,
 
     buf = io.BytesIO()
     wb.save(buf)
+    log_event(
+        "gen_award_letter",
+        f"scenario={scenario_name} / {n_items:,} items / ${award_total:,.0f}",
+        related=supplier_name,
+    )
     return buf.getvalue()
 
 

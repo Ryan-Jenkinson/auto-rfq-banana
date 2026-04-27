@@ -4,64 +4,118 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is for
 
-`auto-rfq-banana` is a self-contained, Windows-deployable browser app that automates the front end of Andersen MRO RFQ work: drop a multi-year supplier export, get a deduplicated candidate RFQ list with multi-window analytics, then (Phase 2+) generate per-supplier RFQ workbooks, ingest returned bids, and run side-by-side comparison with outlier flagging. Sibling to `supplier-pricing` (per-cycle price-file analysis) and `supplier-recon` (Coupa go-live).
+`auto-rfq-banana` is a self-contained, Windows-deployable browser app for the full Andersen MRO RFQ workflow: drop a multi-year supplier export → auto-build a candidate RFQ list with scoring + multi-window analytics → curate (smart trim by tier + description patterns) → generate per-supplier outbound RFQ workbooks → ingest returned bids → cross-supplier comparison with recommendations + outlier flagging → award scenarios → per-supplier award letters with strict isolation guard. Sibling to `supplier-pricing` (per-cycle price-file analysis) and `supplier-recon` (Coupa go-live).
 
-The architecture is the same proven Pyodide / openpyxl stack as those tools — Python in the browser via WebAssembly, no data leaves the user's machine, no AI, no CDN at runtime, IT-approval-free distribution. What differs is the **inverted data model**: instead of matching one supplier's new file against an item master, this app *builds* the master from the supplier's own multi-year history, then sends it back out to N suppliers for competitive bidding.
+Pyodide + openpyxl stack — Python in the browser via WebAssembly, all-local, no AI, no CDN at runtime, IT-approval-free at Andersen.
 
-The full plan (context, decisions, phase breakdown, files to port, hard constraints) lives at `~/.claude/plans/i-want-to-make-compressed-glacier.md`. Read it before any non-trivial change.
+**Data model is inverted from supplier-pricing**: instead of matching one supplier's new file against an item master, this app *builds* the master from the supplier's own multi-year history, then sends it back to N competing suppliers.
 
 ## Run the app
 
-For development on Mac, the simplest path:
-
 ```bash
 cd /Users/ryanjenkinson/Desktop/work/auto-rfq-banana
-python3 -m http.server 8000
-# then open http://localhost:8000/app.html
+python3 -m http.server 8801
+# open http://localhost:8801/app.html
 ```
 
-For Windows distribution, double-clicking `start.bat` does the same thing.
+Windows distribution: double-click `start.bat`.
 
 ## File map (4-file Pyodide pattern)
 
 | File | What it owns |
 |---|---|
-| `app.html` | DOM shell only — legal-gate markup, splash markup, step containers, script/link tags. Keep thin (~120 lines). |
-| `app.css` | All styling. Banana Split palette: chocolate ground (`#1a120a`), cream text (`#fdf6e3`), banana primary (`#fce985`), strawberry warnings (`#ff6f8e`). |
-| `app.js` | Boot diagnostics IIFE, legal-gate IIFE, splash + pixel character (gavel), Pyodide bootstrap, dropzone wiring, step transitions, table/chart render, xlsx download glue. |
-| `app.py` | All Python. Loaded via `fetch('./app.py').then(text => pyodide.runPythonAsync(text))`. Registers itself as `app_engine` in `sys.modules` so JS can call `from app_engine import ...`. |
-| `verify_rfq.py` | Sibling Python script — independent recompute of headline KPIs from the same source export, via a deliberately-different code path. Run with `python3 verify_rfq.py /path/to/export.xlsx`. The "going to a director, prove the math" red/green check. |
+| `app.html` | DOM shell — legal-gate, splash, step containers, script/link tags. ~250 lines. |
+| `app.css` | All styling. Bloomberg Terminal palette: deep navy ground (`#0a0e1a`), amber KPI accent (`#ffb733`), IBM Plex Sans + JetBrains Mono. ~220 lines. |
+| `app.js` | Boot diagnostics IIFE, legal-gate IIFE, splash + pixel banana, Pyodide bootstrap, all UI logic, save manager, scenario UI, follow-up + award letter download glue. |
+| `app.py` | All Python. Loaded via `fetch('./app.py').then(text => pyodide.runPythonAsync(text))`. Registers itself as `app_engine` in `sys.modules`. |
+| `verify_rfq.py` | Sibling Python — independent recompute of headline KPIs from the multi-year export. The "show me the math" red/green check. |
+| `verify_isolation.py` | Sibling Python — walks a folder of award letter xlsx files and flags any cell containing a foreign supplier name. Internal-audience files (banner contains "INTERNAL ... NEVER FORWARD" or filename starts with `INTERNAL`) are auto-skipped. |
 | `start.bat` | Windows launcher (`py -m http.server 8000` + open browser). |
-| `pyodide/`, `wheels/` | Local Pyodide runtime + `openpyxl` 3.1.5 + `et_xmlfile` 1.1.0. Bundled — no PyPI / CDN at runtime. |
+| `pyodide/`, `wheels/` | Local Pyodide runtime + `openpyxl` 3.1.5 + `et_xmlfile` 1.1.0. Bundled — no PyPI/CDN at runtime. |
 
-## Architecture details that aren't obvious from the file map
+## End-to-end workflow (4 steps in the UI)
 
-**Pyodide bootstrap order matters.** `app.js` runs the legal-gate IIFE first (top of file) so the gate is interactive even if everything below throws. Boot diagnostics + global error trap come even earlier — line 1 — so a silent JS hang turns into a visible "BOOT ERROR: …" on the loading overlay instead of an infinite "initializing…". When debugging "the app won't load", check the load-status text first.
+**Step 1 — Drop multi-year supplier export.** xlsx from Coupa/EAM PO history. Auto-detects sheet + row count.
 
-**Anchor "now" to the data, not the wall clock.** `extract_rfq_list` in `app.py` computes the 12/24/36-month windows relative to the *most recent order date* in the export, not `datetime.now()`. Exports are often a few weeks stale; using wall-clock would silently drop the most recent window of activity.
+**Step 2 — Confirm column mapping.** Auto-mapper uses two-pass logic (exact-equality first, substring fallback) to avoid banner-text false positives. Required: at least one of `item_num`/`eam_pn`/`part_number` (the dedup-key cascade), plus `description`, `order_date`, `qty`, `unit_price`. Note: **EAM is the usual primary key** for normal Andersen suppliers; McMaster is the outlier (cXML, blank EAM, lives in Part Number column).
 
-**Module-level state in `app.py`.** After `extract_rfq_list` runs, the result is cached in `_STATE` so `gen_candidate_rfq_list_xlsx` can read it without re-parsing. Don't refactor this away unless the xlsx generator can run in the same Python call as the extraction.
+**Step 3 — Candidate RFQ list with scoring + curation.** Auto-extracted, deduplicated, scored. Each item gets:
+- Score 0-100 (tier STRONG/MODERATE/WEAK/SKIP)
+- Demand flags (DORMANT_12MO, SINGLE_ORDER, STALE_OVER_12MO, etc.)
+- Description pattern flags (service / freight / tariff / obsolete / rental → red, custom / repair / misc → amber, generic → informational)
+- UOM-canonicalized + uom_mixed flag if multiple distinct UOMs
+- File-level difficulty rating snapshot recorded with timestamp for period-end reporting
 
-**Splash character.** Defined as a 22×30 grid of 2-char tokens in `SPLASH_GRID`/`SPLASH_PALETTE` (top of `app.js`). Each non-`..` token maps to a hex color and renders as a 1×1 SVG `<rect>`. Current character is a vertical gavel + sound block (placeholder for a fuller auctioneer figure later). To redesign: edit the grid, keep every row at exactly 22 tokens.
+UI affordances: tier filter / include-filter / search + min-spend filter, "Smart trim" bulk action (untick WEAK+SKIP + red-flagged desc patterns), bulk include/exclude all visible, manual per-row toggle, click-row → per-item history modal with order chart + 90-day median + spike detection + linear trend extrapolation, "Generate outbound RFQ files" button (multi-supplier).
+
+**Step 4 — Compare bids + scenarios + outputs.** Multi-file dropzone for returned bid xlsx. Each loaded bid → per-supplier intake card (priced/no-bid/need-info/UOM-disc/substitute counts + total quoted value + 📥 follow-up xlsx button). Then:
+- Coverage KPIs (3+/2/1/0 bids breakdown + outliers + lowest-bid total + historical baseline)
+- **Consolidation analysis** with carve-outs (Ryan's actual award strategy — pick one supplier, identify exceptions where another saves >30%). UOM-suspect carve-outs are flagged separately and excluded from counted savings.
+- **Comparison matrix** (items × suppliers) with recommendation chips (5-tier: ACCEPT / PUSH_BACK / ASK_CLARIFICATION / EXCLUDE / MANUAL_REVIEW), every recommendation carries a concrete reason string.
+- **Award scenarios** — save named what-ifs (lowest-price / lowest-qualified / consolidate-to-X / incumbent-preferred / manual). Side-by-side compare of any two. Per-scenario buttons: 📨 Letters (one award letter xlsx per awarded supplier with isolation guard), 📊 Internal (cross-supplier full-detail summary, "INTERNAL — NEVER FORWARD" banner).
+
+## Key architectural decisions
+
+**Anchor "now" to the data, not the wall clock.** All windowed aggregations + recency scoring use the dataset's max order date as "today", not `datetime.now()`. Exports are often weeks stale.
+
+**Per-row math is internally consistent.** In the RFQ-list table, `12mo $ = qty_12mo × LAST $/ea`, where LAST = exact unit price of the most recent priced order line (no median, no smoothing — RFQ reporting must be to-the-penny). KPI top-row totals stay as historical actuals (sum of historical line totals). Per Ryan: "no rounding or medians in rfqs ... it should be exact most recent price to the penny always".
+
+**Two-tier dedup-key fallback.** `item_num → eam_pn → part_number`. EAM is the primary for most Andersen suppliers; McMaster's blank-EAM cXML pattern is the reason for the part_number fallback.
+
+**Module-level state in `app.py`.** `_STATE` holds: items, kpis, annual_spend, supplier_name, difficulty, difficulty_history, po_lines_by_key, data_anchor_date, bids, scenarios, thresholds, audit_log. `serialize_state()` / `restore_state(payload)` round-trip the durable subset across save/reload.
+
+**Splash → legal gate → app sequence.** The legal gate is hidden at page load and only revealed after splash dismissal. Canonical legal-gate copy from `~/.claude/skills/workpackage/references/templates.md` — do not customize per-tool.
+
+**Splash character.** Pixel banana bunch on a 22×30 grid in `app.js` (`SPLASH_GRID` + `SPLASH_PALETTE`). Each non-`..` token maps to a hex color and renders as a 1×1 SVG `<rect>`.
+
+## Engine entry points (Python)
+
+| Function | Purpose |
+|---|---|
+| `inspect_workbook(bytes)` | Quick metadata: sheet name, headers, row count |
+| `auto_map_export(headers)` | Two-pass alias mapper (exact, then substring); returns `{field → col_idx}` |
+| `extract_rfq_list(bytes, mapping)` | Full extract: dedup → multi-window aggregation → scoring → difficulty rating |
+| `score_item(it, anchor_date)` / `score_items_in_place(items, anchor)` | Per-item 0-100 + tier + reasons |
+| `compute_difficulty_rating(items, kpis)` | File-level 0-100 + level + signals |
+| `record_difficulty_snapshot(d)` / `list_difficulty_history()` | Snapshot history for period-end reporting |
+| `add_demand_concern_flags(items, anchor)` | DORMANT_12MO / DEMAND_DROP_50 / SINGLE_ORDER / etc. |
+| `description_pattern_flags(desc)` | service / freight / tariff / custom / repair / rental / misc / obsolete / generic |
+| `canon_uom(s)` / `is_risky_uom_change(a, b)` | UOM normalization map; never auto-converts risky pairs |
+| `get_thresholds()` / `set_thresholds({...})` / `reset_thresholds()` | The 11 tunable engine knobs |
+| `parse_supplier_bid(bytes, supplier)` / `ingest_supplier_bid(bytes, supplier)` | Returned-bid intake. Auto-detects "our format" (banner + headers around row 7). |
+| `compute_comparison_matrix(included_keys=None)` | Items × suppliers grid with coverage + outlier flags + recommendation per row |
+| `recommend_for_item(matrix_row)` | 5-tier recommendation + concrete reason |
+| `compute_consolidation_analysis(included_keys, carve_threshold, uom_suspect_ratio)` | Per-supplier consolidation candidates + winner + carve-outs |
+| `save_award_scenario(name, strategy, parameters, overrides, included_keys)` | Persist a what-if; strategies: lowest_price / lowest_qualified / consolidate_to / incumbent_preferred / manual |
+| `evaluate_award_scenario(name)` | Re-run a saved scenario against current state |
+| `compare_award_scenarios(name_a, name_b)` | Totals delta + per-item diffs |
+| `get_item_history(item_num)` | Per-item drill-down: PO lines + linear trend + spike detection + 90-day median reference |
+| `gen_candidate_rfq_list_xlsx(included_keys=None)` | Internal-audience candidate list xlsx |
+| `gen_outbound_rfq_xlsx(supplier, rfq_id, due_date, contact, included_keys)` | Per-supplier 5-tab outbound RFQ. Hidden item_key + rfq_line_id for round-trip. Locked cells, dropdown validation. |
+| `gen_supplier_followup_xlsx(supplier, included_keys=None)` | 7-tab pushback packet, template-based prose |
+| `gen_award_letter_xlsx(scenario_name, supplier_name, rfq_id, contact)` | 3-tab supplier-bound award letter. Strict isolation: defensive cell scan refuses export with `IsolationViolation` if any other supplier's name appears. |
+| `gen_award_letters_for_scenario(scenario_name, rfq_id)` | Batch — one letter per awarded supplier |
+| `gen_internal_award_summary_xlsx(scenario_name, rfq_id)` | Internal-audience full detail with "INTERNAL — NEVER FORWARD" banner |
+| `serialize_state()` / `restore_state(payload)` | Round-trip the durable parts of `_STATE` for save/reload |
+| `log_event(action_type, detail, related)` / `list_audit_log(limit)` | Discrete audit trail. Cap 500 entries. |
 
 ## Hard constraints (do not break)
 
-1. **No CDN at runtime.** All Pyodide + wheel files live in `pyodide/` and `wheels/`. Audit with `grep -r "cdn.jsdelivr.net" *.html *.js` returning nothing. Any new dep must be downloaded into `wheels/` and referenced by relative path.
-2. **Legal gate first.** Full-screen Accept / Exit blocks UI until clicked. Canonical text is in `~/.claude/skills/workpackage/references/templates.md` — do not customize per-tool.
-3. **Cross-supplier isolation (Phase 2+).** Every supplier-bound export must filter to one supplier's data. Defensive double-check at write time. Future `verify_isolation.py` will assert no cross-supplier rows in any award letter.
-4. **No Andersen-internal-only fields in supplier-bound files.** No internal target / cost / margin / last-paid prices in any RFQ workbook destined for a supplier. Same-supplier history echo is OK (they billed it themselves) but should be omitted from outbound RFQs in Phase 2 by default.
-5. **Browser main thread must not block.** When extraction grows past Phase 1's single call, split into stages with `await new Promise(r => setTimeout(r, 0))` between calls — same pattern as supplier-pricing's `match_chunk` loop. Avoids Chrome/Edge "Page Unresponsive" on Andersen Windows laptops.
-6. **Aliases must be multi-word or distinctive.** Bare common words (`unit`, `cost`, `id`, `price`) in `EXPORT_ALIASES` will collide (`unit` matches `Unit Price`). Always use phrases like `"unit price"` not `"unit"`.
+1. **No CDN at runtime.** All Pyodide + wheel files live in `pyodide/` and `wheels/`. Audit with `grep -r "cdn.jsdelivr.net" *.html *.js` returning nothing. Any new dep gets downloaded into `wheels/`.
+2. **Legal gate first.** Full-screen Accept / Exit blocks UI until clicked. Canonical text only.
+3. **Cross-supplier isolation.** Every supplier-bound export filters to one supplier's data. `gen_award_letter_xlsx` raises `IsolationViolation` if any row carries another supplier's id; `verify_isolation.py` is the third-party cross-check.
+4. **No Andersen-internal-only fields in supplier-bound files.** Outbound RFQs do NOT include historical paid prices. Award letters carry the supplier's own bid + qty + delivery only.
+5. **Browser main thread must not block.** Long Python work is split into stages with `await new Promise(r => setTimeout(r, 0))` between calls if needed.
+6. **Aliases must be multi-word or distinctive.** Bare common words (`unit`, `cost`, `id`, `price`) collide. Always use phrases like `"unit price"`.
+7. **RFQ math is to-the-penny.** No rounding in displayed prices, no medians or smoothing. Analytical references (90-day median for spike detection) are clearly labeled and never substitute for the exact LAST $/ea.
 
 ## Cache + browser-refresh hygiene
 
 - During dev, plain `Cmd+R` (NOT `Cmd+Shift+R`). Hard-refresh re-downloads ~13 MB of Pyodide every time.
-- For a real fresh load: DevTools open → right-click refresh → **Empty Cache and Hard Reload**. Or open in a fresh Incognito window.
-- Never add `?v=...` cache-bust query strings — they only invalidate the parent HTML, not the WASM, and waste bandwidth in confusing ways.
+- For a real fresh load: DevTools → right-click refresh → **Empty Cache and Hard Reload**. Or fresh Incognito window.
+- Never add `?v=...` cache-bust query strings — they only invalidate the parent HTML.
 
 ## Bundle for distribution
-
-Same pattern as supplier-pricing:
 
 ```bash
 rm -f ~/Desktop/auto-rfq-banana_bundle.zip
@@ -69,24 +123,29 @@ zip -r ~/Desktop/auto-rfq-banana_bundle.zip auto-rfq-banana \
   -x "*.DS_Store" "*/__pycache__/*" "*.git/*" "samples/*" "scratch/*"
 ```
 
-The zip drops on a Windows laptop; user unzips, double-clicks `start.bat`, app opens.
+The zip drops on a Windows laptop; user unzips, double-clicks `start.bat`.
 
-## What's reused from supplier-pricing (when porting more)
+## Live test data on Ryan's machine
 
-This repo started fresh per Ryan's "don't fork supplier-pricing wholesale" decision, but the engine pieces below are direct ports (or candidates for porting in Phase 2+). Source paths refer to the donor:
+| File | What it is |
+|---|---|
+| `~/Downloads/McMaster Coupa.xlsx` | 24,959 rows / 50 cols. Multi-year (2023-04 to 2026-04) Andersen Coupa export of McMaster purchases. |
+| `~/Downloads/rfq/grainger/Andersen Grainger RFQ 4.10.26 - McMaster Items.xlsx` | Grainger's bid response in our template (3,374 lines, 3,062 priced) |
+| `~/Downloads/rfq/Fastenal/Fastenal 4.23.xlsx` | Fastenal's bid (4,347 lines, 1,815 priced, 87 UOM-disc, 973 substitutes) |
+| `~/Downloads/rfq/msc/Anderson RFQ - McMaster Items_updated 4-8-26.xlsx` | MSC's bid (3,374 lines, 2,048 priced, 1,202 need-info) |
+| `~/Downloads/rfq/grainger/Andersen Grainger 4.10.26_RFQ - Data Spreadsheet.xlsx` | Grainger's reformatted-template version. Lower priority — Ryan said pay less attention. |
 
-- `app.py` lines 25–48: `MFG_ALIASES` + `canon_mfg` (already ported)
-- `app.py` lines 12–102, 581–837: `match_chunk` Tier 0–4 cascade + helpers (port in Phase 2 for returned-bid intake)
-- `app.py` line 1005: `autosize` MergedCell-skip helper (already ported)
-- `app.js` lines 27–59: legal-gate IIFE (already ported, verbatim)
-- `app.js` lines 1–20: boot diagnostics + error trap (already ported, verbatim)
-- `app.js` lines 315–377: `renderMappingTable` + `readMapping` (already ported pattern; new `RFQ_FIELDS` definition)
-- `app.js` lines 1201, 1322, 1494: bookmark-stable folder pattern (port in Phase 2 for per-RFQ-event folders)
+McMaster headline numbers when extracted: 11,169 items / $2,660,088 total / 9,209 POs / 18,619 lines / difficulty 62/100 DIFFICULT (89% items in WEAK/SKIP, 84% missing MFG, 89% generic descriptions). Smart-trim cuts to ~1,263 STRONG+MODERATE candidates worth bidding out.
 
-## Roadmap
+## Roadmap (what's NOT yet built)
 
-- **Phase 1 (current):** RFQ-list extraction + multi-window analytics + candidate-list xlsx export. ✅
-- **Phase 2:** Supplier count + names UI; per-supplier RFQ xlsx generator (Andersen-branded, blank fillable, no internal fields); returned-bid intake with column-mapping + match cascade; cross-supplier comparison matrix; outlier detector (bid-vs-median, bid-vs-history, bid-vs-self).
-- **Phase 3:** Award decisions UI; per-supplier award letters with isolation guard; `verify_isolation.py`; internal award summary.
+- **Validation severity tiers** + row-level validation table on import (Error / Warning / Info)
+- **Saved column-mapping templates per supplier** (one-click re-apply)
+- **Item conflict detection** (same MFG PN with different item numbers, etc.)
+- **Internal-stakeholder verification loop** — using Coupa export contact columns (Requested By / Department / Last Updated By / Receiving Warehouse / Storeroom). Per-requestor PDF + xlsx packet for "is this the right part?" round-trip.
+- **Period-end report generator** — uses difficulty_history snapshots + audit_log + scenario series to produce a leadership-ready PDF/xlsx
+- **Audit log viewer UI** — engine logs events; viewer modal not yet wired
+- **Bid-feedback signal feeding into difficulty rating** — retroactively bump difficulty when many bids come back flagged
+- **Anonymized comparison view** (mask supplier names for one-off pulls)
 
-See `~/.claude/plans/i-want-to-make-compressed-glacier.md` for the full plan + verification criteria for each phase.
+See `~/.claude/plans/i-want-to-make-compressed-glacier.md` for the original plan + the ChatGPT brief at `/tmp/rfq_brief/rfq_claude_code_brief/` for the broader feature catalog.
