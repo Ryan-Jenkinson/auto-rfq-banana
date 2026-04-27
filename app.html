@@ -14,7 +14,9 @@
 
 <!-- Disclaimer gate — full-screen acceptance required before the app loads.
      Canonical version lives in the workpackage skill; do not customize text. -->
-<div id="legal-gate" class="legal-gate" role="dialog" aria-modal="true" aria-labelledby="legal-gate-title">
+<!-- Legal gate is hidden at page load; revealed after the splash is dismissed.
+     This way the splash → warning → app sequence reads top-to-bottom. -->
+<div id="legal-gate" class="legal-gate is-hidden" role="dialog" aria-modal="true" aria-labelledby="legal-gate-title">
   <div class="legal-gate-card">
     <div class="legal-gate-eyebrow">NOTICE — INTERNAL PRODUCTIVITY TOOL</div>
     <h1 id="legal-gate-title" class="legal-gate-title">Please read before continuing</h1>

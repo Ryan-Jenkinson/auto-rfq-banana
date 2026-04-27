@@ -23,18 +23,13 @@ window.addEventListener('error', (e) => {
 });
 
 // ==========================================================================
-// Legal gate — wired FIRST so a click works even if later JS throws on a
-// missing element. Canonical version is in the workpackage skill.
+// Legal gate — wired at boot but kept HIDDEN until the user dismisses the
+// splash. Sequence is: splash (banana) → warning gate → app. Canonical
+// disclaimer copy is in the workpackage skill; do not customize per-tool.
 // ==========================================================================
-(function _initLegalGate() {
+const _legalGate = (function _initLegalGate() {
   const gate = document.getElementById('legal-gate');
-  if (!gate) return;
-  try {
-    if (sessionStorage.getItem('legal-gate-accepted') === '1') {
-      gate.classList.add('is-hidden');
-      return;
-    }
-  } catch (e) { /* sessionStorage may be blocked — fall through and prompt */ }
+  if (!gate) return { show: () => {}, isAccepted: () => true };
 
   const accept = document.getElementById('legal-gate-accept');
   const exit = document.getElementById('legal-gate-exit');
@@ -50,7 +45,7 @@ window.addEventListener('error', (e) => {
       try { window.close(); } catch (e) {}
       setTimeout(() => {
         document.documentElement.innerHTML =
-          '<body style="background:#1a120a;color:#9b8669;font-family:Inter,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;text-align:center"><div><h1 style="color:#fdf6e3;font-size:18px;margin:0 0 8px">Closed.</h1><p>You may close this tab.</p></div></body>';
+          '<body style="background:#1a120a;color:#9b8669;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;text-align:center"><div><h1 style="color:#fdf6e3;font-size:18px;margin:0 0 8px">Closed.</h1><p>You may close this tab.</p></div></body>';
       }, 100);
     });
   }
@@ -58,6 +53,21 @@ window.addEventListener('error', (e) => {
     if (gate.classList.contains('is-hidden')) return;
     if (e.key === 'Escape' && exit) exit.click();
   });
+
+  return {
+    show() {
+      try {
+        if (sessionStorage.getItem('legal-gate-accepted') === '1') return;
+      } catch (e) { /* fall through and prompt */ }
+      gate.classList.remove('is-hidden');
+      // Re-focus the Accept button when the gate appears
+      setTimeout(() => { if (accept) accept.focus(); }, 50);
+    },
+    isAccepted() {
+      try { return sessionStorage.getItem('legal-gate-accepted') === '1'; }
+      catch (e) { return false; }
+    },
+  };
 })();
 
 // ==========================================================================
@@ -82,36 +92,38 @@ const SPLASH_PALETTE = {
 };
 
 const SPLASH_GRID = [
-  /*  0 */ ".. .. .. SP .. .. .. .. .. .. .. .. .. .. .. .. .. .. SH .. .. ..",
-  /*  1 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  // Single whole banana — vertical, stem at top, slight curve toward the
+  // tip at the bottom. Clean iconic silhouette.
+  /*  0 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  /*  1 */ ".. .. .. SP .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
   /*  2 */ ".. .. .. .. .. .. .. .. .. ST ST .. .. .. .. .. .. .. .. .. .. ..",
   /*  3 */ ".. .. .. .. .. .. .. .. ST SM SM ST .. .. .. .. .. .. .. .. .. ..",
   /*  4 */ ".. .. .. .. .. .. .. ST SM SM SM SM ST .. .. .. .. .. .. .. .. ..",
-  /*  5 */ ".. .. .. .. .. .. ST SM SM SM SM SM SM ST .. .. .. .. .. .. .. ..",
-  /*  6 */ ".. .. .. .. .. BO BB BB BB BB BB BB BB BB BO .. .. .. .. .. .. ..",
-  /*  7 */ ".. .. .. .. BO BB BM BM BM BM BM BM BM BM BB BO .. .. .. .. .. ..",
-  /*  8 */ ".. .. .. BO BB BM BL BL BL BL BL BL BL BL BM BB BO .. .. .. .. ..",
-  /*  9 */ ".. .. BO BB BM BL BH BH BL BL BL BH BH BL BM BB BO .. .. .. .. ..",
-  /* 10 */ ".. .. BO BM BL BH BH BL BL BO BL BL BH BH BL BM BO .. .. .. .. ..",
-  /* 11 */ ".. .. BO BM BL BH BL BL BO BO BO BL BL BH BL BM BO .. .. .. .. ..",
-  /* 12 */ ".. .. BO BM BL BL BL BO BB BB BB BO BL BL BL BM BO .. .. .. .. ..",
-  /* 13 */ ".. .. BO BM BL BL BO BB BM BM BM BB BO BL BL BM BO .. .. .. .. ..",
-  /* 14 */ ".. BO BM BL BL BO BB BM BL BL BL BM BB BO BL BL BM BO .. .. .. ..",
-  /* 15 */ ".. BO BM BL BL BO BM BL BH BH BH BL BM BO BL BL BM BO .. .. .. ..",
-  /* 16 */ ".. BO BM BL BO BB BM BL BH BH BH BL BM BB BO BL BM BO .. .. .. ..",
-  /* 17 */ ".. BO BM BL BO BM BL BL BL BL BL BL BL BM BO BL BM BO .. .. .. ..",
-  /* 18 */ ".. BO BM BL BO BM BL BL BL BL BL BL BL BM BO BL BM BO .. .. .. ..",
-  /* 19 */ ".. BO BM BL BO BM BL BL BL BL BL BL BL BM BO BL BM BO .. .. .. ..",
-  /* 20 */ ".. .. BO BM BO BM BM BL BL BL BL BL BM BM BO BM BO .. .. .. .. ..",
-  /* 21 */ ".. .. .. BO BO BM BM BL BL BL BL BL BM BM BO BO .. .. .. .. .. ..",
-  /* 22 */ ".. .. .. .. BO BM BM BM BL BL BL BM BM BM BO .. .. .. .. .. .. ..",
-  /* 23 */ ".. .. .. .. BO BM BM BM BM BM BM BM BM BO .. .. .. .. .. .. .. ..",
-  /* 24 */ ".. .. .. .. .. BO BM BM BM BM BM BM BO .. .. .. .. .. .. .. .. ..",
-  /* 25 */ ".. .. .. .. .. .. BO BM BM BM BM BO .. .. .. .. .. .. .. .. .. ..",
-  /* 26 */ ".. .. .. .. .. .. .. BO BM BM BO .. .. .. .. .. .. .. .. .. .. ..",
-  /* 27 */ ".. .. .. .. .. .. .. .. BO BO .. .. .. .. .. .. .. .. .. .. .. ..",
-  /* 28 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
-  /* 29 */ ".. SH .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. SP ..",
+  /*  5 */ ".. .. .. .. .. .. BO BO BB BB BB BB BO BO .. .. .. .. .. .. .. ..",
+  /*  6 */ ".. .. .. .. .. BO BB BM BM BM BM BM BM BB BO .. .. .. .. .. .. ..",
+  /*  7 */ ".. .. .. .. BO BB BM BL BL BL BL BL BL BM BB BO .. .. .. .. .. ..",
+  /*  8 */ ".. .. .. .. BO BM BL BL BH BH BH BH BL BL BM BO .. .. .. .. .. ..",
+  /*  9 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
+  /* 10 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
+  /* 11 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
+  /* 12 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
+  /* 13 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
+  /* 14 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
+  /* 15 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
+  /* 16 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
+  /* 17 */ ".. .. .. .. BO BM BL BL BH BH BH BH BL BL BM BO .. .. .. .. .. ..",
+  /* 18 */ ".. .. .. .. BO BB BM BL BL BL BL BL BL BM BB BO .. .. .. .. .. ..",
+  /* 19 */ ".. .. .. .. .. BO BB BM BL BL BL BL BL BM BB BO .. .. .. .. .. ..",
+  /* 20 */ ".. .. .. .. .. .. BO BB BM BL BL BL BL BM BB BO BO .. .. .. .. ..",
+  /* 21 */ ".. .. .. .. .. .. .. BO BB BM BM BM BM BM BB BB BO .. .. .. .. ..",
+  /* 22 */ ".. .. .. .. .. .. .. .. BO BB BB BB BB BB BB BO .. .. .. .. .. ..",
+  /* 23 */ ".. .. .. .. .. .. .. .. .. BO BO BO BO BO BO .. .. .. .. .. .. ..",
+  /* 24 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  /* 25 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  /* 26 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  /* 27 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  /* 28 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. SH .. .. ..",
+  /* 29 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
 ];
 
 (function buildSplashChar() {
@@ -141,7 +153,11 @@ function _setSplashStatus(text, ready) {
 function _dismissSplash() {
   const splash = document.getElementById('splash');
   if (splash) splash.classList.add('hidden');
-  setTimeout(() => { if (splash) splash.style.display = 'none'; }, 350);
+  setTimeout(() => {
+    if (splash) splash.style.display = 'none';
+    // After splash, reveal the legal gate (unless accepted earlier in this tab session)
+    if (_legalGate && !_legalGate.isAccepted()) _legalGate.show();
+  }, 350);
 }
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && _pyReady) _dismissSplash();
