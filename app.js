@@ -92,37 +92,40 @@ const SPLASH_PALETTE = {
 };
 
 const SPLASH_GRID = [
-  // Single whole banana — vertical, stem at top, slight curve toward the
-  // tip at the bottom. Clean iconic silhouette.
+  // Cute bunch of bananas — two horizontal-ish bananas joined at a brown
+  // stem at top center, with a tiny third banana peeking between them.
+  // Chunky cartoon proportions; reads instantly as a bunch, not as one
+  // tall single banana. Gentler bob animation (set in CSS) so it
+  // hovers rather than wobbles.
   /*  0 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
-  /*  1 */ ".. .. .. SP .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
-  /*  2 */ ".. .. .. .. .. .. .. .. .. ST ST .. .. .. .. .. .. .. .. .. .. ..",
-  /*  3 */ ".. .. .. .. .. .. .. .. ST SM SM ST .. .. .. .. .. .. .. .. .. ..",
-  /*  4 */ ".. .. .. .. .. .. .. ST SM SM SM SM ST .. .. .. .. .. .. .. .. ..",
-  /*  5 */ ".. .. .. .. .. .. BO BO BB BB BB BB BO BO .. .. .. .. .. .. .. ..",
-  /*  6 */ ".. .. .. .. .. BO BB BM BM BM BM BM BM BB BO .. .. .. .. .. .. ..",
-  /*  7 */ ".. .. .. .. BO BB BM BL BL BL BL BL BL BM BB BO .. .. .. .. .. ..",
-  /*  8 */ ".. .. .. .. BO BM BL BL BH BH BH BH BL BL BM BO .. .. .. .. .. ..",
-  /*  9 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
-  /* 10 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
-  /* 11 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
-  /* 12 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
-  /* 13 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
-  /* 14 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
-  /* 15 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
-  /* 16 */ ".. .. .. .. BO BM BL BH BH BH BH BH BH BL BM BO .. .. .. .. .. ..",
-  /* 17 */ ".. .. .. .. BO BM BL BL BH BH BH BH BL BL BM BO .. .. .. .. .. ..",
-  /* 18 */ ".. .. .. .. BO BB BM BL BL BL BL BL BL BM BB BO .. .. .. .. .. ..",
-  /* 19 */ ".. .. .. .. .. BO BB BM BL BL BL BL BL BM BB BO .. .. .. .. .. ..",
-  /* 20 */ ".. .. .. .. .. .. BO BB BM BL BL BL BL BM BB BO BO .. .. .. .. ..",
-  /* 21 */ ".. .. .. .. .. .. .. BO BB BM BM BM BM BM BB BB BO .. .. .. .. ..",
-  /* 22 */ ".. .. .. .. .. .. .. .. BO BB BB BB BB BB BB BO .. .. .. .. .. ..",
-  /* 23 */ ".. .. .. .. .. .. .. .. .. BO BO BO BO BO BO .. .. .. .. .. .. ..",
+  /*  1 */ ".. SP .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. SH ..",
+  /*  2 */ ".. .. .. .. .. .. .. .. .. .. ST .. .. .. .. .. .. .. .. .. .. ..",
+  /*  3 */ ".. .. .. .. .. .. .. .. .. ST SM ST .. .. .. .. .. .. .. .. .. ..",
+  /*  4 */ ".. .. .. .. .. .. .. .. ST SM SM SM ST .. .. .. .. .. .. .. .. ..",
+  /*  5 */ ".. .. .. .. .. .. .. ST SM SM SM SM SM ST .. .. .. .. .. .. .. ..",
+  /*  6 */ ".. .. .. .. .. BO BO ST SM SM SM SM ST BO BO .. .. .. .. .. .. ..",
+  /*  7 */ ".. .. .. .. BO BB BO ST SM SM SM ST BO BB BO .. .. .. .. .. .. ..",
+  /*  8 */ ".. .. .. BO BB BM BO BO BO BO BO BO BO BM BB BO .. .. .. .. .. ..",
+  /*  9 */ ".. .. BO BB BM BL BL BO BB BM BB BO BL BL BM BB BO .. .. .. .. ..",
+  /* 10 */ ".. BO BB BM BL BH BH BO BM BL BM BO BH BH BL BM BB BO .. .. .. ..",
+  /* 11 */ ".. BO BM BL BH BH BL BO BL BH BL BO BL BH BH BL BM BO .. .. .. ..",
+  /* 12 */ "BO BB BM BL BL BL BL BO BL BH BL BO BL BL BL BL BM BB BO .. .. ..",
+  /* 13 */ "BO BM BL BL BL BL BL BO BL BH BL BO BL BL BL BL BL BM BO .. .. ..",
+  /* 14 */ "BO BM BL BL BL BL BL BO BL BL BL BO BL BL BL BL BL BM BO .. .. ..",
+  /* 15 */ "BO BM BL BL BL BL BL BO BL BL BL BO BL BL BL BL BL BM BO .. .. ..",
+  /* 16 */ ".. BO BM BL BL BL BL BO BM BL BM BO BL BL BL BL BM BO .. .. .. ..",
+  /* 17 */ ".. BO BM BM BL BL BL BO BM BL BM BO BL BL BL BM BM BO .. .. .. ..",
+  /* 18 */ ".. .. BO BM BM BL BL BO BB BM BB BO BL BL BM BM BO .. .. .. .. ..",
+  /* 19 */ ".. .. BO BB BM BM BL BO BO BO BO BO BL BM BM BB BO .. .. .. .. ..",
+  /* 20 */ ".. .. .. BO BB BM BM BB BO .. .. BO BB BM BM BB BO .. .. .. .. ..",
+  /* 21 */ ".. .. .. .. BO BB BM BB BO .. .. .. BO BB BM BB BO .. .. .. .. ..",
+  /* 22 */ ".. .. .. .. .. BO BB BO .. .. .. .. .. BO BB BO .. .. .. .. .. ..",
+  /* 23 */ ".. .. .. .. .. .. BO .. .. .. .. .. .. .. BO .. .. .. .. .. .. ..",
   /* 24 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
   /* 25 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
   /* 26 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
   /* 27 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
-  /* 28 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. SH .. .. ..",
+  /* 28 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
   /* 29 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
 ];
 
@@ -419,14 +422,38 @@ json.dumps(_rfq, default=str)
 function _renderKpis() {
   if (!_rfqResult) return;
   const k = _rfqResult.kpis;
-  const fmt = (n) => '$' + Math.round(n).toLocaleString();
+  const d = _rfqResult.difficulty;
+  // Compact dollar format — keeps headline numbers under ~7 chars so they
+  // never wrap at 36px regardless of tile width. Full precision in the sub.
+  const fmt$Compact = (n) => {
+    if (n == null) return '—';
+    const a = Math.abs(n);
+    if (a >= 1e6) return '$' + (n / 1e6).toFixed(2) + 'M';
+    if (a >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
+    return '$' + Math.round(n).toLocaleString();
+  };
+  const fmt$Full = (n) => n == null ? '—' : '$' + Math.round(n).toLocaleString();
+
+  let difficultyTile = '';
+  if (d) {
+    const diffColor = d.score >= 70 ? 'var(--red)' : d.score >= 50 ? 'var(--accent)' : d.score >= 30 ? 'var(--cyan)' : 'var(--green)';
+    difficultyTile = `
+      <div class="kpi" style="border-color: ${diffColor};">
+        <div class="kpi-label">Difficulty</div>
+        <div class="kpi-value" style="color: ${diffColor};">${d.score}</div>
+        <div class="kpi-sub"><strong style="color: ${diffColor};">${d.level}</strong> — ${d.summary}</div>
+      </div>
+    `;
+  }
+
   $('kpi-row').innerHTML = `
     <div class="kpi"><div class="kpi-label">Items</div><div class="kpi-value">${k.item_count.toLocaleString()}</div><div class="kpi-sub">unique part numbers</div></div>
-    <div class="kpi"><div class="kpi-label">Total spend (all)</div><div class="kpi-value">${fmt(k.total_spend)}</div><div class="kpi-sub">${k.po_count.toLocaleString()} POs · ${k.line_count.toLocaleString()} lines</div></div>
-    <div class="kpi"><div class="kpi-label">Date range</div><div class="kpi-value">${(k.first_order || '').slice(0,4)} → ${(k.last_order || '').slice(0,4)}</div><div class="kpi-sub">${k.first_order} to ${k.last_order} · ${k.years_span.toFixed(1)} yr</div></div>
-    <div class="kpi"><div class="kpi-label">12-mo spend</div><div class="kpi-value">${fmt(k.spend_12mo)}</div><div class="kpi-sub">${k.items_12mo.toLocaleString()} items active</div></div>
-    <div class="kpi"><div class="kpi-label">24-mo spend</div><div class="kpi-value">${fmt(k.spend_24mo)}</div><div class="kpi-sub">${k.items_24mo.toLocaleString()} items active</div></div>
-    <div class="kpi"><div class="kpi-label">36-mo spend</div><div class="kpi-value">${fmt(k.spend_36mo)}</div><div class="kpi-sub">${k.items_36mo.toLocaleString()} items active</div></div>
+    <div class="kpi"><div class="kpi-label">Total spend (all)</div><div class="kpi-value">${fmt$Compact(k.total_spend)}</div><div class="kpi-sub">${fmt$Full(k.total_spend)} · ${k.po_count.toLocaleString()} POs · ${k.line_count.toLocaleString()} lines</div></div>
+    <div class="kpi"><div class="kpi-label">Date range</div><div class="kpi-value">${k.years_span.toFixed(1)} yr</div><div class="kpi-sub">${k.first_order} → ${k.last_order}</div></div>
+    <div class="kpi"><div class="kpi-label">12-mo spend</div><div class="kpi-value">${fmt$Compact(k.spend_12mo)}</div><div class="kpi-sub">${fmt$Full(k.spend_12mo)} · ${k.items_12mo.toLocaleString()} items active</div></div>
+    <div class="kpi"><div class="kpi-label">24-mo spend</div><div class="kpi-value">${fmt$Compact(k.spend_24mo)}</div><div class="kpi-sub">${fmt$Full(k.spend_24mo)} · ${k.items_24mo.toLocaleString()} items active</div></div>
+    <div class="kpi"><div class="kpi-label">36-mo spend</div><div class="kpi-value">${fmt$Compact(k.spend_36mo)}</div><div class="kpi-sub">${fmt$Full(k.spend_36mo)} · ${k.items_36mo.toLocaleString()} items active</div></div>
+    ${difficultyTile}
   `;
 }
 

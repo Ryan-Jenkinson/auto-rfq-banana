@@ -101,23 +101,23 @@ button.btn.ghost:hover:not(:disabled) { background: var(--bg-2); border-color: v
 button.btn.big { padding: 12px 22px; font-size: 14px; }
 
 /* ---------- KPI tiles ---------- */
-.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 32px; }
-.kpi { background: var(--bg-1); border: 1px solid var(--line); border-radius: 6px; padding: 22px 22px 20px; position: relative; display: flex; flex-direction: column; min-height: 130px; }
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 32px; }
+.kpi { background: var(--bg-1); border: 1px solid var(--line); border-radius: 6px; padding: 20px 20px 18px; position: relative; display: flex; flex-direction: column; min-height: 130px; }
 .kpi-label { font-family: var(--ui); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--ink-2); font-weight: 600; margin-bottom: 12px; }
-/* KPI value is the hero. !important overrides app.js's inline font-size:14px
-   on the date-range tile — every value must be the same 36px size. Long
-   values wrap to two lines (e.g. date range) instead of shrinking. */
+/* KPI value is the hero. JS now formats big dollar values as compact
+   ($2.66M / $939K) so they fit at 36px without wrapping. nowrap
+   guarantees no mid-number text-wrap regardless of tile width. */
 .kpi-value {
-  font-family: var(--mono) !important;
-  font-weight: 600 !important;
-  font-size: 36px !important;
-  line-height: 1.1 !important;
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 36px;
+  line-height: 1.1;
   color: var(--accent);
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
   font-feature-settings: "tnum", "lnum";
-  word-break: break-word;
-  overflow-wrap: anywhere;
-  white-space: normal;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
 }
 .kpi-sub { font-family: var(--ui); font-size: 12px; color: var(--ink-2); margin-top: 10px; font-weight: 400; }
 /* first tile is the active anchor — accent underline */

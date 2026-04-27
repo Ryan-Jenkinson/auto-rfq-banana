@@ -489,17 +489,245 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         key=lambda d: d["year"],
     )
 
+    # Score each item + compute file-level difficulty rating
+    _STATE["data_anchor_date"] = now.date().isoformat() if now else None
+    score_items_in_place(out_items, anchor_date=now)
+    difficulty = compute_difficulty_rating(out_items, kpis)
+
     # Persist for the xlsx generator + drill-down modal
     _STATE["items"] = out_items
     _STATE["kpis"] = kpis
     _STATE["annual_spend"] = annual_out
     _STATE["supplier_name"] = supplier_counter.most_common(1)[0][0] if supplier_counter else ""
+    _STATE["difficulty"] = difficulty
     # Per-item PO lines are kept Python-side (not shipped to JS in the items
     # array) to keep the JS payload small. The modal pulls them on demand.
     _STATE["po_lines_by_key"] = {k: list(rec["po_lines"]) for k, rec in items.items()}
-    _STATE["data_anchor_date"] = now.date().isoformat() if now else None
 
-    return {"kpis": kpis, "items": out_items, "annual_spend": annual_out}
+    return {"kpis": kpis, "items": out_items, "annual_spend": annual_out, "difficulty": difficulty}
+
+
+# ---------------------------------------------------------------------------
+# Inclusion scoring + file difficulty rating
+# ---------------------------------------------------------------------------
+
+# Tunable scoring weights — total to 1.0
+SCORE_WEIGHTS = {
+    "spend":     0.40,   # 24-mo spend (capped at the threshold below)
+    "recency":   0.25,   # days since last order, decays over a year
+    "frequency": 0.25,   # distinct PO count
+    "data":      0.10,   # data-quality (MFG + UOM)
+}
+# Calibration: full score at these levels
+SCORE_SPEND_FULL_24MO = 1000.0     # $1k+ spend in 24mo = full spend points
+SCORE_RECENCY_RECENT_DAYS = 90     # within 90d = full recency points
+SCORE_RECENCY_DEAD_DAYS = 540      # 18mo+ since last order = zero recency
+SCORE_FREQUENCY_FULL = 6           # 6+ POs = full frequency points
+
+# Tier thresholds
+TIER_STRONG = 70
+TIER_MODERATE = 45
+TIER_WEAK = 25
+
+
+def score_item(it: dict, anchor_date) -> dict:
+    """Score one item 0-100, return {score, tier, reasons, default_include}.
+
+    Anchor_date should be the dataset's max order date (so 'recency' is
+    measured against the data, not wall-clock — same anchor as the windows).
+    """
+    spend_24 = it.get("spend_24mo") or 0.0
+    spend_score = min(1.0, spend_24 / SCORE_SPEND_FULL_24MO)
+
+    # Recency: parse last_order ISO; days since vs anchor
+    recency_score = 0.0
+    days_since_last = None
+    last_order_iso = it.get("last_order")
+    if last_order_iso and anchor_date:
+        try:
+            last_dt = datetime.fromisoformat(last_order_iso)
+            days_since_last = (anchor_date - last_dt).days
+            if days_since_last <= SCORE_RECENCY_RECENT_DAYS:
+                recency_score = 1.0
+            elif days_since_last >= SCORE_RECENCY_DEAD_DAYS:
+                recency_score = 0.0
+            else:
+                # Linear decay between recent and dead
+                rng = SCORE_RECENCY_DEAD_DAYS - SCORE_RECENCY_RECENT_DAYS
+                recency_score = max(0.0, 1.0 - (days_since_last - SCORE_RECENCY_RECENT_DAYS) / rng)
+        except (ValueError, TypeError):
+            pass
+
+    po_count = it.get("po_count") or 0
+    frequency_score = min(1.0, po_count / SCORE_FREQUENCY_FULL)
+
+    # Data quality: MFG present + UOM consistent
+    has_mfg = bool(it.get("mfg_name"))
+    uom_clean = bool(it.get("uom")) and not it.get("uom_mixed")
+    data_score = 0.0
+    if has_mfg: data_score += 0.5
+    if uom_clean: data_score += 0.5
+
+    # Weighted sum
+    total = (
+        SCORE_WEIGHTS["spend"]     * spend_score +
+        SCORE_WEIGHTS["recency"]   * recency_score +
+        SCORE_WEIGHTS["frequency"] * frequency_score +
+        SCORE_WEIGHTS["data"]      * data_score
+    )
+    score = round(total * 100)
+
+    # Tier
+    if score >= TIER_STRONG:
+        tier = "STRONG"
+    elif score >= TIER_MODERATE:
+        tier = "MODERATE"
+    elif score >= TIER_WEAK:
+        tier = "WEAK"
+    else:
+        tier = "SKIP"
+
+    # Human-readable reasons (lead with the negatives — that's why scoring exists)
+    reasons = []
+    if spend_24 < 100:
+        reasons.append(f"Low 24-mo spend (${spend_24:,.0f})")
+    elif spend_24 < SCORE_SPEND_FULL_24MO / 2:
+        reasons.append(f"Modest 24-mo spend (${spend_24:,.0f})")
+    if days_since_last is None:
+        reasons.append("No order date")
+    elif days_since_last > SCORE_RECENCY_DEAD_DAYS:
+        reasons.append(f"No order in {days_since_last // 30}mo")
+    elif days_since_last > 365:
+        reasons.append(f"Last order {days_since_last // 30}mo ago")
+    if po_count <= 1:
+        reasons.append(f"Only {po_count} PO")
+    elif po_count <= 2:
+        reasons.append(f"Only {po_count} POs")
+    if not has_mfg:
+        reasons.append("MFG blank")
+    if it.get("uom_mixed"):
+        reasons.append("UOM mixed")
+    if not reasons and tier in ("STRONG", "MODERATE"):
+        reasons.append("Healthy spend + recent + recurring")
+
+    return {
+        "score": score,
+        "tier": tier,
+        "reasons": reasons,
+        "default_include": tier in ("STRONG", "MODERATE"),
+        "days_since_last_order": days_since_last,
+    }
+
+
+def score_items_in_place(items: list, anchor_date) -> None:
+    """Mutate each item dict in-place, adding score/tier/reasons.
+
+    Note: this does NOT override the existing `included` flag. The tier
+    is exposed so the UI can render it (chip, filter), but the user
+    explicitly opts in to "auto-exclude WEAK/SKIP" via a toggle (TODO).
+    Avoids surprising the user with a mass-exclusion on refresh.
+    """
+    for it in items:
+        s = score_item(it, anchor_date)
+        it["score"] = s["score"]
+        it["tier"] = s["tier"]
+        it["score_reasons"] = s["reasons"]
+        it["days_since_last_order"] = s["days_since_last_order"]
+        # Conservative: keep the original `included` default (spend_24mo > 0).
+        # The tier is informational; user can apply tier-based defaults later.
+
+
+def compute_difficulty_rating(items: list, kpis: dict) -> dict:
+    """Roll per-item scores up to a file-level difficulty rating.
+
+    Outputs a 0-100 difficulty score (HIGHER = HARDER to RFQ — opposite of
+    item score, which is item quality), a level label, and the contributing
+    signals. Snapshot intended to be persisted with a timestamp so
+    period-end reports can chart difficulty trending over time as more
+    files run through the tool.
+
+    Phase 2.5 will add a bid-feedback signal (% of outlier bids retroactively
+    increases the difficulty after-the-fact).
+    """
+    if not items:
+        return {"score": 0, "level": "EMPTY", "signals": {}, "summary": "no items"}
+
+    n = len(items)
+    by_tier = Counter(it.get("tier", "SKIP") for it in items)
+    pct_weak_or_skip = 100.0 * (by_tier.get("WEAK", 0) + by_tier.get("SKIP", 0)) / n
+    pct_strong = 100.0 * by_tier.get("STRONG", 0) / n
+    pct_no_mfg = 100.0 * sum(1 for it in items if not it.get("mfg_name")) / n
+    pct_uom_mixed = 100.0 * sum(1 for it in items if it.get("uom_mixed")) / n
+    pct_no_desc = 100.0 * sum(1 for it in items if not it.get("description") or len((it.get("description") or "").strip()) < 10) / n
+    avg_score = sum(it.get("score", 0) for it in items) / n
+
+    # Spend concentration — what % of items capture 80% of spend?
+    sorted_spend = sorted([it.get("spend_all", 0) for it in items], reverse=True)
+    total = sum(sorted_spend) or 1.0
+    cum = 0.0
+    items_for_80 = 0
+    for i, sp in enumerate(sorted_spend):
+        cum += sp
+        items_for_80 = i + 1
+        if cum / total >= 0.80:
+            break
+    pct_items_for_80 = 100.0 * items_for_80 / n
+
+    # Difficulty score — weighted aggregate (higher = harder)
+    # Each signal contributes 0-100 to the total.
+    sig_weak_tail = pct_weak_or_skip                                   # already 0-100
+    sig_data_quality = (pct_no_mfg + pct_uom_mixed + pct_no_desc) / 3  # 0-100
+    sig_long_tail = max(0, min(100, pct_items_for_80 * 1.5))           # bias toward long-tail = harder
+    sig_low_avg = max(0, 100 - avg_score)                              # inverse of average item quality
+
+    diff_raw = (
+        0.30 * sig_weak_tail +
+        0.30 * sig_data_quality +
+        0.20 * sig_long_tail +
+        0.20 * sig_low_avg
+    )
+    diff_score = round(diff_raw)
+
+    if diff_score >= 70:
+        level = "VERY DIFFICULT"
+    elif diff_score >= 50:
+        level = "DIFFICULT"
+    elif diff_score >= 30:
+        level = "MODERATE"
+    else:
+        level = "EASY"
+
+    # Build a one-line summary the UI can show under the label
+    summary_parts = []
+    if pct_weak_or_skip > 40:
+        summary_parts.append(f"{pct_weak_or_skip:.0f}% items in WEAK/SKIP tier")
+    if pct_no_mfg > 25:
+        summary_parts.append(f"{pct_no_mfg:.0f}% missing MFG")
+    if pct_no_desc > 15:
+        summary_parts.append(f"{pct_no_desc:.0f}% generic/short descriptions")
+    if pct_items_for_80 > 25:
+        summary_parts.append(f"long tail — top {pct_items_for_80:.0f}% of items hold 80% of spend")
+    if not summary_parts:
+        summary_parts.append("clean data, healthy spend distribution")
+
+    return {
+        "score": diff_score,
+        "level": level,
+        "summary": " · ".join(summary_parts),
+        "snapshot_at": datetime.now().isoformat(),
+        "signals": {
+            "n_items": n,
+            "by_tier": dict(by_tier),
+            "pct_weak_or_skip": round(pct_weak_or_skip, 1),
+            "pct_strong": round(pct_strong, 1),
+            "pct_no_mfg": round(pct_no_mfg, 1),
+            "pct_uom_mixed": round(pct_uom_mixed, 1),
+            "pct_no_desc": round(pct_no_desc, 1),
+            "items_for_80pct_spend": items_for_80,
+            "pct_items_for_80": round(pct_items_for_80, 1),
+            "avg_score": round(avg_score, 1),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
