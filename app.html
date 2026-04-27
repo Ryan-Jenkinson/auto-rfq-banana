@@ -150,7 +150,31 @@
     <div class="actions">
       <button class="btn ghost" id="back-to-2">← Back</button>
       <button class="btn ghost" id="export-rfq-list">⬇ Export candidate list (xlsx)</button>
-      <button class="btn primary" id="to-suppliers" disabled>Set up suppliers → (Phase 2)</button>
+      <button class="btn primary" id="to-bids">Compare supplier bids →</button>
+    </div>
+  </section>
+
+  <!-- STEP 4: Returned-bid intake + comparison + consolidation -->
+  <section id="step-4" class="step" hidden>
+    <h1>Compare supplier bids</h1>
+    <p class="subtitle">Drop each supplier's returned bid xlsx (any number of suppliers — typically 2-5). The app auto-detects the response template, matches each bid line back to the RFQ via the McMaster Part Number, and surfaces consolidation winner + carve-out exceptions + outliers.</p>
+
+    <div id="bid-intake-row" class="bid-intake-row"></div>
+
+    <div class="actions" style="margin-top:0;">
+      <button class="btn ghost" id="bid-add-btn">＋ Add supplier bid xlsx</button>
+      <input type="file" id="bid-file-input" accept=".xlsx" style="display:none">
+      <button class="btn ghost" id="bid-clear-btn">Clear all bids</button>
+    </div>
+
+    <div id="bid-summary-row" class="kpi-row" style="margin-top:32px;"></div>
+
+    <div id="consolidation-block" style="margin-top:32px;"></div>
+
+    <div id="comparison-section" style="margin-top:32px;"></div>
+
+    <div class="actions">
+      <button class="btn ghost" id="back-to-3">← Back to RFQ list</button>
     </div>
   </section>
 

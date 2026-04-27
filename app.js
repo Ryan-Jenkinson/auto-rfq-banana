@@ -320,6 +320,11 @@ $('to-mapping').addEventListener('click', async () => {
 });
 $('back-to-1').addEventListener('click', () => _showStep(1));
 $('back-to-2').addEventListener('click', () => _showStep(2));
+$('back-to-3').addEventListener('click', () => _showStep(3));
+$('to-bids').addEventListener('click', async () => {
+  _showStep(4);
+  await _refreshBidViews();
+});
 
 // ==========================================================================
 // Step 2: column mapping (auto-detect via aliases + manual override)
@@ -662,6 +667,381 @@ base64.b64encode(_b).decode('ascii')
     btn.textContent = t;
   }
 });
+
+// ==========================================================================
+// Step 4 — Returned-bid intake + comparison matrix + consolidation
+// ==========================================================================
+let _loadedBids = {};   // {supplier_name: parsed_result}
+
+async function _onAddBidClick() {
+  const input = $('bid-file-input');
+  input.value = '';
+  input.click();
+}
+
+async function _onBidFileSelected(file) {
+  if (!file) return;
+  // Suggest supplier name from filename (strip extension + dates + RFQ tags)
+  const stem = file.name.replace(/\.xlsx$/i, '');
+  const suggest = stem
+    .replace(/^Andersen[\s_-]*/i, '')
+    .replace(/[\s_-]*RFQ.*/i, '')
+    .replace(/[\s_-]*\d+[\.\-]\d+.*/g, '')
+    .replace(/[\s_-]+/g, ' ')
+    .trim() || stem;
+  const name = prompt(`Supplier name for "${file.name}":`, suggest);
+  if (!name) return;
+
+  // Read + parse
+  $('bid-add-btn').disabled = true;
+  $('bid-add-btn').textContent = 'Parsing…';
+  try {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    _py.globals.set('_bid_bytes', bytes);
+    _py.globals.set('_bid_supplier', name);
+    const out = await _py.runPythonAsync(`
+import json
+from app_engine import ingest_supplier_bid
+json.dumps(ingest_supplier_bid(_bid_bytes.to_py(), _bid_supplier), default=str)
+`);
+    const parsed = JSON.parse(out);
+    _loadedBids[name] = parsed;
+    _saveMgr.markDirty();
+    await _refreshBidViews();
+  } catch (err) {
+    console.error('[bid intake] failed', err);
+    alert('Failed to parse bid file: ' + (err.message || err));
+  } finally {
+    $('bid-add-btn').disabled = false;
+    $('bid-add-btn').textContent = '＋ Add supplier bid xlsx';
+  }
+}
+
+$('bid-add-btn').addEventListener('click', _onAddBidClick);
+$('bid-file-input').addEventListener('change', (e) => _onBidFileSelected(e.target.files[0]));
+$('bid-clear-btn').addEventListener('click', async () => {
+  if (!confirm('Clear all loaded supplier bids?')) return;
+  _loadedBids = {};
+  await _py.runPythonAsync(`
+from app_engine import _STATE
+_STATE['bids'] = {}
+None
+`);
+  _saveMgr.markDirty();
+  await _refreshBidViews();
+});
+
+async function _refreshBidViews() {
+  _renderBidIntakeRow();
+  _renderBidSummary();
+  await _refreshConsolidationAndMatrix();
+}
+
+function _renderBidIntakeRow() {
+  const wrap = $('bid-intake-row');
+  if (!wrap) return;
+  const suppliers = Object.keys(_loadedBids);
+  if (!suppliers.length) {
+    wrap.innerHTML = `<div style="padding:32px;text-align:center;color:var(--ink-2);border:1px dashed var(--line);border-radius:6px;font-family:var(--ui);">No supplier bids loaded yet. Click "Add supplier bid xlsx" below.</div>`;
+    return;
+  }
+  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;">';
+  for (const sup of suppliers) {
+    const p = _loadedBids[sup];
+    const s = p.summary || {};
+    html += `
+      <div style="background:var(--bg-1);border:1px solid var(--line);border-radius:6px;padding:18px;">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;">
+          <div style="font-family:var(--ui);font-weight:600;font-size:16px;color:var(--ink-0);">${_escapeHtml(sup)}</div>
+          <button class="btn ghost" data-remove-supplier="${_escapeHtml(sup)}" style="padding:4px 10px;font-size:11px;">×</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;font-family:var(--mono);font-size:11px;">
+          <div><span style="color:var(--ink-2);">Lines</span> <strong style="color:var(--ink-0);">${(s.n_lines||0).toLocaleString()}</strong></div>
+          <div><span style="color:var(--ink-2);">Priced</span> <strong style="color:var(--green);">${(s.n_priced||0).toLocaleString()}</strong></div>
+          <div><span style="color:var(--ink-2);">No bid</span> <strong style="color:var(--ink-1);">${(s.n_no_bid||0).toLocaleString()}</strong></div>
+          <div><span style="color:var(--ink-2);">Need info</span> <strong style="color:var(--accent);">${(s.n_need_info||0).toLocaleString()}</strong></div>
+          <div><span style="color:var(--ink-2);">UOM disc</span> <strong style="color:var(--red);">${(s.n_uom_disc||0).toLocaleString()}</strong></div>
+          <div><span style="color:var(--ink-2);">Sub offered</span> <strong style="color:var(--cyan);">${(s.n_substitute||0).toLocaleString()}</strong></div>
+        </div>
+        <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);font-family:var(--mono);font-size:13px;">
+          <span style="color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Quoted value</span><br>
+          <strong style="color:var(--accent);font-size:18px;">$${(s.total_quoted_value||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</strong>
+        </div>
+      </div>
+    `;
+  }
+  html += '</div>';
+  wrap.innerHTML = html;
+  wrap.querySelectorAll('[data-remove-supplier]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const sup = btn.getAttribute('data-remove-supplier');
+      delete _loadedBids[sup];
+      await _py.runPythonAsync(`
+from app_engine import remove_supplier_bid
+remove_supplier_bid(${JSON.stringify(sup)})
+`);
+      _saveMgr.markDirty();
+      await _refreshBidViews();
+    });
+  });
+}
+
+function _renderBidSummary() {
+  const wrap = $('bid-summary-row');
+  if (!wrap) { return; }
+  if (!Object.keys(_loadedBids).length) { wrap.innerHTML = ''; return; }
+  // wait for async render
+}
+
+async function _refreshConsolidationAndMatrix() {
+  const consolEl = $('consolidation-block');
+  const compEl = $('comparison-section');
+  if (!Object.keys(_loadedBids).length) {
+    consolEl.innerHTML = '';
+    compEl.innerHTML = '';
+    $('bid-summary-row').innerHTML = '';
+    return;
+  }
+  consolEl.innerHTML = '<div style="padding:24px;color:var(--ink-2);font-family:var(--mono);font-size:12px;">Computing consolidation analysis…</div>';
+  compEl.innerHTML = '';
+
+  const out = await _py.runPythonAsync(`
+import json
+from app_engine import compute_comparison_matrix, compute_consolidation_analysis
+result = {
+  "matrix": compute_comparison_matrix(),
+  "consolidation": compute_consolidation_analysis(),
+}
+json.dumps(result, default=str)
+`);
+  const data = JSON.parse(out);
+  _renderBidCoverageKPIs(data.matrix);
+  _renderConsolidation(data.consolidation);
+  _renderComparisonMatrix(data.matrix);
+}
+
+function _renderBidCoverageKPIs(matrix) {
+  const wrap = $('bid-summary-row');
+  if (!wrap) return;
+  const sm = matrix.summary || {};
+  const fmt$ = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  wrap.innerHTML = `
+    <div class="kpi"><div class="kpi-label">3+ bids</div><div class="kpi-value" style="color:var(--green);">${(sm.n_with_3plus_bids||0).toLocaleString()}</div><div class="kpi-sub">full competition</div></div>
+    <div class="kpi"><div class="kpi-label">2 bids</div><div class="kpi-value" style="color:var(--accent);">${(sm.n_with_2_bids||0).toLocaleString()}</div><div class="kpi-sub">partial competition</div></div>
+    <div class="kpi"><div class="kpi-label">1 bid</div><div class="kpi-value" style="color:var(--cyan);">${(sm.n_with_1_bid||0).toLocaleString()}</div><div class="kpi-sub">single source</div></div>
+    <div class="kpi"><div class="kpi-label">0 bids</div><div class="kpi-value" style="color:var(--red);">${(sm.n_with_0_bids||0).toLocaleString()}</div><div class="kpi-sub">no bid — follow up</div></div>
+    <div class="kpi"><div class="kpi-label">Outliers</div><div class="kpi-value" style="color:var(--red);">${(sm.n_outliers_flagged||0).toLocaleString()}</div><div class="kpi-sub">>3× median or vs hist</div></div>
+    <div class="kpi"><div class="kpi-label">Lowest-bid total</div><div class="kpi-value">${fmt$(sm.total_lowest_value)}</div><div class="kpi-sub">if every item awarded to its lowest bid</div></div>
+    <div class="kpi"><div class="kpi-label">Historical baseline</div><div class="kpi-value">${fmt$(sm.total_historical_value)}</div><div class="kpi-sub">qty × last-paid price</div></div>
+  `;
+}
+
+function _renderConsolidation(consol) {
+  const el = $('consolidation-block');
+  const fmt$ = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const cands = consol.candidates || [];
+  const w = consol.winner;
+  if (!cands.length) { el.innerHTML = ''; return; }
+
+  // Candidates ranking
+  let html = '<h2 style="margin-top:0;">Consolidation candidates</h2>';
+  html += '<p class="subtitle" style="margin-bottom:18px;">Default award strategy: consolidate to one supplier. Then carve out exceptions where another supplier saves significantly on a specific item.</p>';
+  html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-bottom:24px;">';
+  html += '<table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;">';
+  html += `<thead style="background:var(--bg-2);"><tr>
+    <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Supplier</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Items quoted</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">% of RFQ</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Lowest on N items</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Award all to them</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Items they didn't quote</th>
+  </tr></thead><tbody>`;
+  cands.forEach((c, i) => {
+    const isWinner = i === 0;
+    html += `<tr style="border-bottom:1px solid var(--line);${isWinner ? 'background:rgba(255,183,51,0.06);' : ''}">
+      <td style="padding:12px 14px;font-weight:${isWinner ? '700' : '400'};color:${isWinner ? 'var(--accent)' : 'var(--ink-0)'};">
+        ${isWinner ? '★ ' : ''}${_escapeHtml(c.supplier)}
+      </td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${c.n_items_quoted.toLocaleString()}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${c.pct_items_quoted.toFixed(1)}%</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${c.n_items_lowest.toLocaleString()} (${c.pct_items_lowest.toFixed(0)}%)</td>
+      <td style="padding:12px 14px;text-align:right;color:${isWinner ? 'var(--accent)' : 'var(--ink-0)'};font-weight:${isWinner ? '700' : '500'};">${fmt$(c.consolidation_value)}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-2);">${c.items_not_quoted.toLocaleString()}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+
+  // Winner award math
+  if (w) {
+    const realCarves = (w.carve_outs || []).filter(c => !c.verify_uom);
+    const uomCarves = (w.carve_outs || []).filter(c => c.verify_uom);
+    html += `<div style="background:var(--bg-1);border:1px solid var(--accent);border-radius:6px;padding:24px;margin-bottom:24px;">
+      <div style="font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.16em;font-weight:600;margin-bottom:6px;">Recommended award (consolidation + carve-outs)</div>
+      <div style="font-family:var(--ui);font-size:24px;font-weight:600;color:var(--ink-0);margin-bottom:18px;">★ ${_escapeHtml(w.supplier)} <span style="color:var(--ink-2);font-size:14px;font-weight:400;">as primary, with ${realCarves.length} verified carve-out${realCarves.length === 1 ? '' : 's'}</span></div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;">
+        <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Winner base</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--ink-0);margin-top:4px;">${fmt$(w.consolidation_value)}</div></div>
+        <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">− Carve-outs (verified)</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--green);margin-top:4px;">−${fmt$(w.carve_out_savings_total)}</div></div>
+        <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">+ Items winner skipped</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--ink-1);margin-top:4px;">+${fmt$(w.items_at_best_alt_value)}</div></div>
+        <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">= Final award</div><div style="font-family:var(--mono);font-size:22px;font-weight:700;color:var(--accent);margin-top:4px;">${fmt$(w.final_award_value)}</div></div>
+        <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">vs Historical</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--ink-1);margin-top:4px;">${fmt$(w.historical_value)}</div></div>
+        <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Net savings</div><div style="font-family:var(--mono);font-size:22px;font-weight:700;color:var(--green);margin-top:4px;">${fmt$(w.savings_vs_history)}</div></div>
+      </div>
+    </div>`;
+
+    // Verified carve-outs
+    if (realCarves.length) {
+      html += `<details open style="margin-bottom:14px;"><summary style="cursor:pointer;padding:10px 0;font-family:var(--ui);font-size:13px;font-weight:600;color:var(--ink-0);">${realCarves.length} verified carve-out${realCarves.length === 1 ? '' : 's'} — ${fmt$(w.carve_out_savings_total)} additional savings</summary>`;
+      html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:400px;margin-top:8px;"><table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
+      html += `<thead style="background:var(--bg-2);position:sticky;top:0;"><tr>
+        <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item #</th>
+        <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Description</th>
+        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty</th>
+        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Winner $/ea</th>
+        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Carve to → $/ea</th>
+        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Savings</th>
+      </tr></thead><tbody>`;
+      for (const co of realCarves.slice(0, 200)) {
+        html += `<tr style="border-bottom:1px solid var(--line);">
+          <td style="padding:10px;color:var(--ink-0);">${_escapeHtml(co.item_num)}</td>
+          <td style="padding:10px;color:var(--ink-1);max-width:280px;">${_escapeHtml(_truncate(co.description, 60))}</td>
+          <td style="padding:10px;text-align:right;color:var(--ink-1);">${(co.qty_24mo||0).toLocaleString()}</td>
+          <td style="padding:10px;text-align:right;color:var(--ink-1);">$${co.winner_price.toFixed(2)}</td>
+          <td style="padding:10px;text-align:right;color:var(--cyan);"><strong>${_escapeHtml(co.carve_supplier)}</strong> $${co.carve_price.toFixed(2)}</td>
+          <td style="padding:10px;text-align:right;color:var(--green);font-weight:600;">$${co.savings_total.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})} <span style="color:var(--ink-2);">(${co.savings_pct.toFixed(0)}%)</span></td>
+        </tr>`;
+      }
+      if (realCarves.length > 200) {
+        html += `<tr><td colspan="6" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${realCarves.length - 200} more verified carve-outs</td></tr>`;
+      }
+      html += '</tbody></table></div></details>';
+    }
+
+    // UOM-suspect carve-outs (NOT counted in savings)
+    if (uomCarves.length) {
+      const uomSuspectTotal = uomCarves.reduce((sum, c) => sum + c.savings_total, 0);
+      html += `<details style="margin-bottom:14px;"><summary style="cursor:pointer;padding:10px 0;font-family:var(--ui);font-size:13px;font-weight:600;color:var(--red);">⚠ ${uomCarves.length} UOM-suspect carve-out${uomCarves.length === 1 ? '' : 's'} — apparent ${fmt$(uomSuspectTotal)} savings NOT counted (verify UOM first)</summary>`;
+      html += '<p style="color:var(--ink-2);font-size:12px;margin:8px 0;">These look like huge savings but the supplier annotated a UOM mismatch (e.g. "per each vs per package") OR the price ratio is >20×. Almost certainly false positives — confirm with the supplier before treating as real savings.</p>';
+      html += '<div style="border:1px solid var(--red);border-radius:6px;overflow:auto;max-height:300px;background:rgba(255,77,109,0.04);"><table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
+      html += `<thead style="background:var(--bg-2);position:sticky;top:0;"><tr>
+        <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item #</th>
+        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty</th>
+        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Winner $/ea</th>
+        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Other → $/ea</th>
+        <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Note</th>
+      </tr></thead><tbody>`;
+      for (const co of uomCarves.slice(0, 100)) {
+        const note = (co.carve_notes || co.winner_notes || '').slice(0, 60);
+        html += `<tr style="border-bottom:1px solid rgba(255,77,109,0.18);">
+          <td style="padding:10px;color:var(--ink-0);">${_escapeHtml(co.item_num)}</td>
+          <td style="padding:10px;text-align:right;color:var(--ink-1);">${(co.qty_24mo||0).toLocaleString()}</td>
+          <td style="padding:10px;text-align:right;color:var(--ink-1);">$${co.winner_price.toFixed(2)}</td>
+          <td style="padding:10px;text-align:right;color:var(--red);"><strong>${_escapeHtml(co.carve_supplier)}</strong> $${co.carve_price.toFixed(2)}</td>
+          <td style="padding:10px;color:var(--ink-2);font-style:italic;">${_escapeHtml(note)}</td>
+        </tr>`;
+      }
+      html += '</tbody></table></div></details>';
+    }
+
+    // Items winner didn't quote
+    const orphans = w.items_winner_didnt_quote || [];
+    const noBidByAny = orphans.filter(o => !o.best_alt_supplier);
+    const coveredByAlt = orphans.filter(o => o.best_alt_supplier);
+    if (orphans.length) {
+      html += `<details style="margin-bottom:14px;"><summary style="cursor:pointer;padding:10px 0;font-family:var(--ui);font-size:13px;font-weight:600;color:var(--ink-0);">${orphans.length} items winner didn't quote — ${coveredByAlt.length} covered by alternate, <span style="color:var(--red);">${noBidByAny.length} have NO bid</span></summary>`;
+      if (noBidByAny.length) {
+        const totalAtRisk = noBidByAny.reduce((s, o) => s + (o.value_at_history || 0), 0);
+        html += `<p style="color:var(--red);font-size:12px;margin:8px 0;font-weight:600;">${noBidByAny.length} items got NO bid from any supplier — ${fmt$(totalAtRisk)} of historical spend at risk. Need to follow up or drop from RFQ.</p>`;
+      }
+      html += '</details>';
+    }
+  }
+
+  el.innerHTML = html;
+}
+
+function _renderComparisonMatrix(matrix) {
+  const el = $('comparison-section');
+  const suppliers = matrix.suppliers || [];
+  const rows = matrix.rows || [];
+  if (!suppliers.length) { el.innerHTML = ''; return; }
+
+  // Filter to only items with at least one bid by default — cleaner view
+  const rowsWithBids = rows.filter(r => r.n_quoted > 0);
+
+  let html = `<h2 style="margin-top:0;">Comparison matrix · ${rowsWithBids.length.toLocaleString()} items with at least one bid <span style="color:var(--ink-2);font-size:14px;font-weight:400;">(${rows.length - rowsWithBids.length} no-bid items hidden)</span></h2>`;
+  html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:70vh;">';
+  html += '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
+  html += `<thead style="background:var(--bg-2);position:sticky;top:0;z-index:1;"><tr>
+    <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item #</th>
+    <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Description</th>
+    <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty 24mo</th>
+    <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Last $/ea</th>`;
+  for (const sup of suppliers) {
+    html += `<th style="padding:10px;text-align:right;color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;border-left:1px solid var(--line);">${_escapeHtml(sup)}</th>`;
+  }
+  html += `<th style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Cov</th>
+    <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Flags</th>
+  </tr></thead><tbody>`;
+
+  // Sort by 24-mo qty × hist price desc (highest-value items first)
+  rowsWithBids.sort((a, b) => (b.qty_24mo * (b.last_unit_price || 0)) - (a.qty_24mo * (a.last_unit_price || 0)));
+  const cap = 500;
+  const slice = rowsWithBids.slice(0, cap);
+  for (const r of slice) {
+    const lowestSup = r.lowest_supplier;
+    let cells = '';
+    for (const sup of suppliers) {
+      const b = r.bids[sup] || {};
+      const isLow = (sup === lowestSup);
+      let cellContent = '';
+      let cellColor = 'var(--ink-1)';
+      if (b.status === 'MISSING') {
+        cellContent = '—';
+        cellColor = 'var(--ink-2)';
+      } else if (b.status === 'NO_BID') {
+        cellContent = 'no bid';
+        cellColor = 'var(--ink-2)';
+      } else if (b.status === 'NEED_INFO') {
+        cellContent = 'need info';
+        cellColor = 'var(--accent)';
+      } else if (b.price != null) {
+        cellContent = '$' + b.price.toFixed(2);
+        if (b.status === 'UOM_DISC') cellContent += ' ⚠';
+        if (b.status === 'SUBSTITUTE') cellContent += ' †';
+        cellColor = isLow ? 'var(--green)' : 'var(--ink-0)';
+      }
+      cells += `<td style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);color:${cellColor};font-weight:${isLow ? '700' : '400'};">${cellContent}</td>`;
+    }
+    const covColor = r.coverage === 'FULL' ? 'var(--green)' : r.coverage === 'PARTIAL' ? 'var(--accent)' : r.coverage === 'SINGLE' ? 'var(--cyan)' : 'var(--red)';
+    const flagsTxt = (r.flags || []).slice(0, 2).map(f => f.split(':')[0]).join(', ');
+    html += `<tr style="border-bottom:1px solid rgba(122,109,115,0.25);" data-comp-item="${_escapeHtml(r.item_num)}">
+      <td style="padding:8px 10px;color:var(--ink-0);">${_escapeHtml(r.item_num)}</td>
+      <td style="padding:8px 10px;color:var(--ink-1);max-width:240px;">${_escapeHtml(_truncate(r.description, 50))}</td>
+      <td style="padding:8px 10px;text-align:right;color:var(--ink-0);">${(r.qty_24mo||0).toLocaleString()}</td>
+      <td style="padding:8px 10px;text-align:right;color:var(--ink-1);">$${(r.last_unit_price||0).toFixed(2)}</td>
+      ${cells}
+      <td style="padding:8px 10px;text-align:center;color:${covColor};font-weight:600;font-size:10px;">${r.coverage}</td>
+      <td style="padding:8px 10px;color:var(--red);font-size:10px;">${_escapeHtml(flagsTxt)}</td>
+    </tr>`;
+  }
+  if (rowsWithBids.length > cap) {
+    html += `<tr><td colspan="${suppliers.length + 6}" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${(rowsWithBids.length - cap).toLocaleString()} more items hidden</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+  html += '<div style="margin-top:8px;color:var(--ink-2);font-size:11px;font-family:var(--mono);">⚠ = UOM discrepancy noted by supplier &nbsp;·&nbsp; † = substitute part offered &nbsp;·&nbsp; <strong style="color:var(--green);">green</strong> = lowest non-flagged bid</div>';
+
+  el.innerHTML = html;
+
+  // Wire row click → open per-item history modal
+  el.querySelectorAll('tr[data-comp-item]').forEach(tr => {
+    tr.style.cursor = 'pointer';
+    tr.addEventListener('click', () => {
+      const k = tr.getAttribute('data-comp-item');
+      _openItemHistory(k);
+    });
+  });
+}
 
 // ==========================================================================
 // Per-item history modal — drill-into for any RFQ row.

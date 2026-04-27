@@ -1092,6 +1092,729 @@ def gen_candidate_rfq_list_xlsx(included_keys=None) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Returned-bid intake — parses each supplier's response file.
+#
+# Three observed file shapes in the McMaster RFQ:
+#   1. "Our format" (Grainger primary, MSC, Fastenal): banner row at top,
+#      real headers at row 7 (1-indexed). Cols 1-10:
+#        1=Commodity 2=Item 3=EAM Part # 4=Part Number (= McMaster anchor)
+#        5=Item # 6=Manufacturer Name 7=Qty 8=UOM 9=Quoted Price 10=Notes
+#      Fastenal extends to 20 cols with substitute-part / verified-pricing data.
+#   2. "Their format" (Grainger secondary): completely restructured. NOT
+#      auto-handled in v1 — falls back to manual mapping (TODO).
+#
+# No-bid signals (treat as not quoted, not a real $0 line):
+#   - Quoted Price is 0 / empty / None
+#   - Notes contains "need more information" / "n/a" / "discontinued" / "obsolete"
+# ---------------------------------------------------------------------------
+
+# Status enum-ish strings used in the comparison matrix
+BID_STATUS_PRICED      = "PRICED"        # quoted with a real price
+BID_STATUS_NO_BID      = "NO_BID"        # supplier explicitly declined or left blank
+BID_STATUS_NEED_INFO   = "NEED_INFO"     # supplier asked for clarification
+BID_STATUS_UOM_DISC    = "UOM_DISC"      # priced but with a UOM-mismatch warning
+BID_STATUS_SUBSTITUTE  = "SUBSTITUTE"    # priced with an alternate part offered
+
+NO_BID_NOTE_MARKERS = (
+    "need more information", "need more info", "need info", "more info",
+    "n/a", "na", "discontinued", "obsolete", "no quote", "no bid",
+    "unable to quote", "cannot quote", "not available", "not stocked",
+    "no longer available", "tbd", "to be quoted",
+)
+
+
+def _matches_no_bid(notes_text: str) -> bool:
+    if not notes_text:
+        return False
+    t = str(notes_text).strip().lower()
+    if not t:
+        return False
+    return any(m in t for m in NO_BID_NOTE_MARKERS)
+
+
+def _detect_our_format(ws) -> int:
+    """Look for the canonical header row in our-format response files.
+    Returns the 1-indexed row number where headers live, or 0 if not detected.
+
+    The signature: at least 4 cells in the row that EXACTLY match expected
+    header names (after strip + lowercase). Banner rows that contain the
+    phrase 'quoted price' embedded in long instruction text don't match
+    because we require exact cell equality, not substring.
+    """
+    expected = {
+        "commodity", "item", "eam part number", "part number", "partnumber",
+        "item #", "manufacturer name", "qty", "uom", "quoted price", "notes",
+    }
+    for r_idx in range(1, 16):
+        try:
+            row = next(ws.iter_rows(min_row=r_idx, max_row=r_idx, values_only=True), None)
+        except Exception:
+            continue
+        if not row:
+            continue
+        cells = [str(c or "").strip().lower() for c in row]
+        hits = sum(1 for c in cells if c in expected)
+        if hits >= 4:
+            return r_idx
+    return 0
+
+
+def _our_format_columns(header_row: tuple) -> dict:
+    """Map the 'our format' headers to logical fields.
+    Handles the 11-col primary layout AND the 20-col Fastenal extension."""
+    cols = {}
+    for i, raw in enumerate(header_row):
+        if raw is None:
+            continue
+        h = str(raw).strip().lower()
+        if not h:
+            continue
+        # Core columns (assigned only once — first match wins for ambiguous names)
+        if h == "commodity" and "commodity" not in cols:
+            cols["commodity"] = i
+        elif h == "item" and "description" not in cols:
+            cols["description"] = i
+        elif h == "eam part number" and "eam_pn" not in cols:
+            cols["eam_pn"] = i
+        elif h in ("part number", "partnumber") and "part_number" not in cols:
+            cols["part_number"] = i        # = McMaster anchor
+        elif h == "item #" and "item_num" not in cols:
+            cols["item_num"] = i
+        elif h == "manufacturer name" and "mfg_name" not in cols:
+            cols["mfg_name"] = i
+        elif h == "qty" and "qty" not in cols:
+            cols["qty"] = i
+        elif h == "uom" and "uom" not in cols:
+            cols["uom"] = i
+        elif h == "quoted price" and "quoted_price" not in cols:
+            cols["quoted_price"] = i
+        elif h == "notes" and "notes" not in cols:
+            cols["notes"] = i
+        elif h == "verified pricing" and "verified_price" not in cols:
+            cols["verified_price"] = i     # Fastenal extension
+        elif h.startswith("exact ") and "part" in h and "exact_part" not in cols:
+            cols["exact_part"] = i         # Fastenal: their exact catalog part
+        elif h.startswith("exact ") and "description" in h and "exact_desc" not in cols:
+            cols["exact_desc"] = i
+        elif h.startswith("sub ") and "part" in h and "sub_part" not in cols:
+            cols["sub_part"] = i           # Fastenal: substitute offered
+        elif h.startswith("sub ") and "description" in h and "sub_desc" not in cols:
+            cols["sub_desc"] = i
+        elif h == "sell price/uom" and "sub_price" not in cols:
+            cols["sub_price"] = i
+        elif h == "notes" and "notes_2" not in cols:
+            cols["notes_2"] = i            # Fastenal's second notes col
+    return cols
+
+
+def parse_supplier_bid(file_bytes, supplier_name: str = "") -> dict:
+    """Parse one supplier's returned-bid xlsx. Auto-detects 'our format'
+    (banner + headers around row 7). Returns:
+
+        {
+          "supplier": str,
+          "bids": [{rfq_key, item_num, part_number, mfg_name, description,
+                    qty, uom, quoted_price, notes, status, alt_part,
+                    verified_price, has_substitute, ...}, ...],
+          "summary": {
+              "n_lines": int, "n_priced": int, "n_no_bid": int,
+              "n_need_info": int, "n_uom_disc": int, "n_substitute": int,
+              "total_quoted_value": float,
+          },
+          "format": "our_format" | "unknown",
+        }
+    """
+    if not isinstance(file_bytes, (bytes, bytearray)):
+        file_bytes = bytes(file_bytes)
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    header_row_idx = _detect_our_format(ws)
+    if not header_row_idx:
+        wb.close()
+        return {"supplier": supplier_name, "bids": [], "format": "unknown",
+                "summary": {"n_lines": 0, "n_priced": 0, "n_no_bid": 0,
+                            "n_need_info": 0, "n_uom_disc": 0, "n_substitute": 0,
+                            "total_quoted_value": 0.0},
+                "error": "Could not auto-detect header row. Use manual column mapping."}
+
+    header_row = next(ws.iter_rows(min_row=header_row_idx, max_row=header_row_idx, values_only=True))
+    cols = _our_format_columns(header_row)
+
+    def g(row, field):
+        i = cols.get(field)
+        return None if (i is None or i >= len(row)) else row[i]
+
+    bids = []
+    n_priced = n_no_bid = n_need_info = n_uom_disc = n_substitute = 0
+    total_value = 0.0
+
+    for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        if row is None:
+            continue
+        # Anchor key: McMaster Part Number (the column we sent — same anchor
+        # the supplier filled prices against). Fall back to Item # then EAM.
+        part = norm_text(g(row, "part_number"))
+        item = norm_text(g(row, "item_num"))
+        eam  = norm_text(g(row, "eam_pn"))
+        if _is_blanky(part): part = ""
+        if _is_blanky(item): item = ""
+        if _is_blanky(eam):  eam  = ""
+        key_raw = part or item or eam
+        if not key_raw:
+            continue
+        rfq_key = norm_pn(key_raw)
+
+        qty = safe_float(g(row, "qty"))
+        quoted = safe_float(g(row, "quoted_price"))
+        verified = safe_float(g(row, "verified_price"))
+        notes = norm_text(g(row, "notes")) or ""
+        notes_2 = norm_text(g(row, "notes_2")) or ""
+        if notes_2 and notes_2 not in notes:
+            notes = (notes + " | " + notes_2).strip(" |")
+        sub_part = norm_text(g(row, "sub_part")) or ""
+        sub_desc = norm_text(g(row, "sub_desc")) or ""
+        sub_price = safe_float(g(row, "sub_price"))
+        exact_part = norm_text(g(row, "exact_part")) or ""
+        exact_desc = norm_text(g(row, "exact_desc")) or ""
+
+        # Status determination — order matters
+        is_no_bid = (
+            (quoted is None or quoted == 0) and verified is None
+        ) or _matches_no_bid(notes)
+        has_uom_warning = "uom" in notes.lower() and ("disc" in notes.lower() or "mismatch" in notes.lower() or "differ" in notes.lower())
+        has_substitute_offered = bool(sub_part) and not is_no_bid
+
+        if is_no_bid:
+            if any(m in notes.lower() for m in ("need more info", "need info", "more info", "tbd", "to be quoted")):
+                status = BID_STATUS_NEED_INFO
+                n_need_info += 1
+            else:
+                status = BID_STATUS_NO_BID
+                n_no_bid += 1
+        elif has_uom_warning:
+            status = BID_STATUS_UOM_DISC
+            n_uom_disc += 1
+            n_priced += 1
+        elif has_substitute_offered:
+            status = BID_STATUS_SUBSTITUTE
+            n_substitute += 1
+            n_priced += 1
+        else:
+            status = BID_STATUS_PRICED
+            n_priced += 1
+
+        # Effective price — verified takes precedence (it's the "we re-confirmed"
+        # value Fastenal added) but we keep the raw quoted value for transparency
+        effective_price = verified if (verified is not None and verified > 0) else quoted
+        if effective_price is not None and qty is not None and effective_price > 0:
+            total_value += effective_price * qty
+
+        bids.append({
+            "rfq_key": rfq_key,
+            "item_num": item,
+            "part_number": part,
+            "eam_pn": eam,
+            "mfg_name": norm_text(g(row, "mfg_name")) or "",
+            "description": norm_text(g(row, "description")) or "",
+            "commodity": norm_text(g(row, "commodity")) or "",
+            "qty": qty,
+            "uom": norm_text(g(row, "uom")) or "",
+            "quoted_price": quoted,
+            "verified_price": verified,
+            "effective_price": effective_price,
+            "notes": notes,
+            "status": status,
+            # Fastenal-style extensions (empty for other suppliers)
+            "exact_part": exact_part,
+            "exact_desc": exact_desc,
+            "sub_part": sub_part,
+            "sub_desc": sub_desc,
+            "sub_price": sub_price,
+            "has_substitute": has_substitute_offered,
+        })
+
+    wb.close()
+
+    return {
+        "supplier": supplier_name or "(unnamed)",
+        "format": "our_format",
+        "header_row": header_row_idx,
+        "columns_detected": cols,
+        "bids": bids,
+        "summary": {
+            "n_lines": len(bids),
+            "n_priced": n_priced,
+            "n_no_bid": n_no_bid,
+            "n_need_info": n_need_info,
+            "n_uom_disc": n_uom_disc,
+            "n_substitute": n_substitute,
+            "total_quoted_value": total_value,
+        },
+    }
+
+
+def ingest_supplier_bid(file_bytes, supplier_name: str) -> dict:
+    """Parse and persist a supplier bid into _STATE. Returns the parse result.
+
+    Replaces any prior bid for the same supplier_name (re-uploads overwrite).
+    """
+    parsed = parse_supplier_bid(file_bytes, supplier_name)
+    if "bids" not in _STATE or not isinstance(_STATE.get("bids"), dict):
+        _STATE["bids"] = {}
+    _STATE["bids"][supplier_name] = parsed
+    return parsed
+
+
+def list_supplier_bids() -> list:
+    """Summary of all loaded bids."""
+    bids = _STATE.get("bids", {})
+    return [
+        {
+            "supplier": s,
+            "format": p.get("format"),
+            "summary": p.get("summary", {}),
+        }
+        for s, p in bids.items()
+    ]
+
+
+def remove_supplier_bid(supplier_name: str) -> bool:
+    bids = _STATE.get("bids", {}) or {}
+    if supplier_name in bids:
+        del bids[supplier_name]
+        _STATE["bids"] = bids
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Cross-supplier comparison + outlier detection
+# ---------------------------------------------------------------------------
+
+def _outlier_factor():
+    """Tunable: a quote is an outlier if it's >= this multiple of the median
+    OR <= 1/this multiple. Default 3.0 — picks up the "supplier C bid $784
+    for a $40 part" scenario without flagging normal price spread."""
+    return 3.0
+
+
+def compute_comparison_matrix(included_keys=None) -> dict:
+    """Build the cross-supplier comparison view for the loaded RFQ items
+    against the loaded supplier bids.
+
+    Returns:
+        {
+          "suppliers": [supplier_name, ...],   # ordered, columns of the matrix
+          "rows": [
+             {
+               "rfq_key", "item_num", "part_number", "description", "mfg_name",
+               "uom", "qty_24mo", "last_unit_price", "tier", "score",
+               "bids": {supplier: {price, status, notes, alt_part, ...}, ...},
+               "n_quoted": int,
+               "coverage": "FULL" | "PARTIAL" | "SINGLE" | "NONE",
+               "lowest_supplier": str | None,
+               "lowest_price": float | None,
+               "winner_savings_vs_history": float | None,
+               "spread_pct": float | None,    # (max - min) / median
+               "flags": [str, ...],
+             }, ...
+          ],
+          "summary": {
+             "n_items": int,
+             "n_with_3plus_bids": int,
+             "n_with_2_bids": int,
+             "n_with_1_bid": int,
+             "n_with_0_bids": int,
+             "n_outliers_flagged": int,
+             "total_lowest_value": float,
+             "total_historical_value": float,
+             "estimated_savings": float,
+          }
+        }
+    """
+    items = _STATE.get("items", [])
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+    suppliers = list(bids_by_supplier.keys())
+
+    if included_keys is not None:
+        keep = set(included_keys)
+        items = [it for it in items if it["item_num"] in keep]
+
+    # Build a lookup: (supplier, rfq_key) -> bid record
+    bid_lookup = {}
+    for sup, parsed in bids_by_supplier.items():
+        for b in parsed.get("bids", []):
+            bid_lookup[(sup, b["rfq_key"])] = b
+
+    rows = []
+    n_full = n_two = n_one = n_zero = n_outliers = 0
+    total_lowest = 0.0
+    total_historical = 0.0
+    est_savings = 0.0
+    n_sup = len(suppliers)
+    outlier_factor = _outlier_factor()
+
+    for it in items:
+        rfq_key = it["key"]
+        per_sup = {}
+        priced_values = []  # only PRICED-status bids contribute to outlier math
+        for sup in suppliers:
+            b = bid_lookup.get((sup, rfq_key))
+            if b is None:
+                per_sup[sup] = {"status": "MISSING", "price": None, "notes": "", "raw": None}
+                continue
+            per_sup[sup] = {
+                "status": b["status"],
+                "price": b["effective_price"],
+                "notes": b["notes"],
+                "raw": b,
+            }
+            if b["status"] in (BID_STATUS_PRICED, BID_STATUS_UOM_DISC, BID_STATUS_SUBSTITUTE) \
+               and b["effective_price"] is not None and b["effective_price"] > 0:
+                priced_values.append((sup, b["effective_price"]))
+
+        n_quoted = len(priced_values)
+        coverage = (
+            "FULL" if n_quoted >= n_sup and n_sup >= 3
+            else "PARTIAL" if n_quoted >= 2
+            else "SINGLE" if n_quoted == 1
+            else "NONE"
+        )
+        if n_quoted == 0: n_zero += 1
+        elif n_quoted == 1: n_one += 1
+        elif n_quoted == 2: n_two += 1
+        else: n_full += 1
+
+        lowest_supplier = None
+        lowest_price = None
+        spread_pct = None
+        flags = []
+
+        if priced_values:
+            priced_values.sort(key=lambda t: t[1])
+            lowest_supplier, lowest_price = priced_values[0]
+            highest_price = priced_values[-1][1]
+            if len(priced_values) >= 2:
+                med = _median([p for _, p in priced_values])
+                if med and med > 0:
+                    spread_pct = (highest_price - lowest_price) / med * 100.0
+                    # Outlier flag — any bid > Nx median or < median/N
+                    for sup, p in priced_values:
+                        if p >= med * outlier_factor:
+                            flags.append(f"OUTLIER_HIGH:{sup}=${p:.2f}vs_median${med:.2f}")
+                            n_outliers += 1
+                        elif p <= med / outlier_factor:
+                            flags.append(f"OUTLIER_LOW:{sup}=${p:.2f}vs_median${med:.2f}")
+                            n_outliers += 1
+            # vs historical
+            hist = it.get("last_unit_price")
+            if hist and hist > 0:
+                if lowest_price >= hist * outlier_factor:
+                    flags.append(f"ALL_BIDS_HIGH:lowest${lowest_price:.2f}_vs_paid${hist:.2f}")
+                elif lowest_price <= hist / outlier_factor:
+                    flags.append(f"BIG_SAVINGS:lowest${lowest_price:.2f}_vs_paid${hist:.2f}")
+
+        # No-bid coverage flag (high-spend items with no quotes need follow-up)
+        if n_quoted == 0:
+            spend_24 = it.get("spend_24mo_actual") or 0
+            if spend_24 >= 1000:
+                flags.append(f"NO_BID_HIGH_SPEND:${spend_24:,.0f}_24mo_at_risk")
+
+        # Award math — best-case scenario at lowest non-flagged bid
+        qty_24 = it.get("qty_24mo") or 0
+        hist_price = it.get("last_unit_price") or 0
+        if lowest_price and qty_24:
+            total_lowest += lowest_price * qty_24
+        if hist_price and qty_24:
+            total_historical += hist_price * qty_24
+
+        rows.append({
+            "rfq_key": rfq_key,
+            "item_num": it["item_num"],
+            "part_number": it.get("part_number") or "",
+            "description": it["description"],
+            "mfg_name": it["mfg_name"],
+            "uom": it["uom"],
+            "qty_24mo": qty_24,
+            "last_unit_price": hist_price,
+            "tier": it.get("tier"),
+            "score": it.get("score"),
+            "bids": per_sup,
+            "n_quoted": n_quoted,
+            "coverage": coverage,
+            "lowest_supplier": lowest_supplier,
+            "lowest_price": lowest_price,
+            "spread_pct": spread_pct,
+            "flags": flags,
+        })
+
+    est_savings = total_historical - total_lowest
+
+    return {
+        "suppliers": suppliers,
+        "rows": rows,
+        "summary": {
+            "n_items": len(rows),
+            "n_with_3plus_bids": n_full,
+            "n_with_2_bids": n_two,
+            "n_with_1_bid": n_one,
+            "n_with_0_bids": n_zero,
+            "n_outliers_flagged": n_outliers,
+            "total_lowest_value": total_lowest,
+            "total_historical_value": total_historical,
+            "estimated_savings": est_savings,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Consolidation analysis — Ryan's actual award strategy.
+#
+# Default: consolidate to ONE supplier (operational simplicity beats per-line
+# lowest pricing when the savings are small). Then carve out a limited set
+# of "extreme exceptions" — items where another supplier saves enough on a
+# single item to justify splitting the award.
+# ---------------------------------------------------------------------------
+
+# Tunable: an item is a carve-out candidate if another supplier saves at least
+# this fraction of the consolidation winner's price on it. Default 30%.
+DEFAULT_CARVE_OUT_THRESHOLD = 0.30
+
+
+def compute_consolidation_analysis(included_keys=None, carve_threshold: float = None) -> dict:
+    """Rank suppliers as candidate consolidation winners and quantify the
+    impact of carving out exceptions where someone else is meaningfully
+    cheaper on individual items.
+
+    Returns:
+      {
+        "candidates": [
+          {
+            "supplier": str,
+            "n_items_quoted": int,
+            "pct_items_quoted": float,
+            "n_items_lowest": int,
+            "pct_items_lowest": float,
+            "consolidation_value": float,    # award everything they quoted, at their prices
+            "items_not_quoted": int,         # items in the RFQ this supplier didn't quote
+            "consolidation_coverage_pct": float,   # share of total RFQ qty they cover
+            "missing_value_at_history": float,     # value of items they didn't quote, at hist price
+          }, ... sorted by consolidation_value asc (cheapest first)
+        ],
+        "winner": {
+          "supplier": str,
+          "consolidation_value": float,
+          "carve_outs": [
+            {
+              "rfq_key", "item_num", "description",
+              "winner_price", "winner_supplier",
+              "carve_supplier", "carve_price",
+              "qty_24mo", "savings_per_unit", "savings_total",
+              "savings_pct"
+            }, ... sorted by savings_total desc
+          ],
+          "carve_out_savings_total": float,
+          "items_winner_didnt_quote": [
+            {"rfq_key", "item_num", "description", "qty_24mo",
+             "best_alt_supplier", "best_alt_price",
+             "value_at_best_alt", "value_at_history"}, ...
+          ],
+          "final_award_value": float,    # winner-base − carveout-savings + missing-items-at-best-alt
+          "final_award_value_vs_history": float,  # vs historical at last_unit_price
+        } | None,
+        "summary": {
+          "n_suppliers": int,
+          "n_items": int,
+          "carve_out_threshold_pct": float,
+        }
+      }
+    """
+    if carve_threshold is None:
+        carve_threshold = DEFAULT_CARVE_OUT_THRESHOLD
+
+    items = _STATE.get("items", [])
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+    suppliers = list(bids_by_supplier.keys())
+
+    if included_keys is not None:
+        keep = set(included_keys)
+        items = [it for it in items if it["item_num"] in keep]
+
+    # Build (supplier, rfq_key) → bid lookup
+    bid_lookup = {}
+    for sup, parsed in bids_by_supplier.items():
+        for b in parsed.get("bids", []):
+            if b["status"] in (BID_STATUS_PRICED, BID_STATUS_UOM_DISC, BID_STATUS_SUBSTITUTE) \
+               and b["effective_price"] is not None and b["effective_price"] > 0:
+                bid_lookup[(sup, b["rfq_key"])] = b
+
+    n_items = len(items)
+    candidates = []
+    for sup in suppliers:
+        n_quoted = 0
+        n_lowest = 0
+        consol_value = 0.0
+        missing_at_history = 0.0
+        items_not_quoted = 0
+        for it in items:
+            qty = it.get("qty_24mo") or 0
+            sup_bid = bid_lookup.get((sup, it["key"]))
+            if sup_bid:
+                n_quoted += 1
+                consol_value += sup_bid["effective_price"] * qty
+                # Are they the lowest among all suppliers for this item?
+                others = [bid_lookup.get((s, it["key"])) for s in suppliers]
+                priced = [b["effective_price"] for b in others if b]
+                if priced and sup_bid["effective_price"] == min(priced):
+                    n_lowest += 1
+            else:
+                items_not_quoted += 1
+                hist = it.get("last_unit_price") or 0
+                if hist > 0:
+                    missing_at_history += hist * qty
+
+        candidates.append({
+            "supplier": sup,
+            "n_items_quoted": n_quoted,
+            "pct_items_quoted": (100.0 * n_quoted / n_items) if n_items else 0.0,
+            "n_items_lowest": n_lowest,
+            "pct_items_lowest": (100.0 * n_lowest / n_quoted) if n_quoted else 0.0,
+            "consolidation_value": consol_value,
+            "items_not_quoted": items_not_quoted,
+            "consolidation_coverage_pct": (100.0 * n_quoted / n_items) if n_items else 0.0,
+            "missing_value_at_history": missing_at_history,
+        })
+
+    # Sort by consolidation_value ASC (cheapest = best consolidation candidate)
+    # Tiebreak: more items quoted (higher coverage) wins
+    candidates.sort(key=lambda c: (c["consolidation_value"], -c["n_items_quoted"]))
+
+    winner_block = None
+    if candidates:
+        winner = candidates[0]
+        winner_sup = winner["supplier"]
+        carve_outs = []
+        items_not_quoted_details = []
+        carve_savings_total = 0.0
+        items_at_best_alt = 0.0
+
+        for it in items:
+            qty = it.get("qty_24mo") or 0
+            winner_bid = bid_lookup.get((winner_sup, it["key"]))
+            other_bids = [
+                (s, bid_lookup[(s, it["key"])]["effective_price"])
+                for s in suppliers
+                if s != winner_sup and (s, it["key"]) in bid_lookup
+            ]
+            if winner_bid:
+                # Consolidation winner quoted — check if a carve-out is justified
+                w_price = winner_bid["effective_price"]
+                if other_bids:
+                    other_bids.sort(key=lambda t: t[1])
+                    cheapest_other_sup, cheapest_other_price = other_bids[0]
+                    if cheapest_other_price < w_price * (1.0 - carve_threshold):
+                        savings_per_unit = w_price - cheapest_other_price
+                        savings_total = savings_per_unit * qty
+                        # UOM-discrepancy guard — if EITHER side has a UOM
+                        # warning OR the price ratio is extreme (>20×), flag
+                        # the carve-out as needing UOM verification before
+                        # being trusted as real savings. Fastenal's "per each
+                        # vs McMaster per package" notes are the canonical case.
+                        carve_bid_record = bid_lookup.get((cheapest_other_sup, it["key"]))
+                        winner_bid_record = bid_lookup.get((winner_sup, it["key"]))
+                        carve_status = (carve_bid_record or {}).get("status")
+                        winner_status = (winner_bid_record or {}).get("status")
+                        verify_uom = (
+                            carve_status == BID_STATUS_UOM_DISC or
+                            winner_status == BID_STATUS_UOM_DISC or
+                            (cheapest_other_price > 0 and w_price / cheapest_other_price >= 20.0)
+                        )
+                        carve_outs.append({
+                            "rfq_key": it["key"],
+                            "item_num": it["item_num"],
+                            "description": it["description"],
+                            "qty_24mo": qty,
+                            "winner_supplier": winner_sup,
+                            "winner_price": w_price,
+                            "carve_supplier": cheapest_other_sup,
+                            "carve_price": cheapest_other_price,
+                            "savings_per_unit": savings_per_unit,
+                            "savings_total": savings_total,
+                            "savings_pct": (savings_per_unit / w_price * 100.0) if w_price else 0.0,
+                            "verify_uom": verify_uom,
+                            "carve_notes": (carve_bid_record or {}).get("notes", ""),
+                            "winner_notes": (winner_bid_record or {}).get("notes", ""),
+                        })
+                        # Only count savings from carve-outs that DON'T need UOM verify
+                        if not verify_uom:
+                            carve_savings_total += savings_total
+            else:
+                # Winner didn't quote — pick best alternative
+                if other_bids:
+                    other_bids.sort(key=lambda t: t[1])
+                    best_alt_sup, best_alt_price = other_bids[0]
+                    items_at_best_alt += best_alt_price * qty
+                    items_not_quoted_details.append({
+                        "rfq_key": it["key"],
+                        "item_num": it["item_num"],
+                        "description": it["description"],
+                        "qty_24mo": qty,
+                        "best_alt_supplier": best_alt_sup,
+                        "best_alt_price": best_alt_price,
+                        "value_at_best_alt": best_alt_price * qty,
+                        "value_at_history": (it.get("last_unit_price") or 0) * qty,
+                    })
+                else:
+                    # Nobody quoted this item — flag for follow-up
+                    items_not_quoted_details.append({
+                        "rfq_key": it["key"],
+                        "item_num": it["item_num"],
+                        "description": it["description"],
+                        "qty_24mo": qty,
+                        "best_alt_supplier": None,
+                        "best_alt_price": None,
+                        "value_at_best_alt": 0.0,
+                        "value_at_history": (it.get("last_unit_price") or 0) * qty,
+                    })
+
+        carve_outs.sort(key=lambda c: c["savings_total"], reverse=True)
+
+        # Final award value = winner's full quote − carve savings + items at best alt
+        final_award_value = winner["consolidation_value"] - carve_savings_total + items_at_best_alt
+
+        # vs historical at last_unit_price (for items either supplier covers)
+        historical_value = 0.0
+        for it in items:
+            qty = it.get("qty_24mo") or 0
+            hist = it.get("last_unit_price") or 0
+            historical_value += hist * qty
+
+        winner_block = {
+            "supplier": winner_sup,
+            "consolidation_value": winner["consolidation_value"],
+            "carve_outs": carve_outs,
+            "carve_out_savings_total": carve_savings_total,
+            "items_winner_didnt_quote": items_not_quoted_details,
+            "n_items_winner_didnt_quote": len(items_not_quoted_details),
+            "items_at_best_alt_value": items_at_best_alt,
+            "final_award_value": final_award_value,
+            "historical_value": historical_value,
+            "savings_vs_history": historical_value - final_award_value,
+        }
+
+    return {
+        "candidates": candidates,
+        "winner": winner_block,
+        "summary": {
+            "n_suppliers": len(suppliers),
+            "n_items": n_items,
+            "carve_out_threshold_pct": carve_threshold * 100.0,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Register module so app.js can `from app_engine import ...`
 # ---------------------------------------------------------------------------
 sys.modules["app_engine"] = sys.modules[__name__]
