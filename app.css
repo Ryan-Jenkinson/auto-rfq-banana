@@ -4,25 +4,25 @@
    ========================================================================== */
 
 :root {
-  /* Banana Split palette: chocolate ground, cream foreground, banana primary,
-     strawberry warnings, caramel highlights. Playful + readable. */
-  --bg-0: #1a120a;            /* chocolate dark */
-  --bg-1: #261a10;            /* chocolate mid (cards / surfaces) */
-  --bg-2: #321f12;            /* chocolate elevated (inputs / hover) */
-  --line: #3a2917;            /* warm tan border */
-  --ink-0: #fdf6e3;           /* cream (primary text) */
-  --ink-1: #d8c9a8;           /* cream tan (secondary text) */
-  --ink-2: #9b8669;           /* warm gray-tan (muted text) */
-  --accent: #fce985;          /* banana yellow (primary accent) */
-  --accent-deep: #f7d54b;     /* deeper banana for primary buttons */
-  --accent-dim: rgba(252,233,133,0.15);
-  --accent-glow: rgba(252,233,133,0.55);
+  /* Watermelon palette: deep rind ground, flesh-pink primary, seed-cream
+     highlights, cantaloupe-orange secondary. Playful + readable. */
+  --bg-0: #18352a;            /* deep watermelon rind */
+  --bg-1: #20432f;            /* mid rind (cards / surfaces) */
+  --bg-2: #2a5439;            /* elevated rind (inputs / hover) */
+  --line: #3a6b4b;            /* light rind border */
+  --ink-0: #f4ffe8;           /* pale mint cream (primary text) */
+  --ink-1: #cce5b8;           /* mint tan (secondary text) */
+  --ink-2: #8aaa78;           /* moss gray-green (muted text) */
+  --accent: #ff6b8e;          /* watermelon flesh pink (primary accent) */
+  --accent-deep: #e8506f;     /* deeper watermelon for primary buttons */
+  --accent-dim: rgba(255,107,142,0.15);
+  --accent-glow: rgba(255,107,142,0.55);
   --green: #7dd87a;           /* leaf green (success) */
   --green-dim: rgba(125,216,122,0.15);
-  --red: #ff6f8e;             /* strawberry (warnings / push-back) */
-  --red-dim: rgba(255,111,142,0.15);
-  --warn: #b67242;            /* caramel (mid-warnings / accents) */
-  --warn-dim: rgba(182,114,66,0.18);
+  --red: #ffa94d;             /* cantaloupe orange (warnings — distinct from pink primary) */
+  --red-dim: rgba(255,169,77,0.15);
+  --warn: #fff5b0;            /* creamy seed highlight (mid-warnings) */
+  --warn-dim: rgba(255,245,176,0.15);
   --mono: 'JetBrains Mono', ui-monospace, Menlo, monospace;
 }
 * { box-sizing: border-box; }
@@ -59,7 +59,7 @@ h3 { font-size: 15px; margin: 0 0 10px; color: var(--ink-1); font-weight: 600; }
 
 /* dropzone */
 .dropzone { border: 2px dashed var(--line); border-radius: 10px; padding: 28px; background: var(--bg-2); cursor: pointer; transition: all 0.15s; text-align: center; }
-.dropzone:hover, .dropzone.dragover { border-color: var(--accent); background: rgba(252,233,133,0.05); }
+.dropzone:hover, .dropzone.dragover { border-color: var(--accent); background: rgba(255,107,142,0.05); }
 .dropzone.loaded { border-style: solid; border-color: var(--green); background: rgba(45,212,168,0.04); }
 .dropzone-icon { font-size: 26px; margin-bottom: 6px; opacity: 0.7; }
 .dropzone-label { font-weight: 500; font-size: 14px; }
@@ -83,9 +83,9 @@ select.col-select:focus { outline: none; border-color: var(--accent); }
 /* buttons */
 .actions { display: flex; gap: 10px; margin-top: 24px; flex-wrap: wrap; }
 button.btn { background: var(--bg-2); color: var(--ink-0); border: 1px solid var(--line); border-radius: 8px; padding: 11px 18px; font-family: inherit; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.12s; }
-button.btn:hover:not(:disabled) { background: #3d2716; border-color: var(--ink-2); }
+button.btn:hover:not(:disabled) { background: #346a48; border-color: var(--ink-2); }
 button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
-button.btn.primary { background: var(--accent); border-color: var(--accent); color: #2a1a08; font-weight: 700; }
+button.btn.primary { background: var(--accent); border-color: var(--accent); color: #2a0a14; font-weight: 700; }
 button.btn.primary:hover:not(:disabled) { background: var(--accent-deep); border-color: var(--accent-deep); }
 button.btn.ghost { background: transparent; }
 button.btn.big { padding: 12px 20px; font-size: 14px; font-weight: 600; }
@@ -108,11 +108,11 @@ button.btn.big { padding: 12px 20px; font-size: 14px; font-weight: 600; }
 /* RFQ list table */
 .rfq-table-wrap { background: var(--bg-1); border: 1px solid var(--line); border-radius: 12px; overflow: auto; max-height: 60vh; }
 table.rfq-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-table.rfq-table thead th { position: sticky; top: 0; background: #2f1e10; color: var(--ink-1); font-weight: 600; padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.rfq-table thead th { position: sticky; top: 0; background: #275039; color: var(--ink-1); font-weight: 600; padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
 table.rfq-table thead th.num { text-align: right; }
 table.rfq-table tbody td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.rfq-table tbody td.num { text-align: right; font-family: var(--mono); }
-table.rfq-table tbody tr:hover { background: rgba(252,233,133,0.05); }
+table.rfq-table tbody tr:hover { background: rgba(255,107,142,0.05); }
 table.rfq-table tbody tr.excluded { opacity: 0.4; }
 table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
 .cell-include { width: 28px; text-align: center; }
@@ -143,7 +143,7 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
    ========================================================================== */
 .legal-gate {
   position: fixed; inset: 0; z-index: 10000;
-  background: rgba(20, 12, 6, 0.92);
+  background: rgba(12, 24, 18, 0.92);
   backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
   display: flex; align-items: center; justify-content: center;
   padding: 32px 16px; overflow-y: auto;
@@ -179,8 +179,8 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
 #splash {
   position: fixed; inset: 0; z-index: 200;
   background:
-    radial-gradient(ellipse at 30% 20%, rgba(252,233,133,0.14) 0%, transparent 55%),
-    radial-gradient(ellipse at 80% 90%, rgba(45,212,168,0.06) 0%, transparent 55%),
+    radial-gradient(ellipse at 30% 20%, rgba(255,107,142,0.14) 0%, transparent 55%),
+    radial-gradient(ellipse at 80% 90%, rgba(255,169,77,0.08) 0%, transparent 55%),
     var(--bg-0);
   display: flex; align-items: center; justify-content: center;
   padding: 24px;
@@ -191,7 +191,7 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
   max-width: 540px; width: 100%;
   background: var(--bg-1); border: 1px solid var(--line); border-radius: 14px;
   padding: 36px 40px 28px;
-  box-shadow: 0 24px 64px rgba(0,0,0,0.45), 0 0 0 1px rgba(252,233,133,0.08);
+  box-shadow: 0 24px 64px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,107,142,0.08);
 }
 .splash-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
 .splash-dot { width: 12px; height: 12px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 16px var(--accent-glow); animation: splash-pulse 2s ease-in-out infinite; }
@@ -213,8 +213,8 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
   display: flex; justify-content: center; align-items: flex-end;
   height: 220px; margin-bottom: 18px;
   background:
-    radial-gradient(ellipse at 50% 90%, rgba(252,233,133,0.12) 0%, transparent 70%),
-    linear-gradient(180deg, #1f160c 0%, #1a120a 60%, #140d06 100%);
+    radial-gradient(ellipse at 50% 90%, rgba(255,107,142,0.12) 0%, transparent 70%),
+    linear-gradient(180deg, #1d3d2f 0%, #18352a 60%, #122d24 100%);
   border: 1px solid var(--line); border-radius: 10px; padding: 16px 12px 8px;
   position: relative; overflow: hidden;
 }
