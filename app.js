@@ -129,21 +129,11 @@ const SPLASH_GRID = [
   /* 29 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
 ];
 
-(function buildSplashChar() {
-  let svg = "";
-  for (let y = 0; y < SPLASH_GRID.length; y++) {
-    const tokens = SPLASH_GRID[y].trim().split(/\s+/);
-    for (let x = 0; x < tokens.length; x++) {
-      const t = tokens[x];
-      if (t === ".." || !t) continue;
-      const c = SPLASH_PALETTE[t];
-      if (!c) continue;
-      svg += `<rect x="${x}" y="${y}" width="1" height="1" fill="${c}"/>`;
-    }
-  }
-  const el = document.getElementById('splash-char');
-  if (el) el.innerHTML = svg;
-})();
+// Splash character is now an <img> element (./assets/splash-bananas.png).
+// The pixel-art SPLASH_GRID + SPLASH_PALETTE above are kept as a fallback
+// reference but no longer rendered. If you want to revert to pixel art,
+// swap the <img id="splash-char-img"> in app.html for an <svg id="splash-char">
+// and re-enable the build-svg IIFE.
 
 // Splash dismiss on Enter — once Pyodide is ready
 let _pyReady = false;
