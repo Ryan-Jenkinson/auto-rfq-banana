@@ -215,6 +215,7 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
 .splash-char-stage { position: relative; display: flex; justify-content: center; align-items: flex-end; height: 220px; margin-bottom: 18px; background: radial-gradient(ellipse at 50% 90%, rgba(255,183,51,0.08) 0%, transparent 70%), linear-gradient(180deg, #1a2340 0%, #131a2c 60%, #0f1525 100%); border: 1px solid var(--line); border-radius: 6px; padding: 16px 12px 8px; overflow: hidden; }
 .splash-char-stage::before { content: ""; position: absolute; left: 6%; right: 6%; bottom: 14px; height: 8px; border-radius: 50%; background: radial-gradient(ellipse at center, rgba(0,0,0,0.55) 0%, transparent 70%); filter: blur(2px); opacity: 0.7; }
 .splash-char { image-rendering: pixelated; image-rendering: crisp-edges; animation: char-bob 1.4s ease-in-out infinite; filter: drop-shadow(0 6px 0 rgba(0,0,0,0.4)); }
+.splash-char-img { image-rendering: pixelated; image-rendering: crisp-edges; max-width: 70%; max-height: 92%; object-fit: contain; animation: char-bob 1.8s ease-in-out infinite; filter: drop-shadow(0 6px 0 rgba(0,0,0,0.45)); }
 @keyframes char-bob {
   0%, 100% { transform: translateY(0); }
   50%      { transform: translateY(-6px); }
