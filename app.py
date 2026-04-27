@@ -2984,6 +2984,57 @@ def list_loaded_supplier_names() -> list:
 
 
 # ---------------------------------------------------------------------------
+# State serialization for save/restore — pulls everything Python-side that
+# needs to survive a session save/reload.
+#
+# NOT serialized:
+#   - items / po_lines_by_key / annual_spend / kpis / difficulty
+#     (these are derived from extract_rfq_list and re-computed on restore
+#     when the user re-loads the source xlsx)
+#
+# Serialized:
+#   - bids (parsed supplier responses — re-loading them is otherwise tedious)
+#   - scenarios
+#   - thresholds (overrides)
+#   - difficulty_history (the period-end snapshot series)
+#   - supplier_name (incumbent)
+#   - data_anchor_date
+# ---------------------------------------------------------------------------
+
+def serialize_state() -> dict:
+    """Return a JSON-safe dict capturing everything in _STATE that should
+    persist across a save/reload cycle."""
+    return {
+        "bids":                 _STATE.get("bids", {}),
+        "scenarios":            _STATE.get("scenarios", {}),
+        "thresholds":           _STATE.get("thresholds", {}),
+        "difficulty_history":   _STATE.get("difficulty_history", []),
+        "supplier_name":        _STATE.get("supplier_name", ""),
+        "data_anchor_date":     _STATE.get("data_anchor_date"),
+    }
+
+
+def restore_state(payload: dict) -> None:
+    """Apply a previously-serialized state payload back into _STATE.
+    Items + po_lines + difficulty are NOT restored from the save — they
+    require re-running extract_rfq_list against the source xlsx."""
+    if not isinstance(payload, dict):
+        return
+    if "bids" in payload and isinstance(payload["bids"], dict):
+        _STATE["bids"] = payload["bids"]
+    if "scenarios" in payload and isinstance(payload["scenarios"], dict):
+        _STATE["scenarios"] = payload["scenarios"]
+    if "thresholds" in payload and isinstance(payload["thresholds"], dict):
+        _STATE["thresholds"] = payload["thresholds"]
+    if "difficulty_history" in payload and isinstance(payload["difficulty_history"], list):
+        _STATE["difficulty_history"] = payload["difficulty_history"]
+    if "supplier_name" in payload:
+        _STATE["supplier_name"] = payload["supplier_name"]
+    if "data_anchor_date" in payload:
+        _STATE["data_anchor_date"] = payload["data_anchor_date"]
+
+
+# ---------------------------------------------------------------------------
 # Award scenarios — named, saveable, side-by-side comparison.
 #
 # A "scenario" is a strategy for awarding the RFQ:

@@ -1991,14 +1991,26 @@ const _saveMgr = (() => {
     const decisions = {};
     if (_rfqResult) {
       for (const it of _rfqResult.items) {
-        // Default include policy is "spend_24mo > 0". Only persist deltas.
-        const defaultIncluded = (it.spend_24mo || 0) > 0;
+        // Default include policy is "qty_24mo > 0". Only persist deltas.
+        const defaultIncluded = (it.qty_24mo || 0) > 0;
         const ds = {};
         if (it.included !== defaultIncluded) ds.included = it.included;
         if (it.note) ds.note = it.note;
         if (Object.keys(ds).length) decisions[it.item_num] = ds;
       }
     }
+    // Pull Python-side state synchronously via the runtime
+    let pyState = {};
+    try {
+      if (_pyAppLoaded && _py) {
+        const json = _py.runPython(`
+import json
+from app_engine import serialize_state
+json.dumps(serialize_state(), default=str)
+`);
+        pyState = JSON.parse(json);
+      }
+    } catch (e) { console.warn('[saveMgr] state serialize failed:', e); }
     return {
       version: VERSION,
       rfq_id: _rfqId,
@@ -2016,7 +2028,10 @@ const _saveMgr = (() => {
         active_window: $('active-window') ? $('active-window').value : '24',
         min_spend: $('min-spend') ? $('min-spend').value : '0',
         search: $('rfq-search') ? $('rfq-search').value : '',
+        tier_filter: $('tier-filter') ? $('tier-filter').value : 'all',
+        include_filter: $('include-filter') ? $('include-filter').value : 'all',
       },
+      python_state: pyState,
     };
   }
 
@@ -2027,6 +2042,8 @@ const _saveMgr = (() => {
       if ($('active-window') && state.ui_state.active_window) $('active-window').value = state.ui_state.active_window;
       if ($('min-spend') && state.ui_state.min_spend != null) $('min-spend').value = state.ui_state.min_spend;
       if ($('rfq-search') && state.ui_state.search != null) $('rfq-search').value = state.ui_state.search;
+      if ($('tier-filter') && state.ui_state.tier_filter) $('tier-filter').value = state.ui_state.tier_filter;
+      if ($('include-filter') && state.ui_state.include_filter) $('include-filter').value = state.ui_state.include_filter;
     }
     if (state.decisions && _rfqResult) {
       for (const it of _rfqResult.items) {
@@ -2036,6 +2053,22 @@ const _saveMgr = (() => {
         if (d.note !== undefined) it.note = d.note;
       }
       if (typeof _renderRfqTable === 'function') _renderRfqTable();
+    }
+    // Restore python-side state (bids / scenarios / thresholds / difficulty_history)
+    if (state.python_state && _pyAppLoaded && _py) {
+      try {
+        _py.globals.set('_restore_payload', state.python_state);
+        _py.runPython(`
+from app_engine import restore_state
+restore_state(_restore_payload.to_py())
+`);
+        // Mirror loaded bids back into the JS-side _loadedBids cache
+        if (state.python_state.bids) {
+          _loadedBids = state.python_state.bids;
+        }
+      } catch (e) {
+        console.warn('[saveMgr] python_state restore failed:', e);
+      }
     }
   }
 
