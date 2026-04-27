@@ -423,7 +423,7 @@ function _renderKpis() {
   $('kpi-row').innerHTML = `
     <div class="kpi"><div class="kpi-label">Items</div><div class="kpi-value">${k.item_count.toLocaleString()}</div><div class="kpi-sub">unique part numbers</div></div>
     <div class="kpi"><div class="kpi-label">Total spend (all)</div><div class="kpi-value">${fmt(k.total_spend)}</div><div class="kpi-sub">${k.po_count.toLocaleString()} POs · ${k.line_count.toLocaleString()} lines</div></div>
-    <div class="kpi"><div class="kpi-label">Date range</div><div class="kpi-value" style="font-size:14px">${k.first_order} → ${k.last_order}</div><div class="kpi-sub">${k.years_span.toFixed(1)} years of history</div></div>
+    <div class="kpi"><div class="kpi-label">Date range</div><div class="kpi-value">${(k.first_order || '').slice(0,4)} → ${(k.last_order || '').slice(0,4)}</div><div class="kpi-sub">${k.first_order} to ${k.last_order} · ${k.years_span.toFixed(1)} yr</div></div>
     <div class="kpi"><div class="kpi-label">12-mo spend</div><div class="kpi-value">${fmt(k.spend_12mo)}</div><div class="kpi-sub">${k.items_12mo.toLocaleString()} items active</div></div>
     <div class="kpi"><div class="kpi-label">24-mo spend</div><div class="kpi-value">${fmt(k.spend_24mo)}</div><div class="kpi-sub">${k.items_24mo.toLocaleString()} items active</div></div>
     <div class="kpi"><div class="kpi-label">36-mo spend</div><div class="kpi-value">${fmt(k.spend_36mo)}</div><div class="kpi-sub">${k.items_36mo.toLocaleString()} items active</div></div>
@@ -522,6 +522,17 @@ function _renderRfqTable() {
       if (it) it.included = cb.checked;
       cb.closest('tr').classList.toggle('excluded', !cb.checked);
       _saveMgr.markDirty();
+    });
+  });
+
+  // Click row (anywhere except the include checkbox) → open per-item history modal
+  $('rfq-table').querySelectorAll('tbody tr[data-item]').forEach(tr => {
+    tr.style.cursor = 'pointer';
+    tr.addEventListener('click', (e) => {
+      // Ignore clicks on the checkbox cell
+      if (e.target.closest('.cell-include')) return;
+      const itemNum = tr.getAttribute('data-item');
+      _openItemHistory(itemNum);
     });
   });
 }
@@ -630,6 +641,269 @@ base64.b64encode(_b).decode('ascii')
     btn.textContent = t;
   }
 });
+
+// ==========================================================================
+// Per-item history modal — drill-into for any RFQ row.
+//
+// Shows: order-history dot chart with linear trend + expected-price overlay
+// (extrapolated trend at the dataset's anchor date), summary stats by
+// window, and the per-PO line table. Phase 2.5 will overlay incoming
+// supplier bids as right-edge markers; for now it's the historical view.
+// ==========================================================================
+function _ensureItemModal() {
+  if (document.getElementById('item-modal')) return;
+  const m = document.createElement('div');
+  m.id = 'item-modal';
+  m.style.cssText = [
+    'position:fixed','inset:0','z-index:5000','display:none',
+    'align-items:center','justify-content:center',
+    'background:rgba(8,12,22,0.78)','backdrop-filter:blur(4px)',
+    '-webkit-backdrop-filter:blur(4px)','padding:24px',
+  ].join(';');
+  m.innerHTML = `
+    <div id="item-modal-card" style="
+      background:var(--bg-1);border:1px solid var(--line);border-radius:8px;
+      max-width:980px;width:100%;max-height:92vh;overflow:auto;
+      box-shadow:0 24px 80px rgba(0,0,0,0.6);
+      font-family:var(--ui, sans-serif);
+      ">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:22px 26px 14px;border-bottom:1px solid var(--line);">
+        <div style="flex:1;min-width:0;">
+          <div id="im-eyebrow" style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">ITEM HISTORY</div>
+          <div id="im-title" style="font-size:24px;font-weight:600;color:var(--ink-0);font-family:var(--mono);letter-spacing:0.01em;line-height:1.2;"></div>
+          <div id="im-sub" style="font-size:13px;color:var(--ink-1);margin-top:6px;line-height:1.4;"></div>
+        </div>
+        <button id="im-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;flex-shrink:0;margin-left:14px;">×</button>
+      </div>
+      <div id="im-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0;border-bottom:1px solid var(--line);"></div>
+      <div style="padding:22px 26px 8px;">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;">
+          <h3 style="margin:0;font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;font-family:var(--ui);">UNIT PRICE OVER TIME</h3>
+          <div id="im-trend-label" style="font-size:11px;color:var(--ink-2);font-family:var(--mono);"></div>
+        </div>
+        <svg id="im-chart" style="width:100%;height:280px;display:block;" preserveAspectRatio="xMidYMid meet"></svg>
+        <div id="im-trend-callout" style="margin-top:10px;padding:10px 12px;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;font-size:12px;color:var(--ink-1);font-family:var(--mono);"></div>
+      </div>
+      <div style="padding:14px 26px 22px;">
+        <h3 style="margin:0 0 10px;font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;font-family:var(--ui);">ORDER LINES</h3>
+        <div style="border:1px solid var(--line);border-radius:4px;overflow:auto;max-height:300px;">
+          <table id="im-lines" style="width:100%;border-collapse:collapse;font-size:12px;">
+            <thead><tr style="background:var(--bg-2);">
+              <th style="padding:8px 12px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">Date</th>
+              <th style="padding:8px 12px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">Qty</th>
+              <th style="padding:8px 12px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">Unit price</th>
+              <th style="padding:8px 12px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">Line total</th>
+              <th style="padding:8px 12px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">PO #</th>
+              <th style="padding:8px 12px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">UOM</th>
+            </tr></thead>
+            <tbody id="im-lines-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(m);
+  document.getElementById('im-close').addEventListener('click', _closeItemModal);
+  m.addEventListener('click', (e) => { if (e.target === m) _closeItemModal(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && m.style.display === 'flex') _closeItemModal();
+  });
+}
+
+function _closeItemModal() {
+  const m = document.getElementById('item-modal');
+  if (m) m.style.display = 'none';
+}
+
+async function _openItemHistory(itemNum) {
+  _ensureItemModal();
+  const m = document.getElementById('item-modal');
+  m.style.display = 'flex';
+  document.getElementById('im-title').textContent = itemNum;
+  document.getElementById('im-sub').textContent = 'Loading…';
+  document.getElementById('im-summary').innerHTML = '';
+  document.getElementById('im-chart').innerHTML = '';
+  document.getElementById('im-lines-body').innerHTML = '';
+  document.getElementById('im-trend-callout').textContent = '';
+  document.getElementById('im-trend-label').textContent = '';
+
+  try {
+    _py.globals.set('_item_num_in', itemNum);
+    const out = await _py.runPythonAsync(`
+import json
+from app_engine import get_item_history
+json.dumps(get_item_history(_item_num_in), default=str)
+`);
+    const h = JSON.parse(out);
+    if (h.error) {
+      document.getElementById('im-sub').textContent = `(${h.error})`;
+      return;
+    }
+    _renderItemHistory(h);
+  } catch (err) {
+    console.error('[openItemHistory] failed', err);
+    document.getElementById('im-sub').textContent = `Failed: ${err.message || err}`;
+  }
+}
+
+function _renderItemHistory(h) {
+  // Title block
+  document.getElementById('im-title').textContent = h.item_num;
+  const subParts = [];
+  if (h.description) subParts.push(h.description);
+  if (h.mfg_name) subParts.push(`mfg: ${h.mfg_name}`);
+  if (h.mfg_pn) subParts.push(`mfg pn: ${h.mfg_pn}`);
+  if (h.uom) subParts.push(`uom: ${h.uom}${h.uom_mixed ? ' (mixed!)' : ''}`);
+  document.getElementById('im-sub').textContent = subParts.join(' · ');
+
+  // Summary tiles (mini KPI ribbon)
+  const s = h.summary || {};
+  const fmt$ = (n) => n == null ? '—' : '$' + Math.round(n).toLocaleString();
+  const fmtQ = (n) => n == null ? '—' : Math.round(n).toLocaleString();
+  const fmtP = (n) => n == null ? '—' : '$' + Number(n).toFixed(2);
+  const tile = (label, value, sub) => `
+    <div style="padding:14px 18px;border-right:1px solid var(--line);">
+      <div style="font-size:9px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.14em;font-weight:600;margin-bottom:4px;">${label}</div>
+      <div style="font-family:var(--mono);font-size:18px;color:var(--accent, var(--ink-0));font-weight:600;line-height:1.1;">${value}</div>
+      ${sub ? `<div style="font-size:10px;color:var(--ink-2);margin-top:3px;font-family:var(--mono);">${sub}</div>` : ''}
+    </div>
+  `;
+  document.getElementById('im-summary').innerHTML =
+    tile('12-MO', fmt$(s.spend_12mo), `${fmtQ(s.qty_12mo)} ${h.uom || 'units'}`) +
+    tile('24-MO', fmt$(s.spend_24mo), `${fmtQ(s.qty_24mo)} ${h.uom || 'units'}`) +
+    tile('36-MO', fmt$(s.spend_36mo), `${fmtQ(s.qty_36mo)} ${h.uom || 'units'}`) +
+    tile('ALL TIME', fmt$(s.spend_all), `${fmtQ(s.qty_all)} ${h.uom || 'units'} · ${s.po_count} POs`) +
+    tile('LAST PRICE', fmtP(s.last_unit_price), `last order ${s.last_order || '—'}`);
+
+  // Chart
+  _drawItemHistoryChart(h);
+
+  // Trend label + callout
+  const t = h.trend || {};
+  const trendLbl = `slope $${t.slope_per_day != null ? (t.slope_per_day * 365).toFixed(2) : '—'}/yr · R² ${t.r2 != null ? t.r2.toFixed(2) : '—'} · ${t.confidence || ''}`;
+  document.getElementById('im-trend-label').textContent = trendLbl;
+  let callout = '';
+  if (t.expected_today != null) {
+    const expected = '$' + t.expected_today.toFixed(2);
+    const last = s.last_unit_price != null ? '$' + s.last_unit_price.toFixed(2) : '—';
+    const ago = t.days_since_last_order != null
+      ? (t.days_since_last_order < 30
+          ? `${t.days_since_last_order} days ago`
+          : `${(t.days_since_last_order / 30).toFixed(1)} months ago`)
+      : '—';
+    callout = `Last actual order: ${last} · ${ago}. Expected price today (linear extrapolation): <strong style="color:var(--accent);">${expected}</strong>. Confidence: ${t.confidence} (${t.confidence_reason}).`;
+  } else if (t.confidence_reason) {
+    callout = `Trend: ${t.confidence_reason}.`;
+  }
+  document.getElementById('im-trend-callout').innerHTML = callout;
+
+  // Order lines table
+  const tbody = document.getElementById('im-lines-body');
+  let rows = '';
+  // Sort newest-first for display
+  const lines = [...h.po_lines].reverse();
+  for (const ln of lines) {
+    rows += `
+      <tr style="border-bottom:1px solid rgba(122,109,115,0.25);">
+        <td style="padding:8px 12px;color:var(--ink-1);font-family:var(--mono);">${_escapeHtml(ln.date)}</td>
+        <td style="padding:8px 12px;text-align:right;color:var(--ink-0);font-family:var(--mono);">${fmtQ(ln.qty)}</td>
+        <td style="padding:8px 12px;text-align:right;color:var(--ink-0);font-family:var(--mono);">${fmtP(ln.unit_price)}</td>
+        <td style="padding:8px 12px;text-align:right;color:var(--ink-1);font-family:var(--mono);">${fmt$(ln.line_total)}</td>
+        <td style="padding:8px 12px;color:var(--ink-1);font-family:var(--mono);">${_escapeHtml(ln.po || '')}</td>
+        <td style="padding:8px 12px;color:var(--ink-1);font-family:var(--mono);">${_escapeHtml(ln.uom || '')}</td>
+      </tr>
+    `;
+  }
+  tbody.innerHTML = rows || `<tr><td colspan="6" style="padding:24px;text-align:center;color:var(--ink-2);">no order lines</td></tr>`;
+}
+
+function _drawItemHistoryChart(h) {
+  const svg = document.getElementById('im-chart');
+  const W = svg.clientWidth || 800, H = 280;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const padL = 56, padR = 70, padT = 16, padB = 36;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+
+  const points = (h.po_lines || [])
+    .filter(p => p.date && p.unit_price != null)
+    .map(p => ({ date: new Date(p.date), price: p.unit_price, qty: p.qty }));
+  if (!points.length) {
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--ink-2)" font-family="var(--mono)" font-size="11">no priced order lines</text>`;
+    return;
+  }
+  const minDate = points[0].date.getTime();
+  const anchorIso = (h.trend && h.trend.anchor_date) || h.summary.last_order;
+  const anchorDate = anchorIso ? new Date(anchorIso) : points[points.length - 1].date;
+  const maxDate = anchorDate.getTime();
+  const dateRange = Math.max(1, maxDate - minDate);
+  const minPrice = Math.min(...points.map(p => p.price));
+  const maxPrice = Math.max(...points.map(p => p.price), h.trend && h.trend.expected_today != null ? h.trend.expected_today : -Infinity);
+  const priceRange = Math.max(0.01, maxPrice - minPrice);
+  // Pad price scale 8% top + 8% bottom
+  const yMin = minPrice - priceRange * 0.08;
+  const yMax = maxPrice + priceRange * 0.12;
+  const yScale = (p) => padT + innerH - ((p - yMin) / (yMax - yMin)) * innerH;
+  const xScale = (d) => padL + ((d.getTime() - minDate) / dateRange) * innerW;
+
+  let s = '';
+
+  // Y-axis grid lines + labels (4 ticks)
+  for (let i = 0; i <= 4; i++) {
+    const v = yMin + (yMax - yMin) * (i / 4);
+    const y = yScale(v);
+    s += `<line x1="${padL}" y1="${y}" x2="${padL + innerW}" y2="${y}" stroke="var(--line)" stroke-dasharray="2,3" opacity="0.5"/>`;
+    s += `<text x="${padL - 8}" y="${y + 3}" text-anchor="end" fill="var(--ink-2)" font-family="var(--mono)" font-size="10">$${v.toFixed(2)}</text>`;
+  }
+  // X-axis labels (year ticks)
+  const startYear = new Date(minDate).getFullYear();
+  const endYear = anchorDate.getFullYear();
+  for (let y = startYear; y <= endYear; y++) {
+    const tickDate = new Date(`${y}-01-01`).getTime();
+    if (tickDate < minDate || tickDate > maxDate) continue;
+    const x = padL + ((tickDate - minDate) / dateRange) * innerW;
+    s += `<line x1="${x}" y1="${padT + innerH}" x2="${x}" y2="${padT + innerH + 4}" stroke="var(--line)"/>`;
+    s += `<text x="${x}" y="${padT + innerH + 18}" text-anchor="middle" fill="var(--ink-2)" font-family="var(--mono)" font-size="10">${y}</text>`;
+  }
+
+  // Trend line — fit through dataset, extended to anchor
+  const t = h.trend || {};
+  if (t.slope_per_day != null) {
+    const x0 = points[0].date.getTime();
+    const days0 = 0;
+    const days1 = (maxDate - x0) / (1000 * 60 * 60 * 24);
+    const y0 = t.intercept;
+    const y1 = t.slope_per_day * days1 + t.intercept;
+    if (isFinite(y0) && isFinite(y1)) {
+      // Solid up to last data point, dashed for the extrapolation
+      const lastDays = ((points[points.length - 1].date.getTime() - x0) / (1000 * 60 * 60 * 24));
+      const yLast = t.slope_per_day * lastDays + t.intercept;
+      const xLast = xScale(points[points.length - 1].date);
+      s += `<line x1="${xScale(points[0].date)}" y1="${yScale(y0)}" x2="${xLast}" y2="${yScale(yLast)}" stroke="var(--cyan, var(--accent))" stroke-width="1.5" opacity="0.85"/>`;
+      s += `<line x1="${xLast}" y1="${yScale(yLast)}" x2="${xScale(anchorDate)}" y2="${yScale(y1)}" stroke="var(--cyan, var(--accent))" stroke-width="1.5" stroke-dasharray="4,4" opacity="0.65"/>`;
+    }
+  }
+
+  // Order points (size scaled by qty for a hint of order volume)
+  const maxQty = Math.max(1, ...points.map(p => p.qty || 1));
+  for (const p of points) {
+    const x = xScale(p.date);
+    const y = yScale(p.price);
+    const r = Math.max(2.5, Math.min(6, 2.5 + (p.qty / maxQty) * 4));
+    s += `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--accent)" opacity="0.85"/>`;
+  }
+
+  // Expected-today marker
+  if (t.expected_today != null) {
+    const x = xScale(anchorDate);
+    const y = yScale(t.expected_today);
+    s += `<line x1="${x}" y1="${padT}" x2="${x}" y2="${padT + innerH}" stroke="var(--ink-2)" stroke-dasharray="2,3" opacity="0.4"/>`;
+    s += `<circle cx="${x}" cy="${y}" r="6" fill="none" stroke="var(--green, var(--accent))" stroke-width="2"/>`;
+    s += `<text x="${x + 10}" y="${y + 4}" fill="var(--green, var(--ink-0))" font-family="var(--mono)" font-size="11" font-weight="600">$${t.expected_today.toFixed(2)}</text>`;
+    s += `<text x="${x + 10}" y="${y - 8}" fill="var(--ink-2)" font-family="var(--mono)" font-size="9" letter-spacing="0.1em">EXPECTED</text>`;
+  }
+
+  svg.innerHTML = s;
+}
 
 // ==========================================================================
 // Save manager — 60s autosave to localStorage + manual named saves

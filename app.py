@@ -344,6 +344,9 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         "uom_counts": Counter(),
         "commodity_counts": Counter(),
         "po_set": set(),
+        # Per-item PO line list, used by the per-item drill-down modal.
+        # Each entry: (date_iso, qty, unit_price, line_total, po, uom)
+        "po_lines": [],
         "qty_12mo": 0.0, "spend_12mo": 0.0,
         "qty_24mo": 0.0, "spend_24mo": 0.0,
         "qty_36mo": 0.0, "spend_36mo": 0.0,
@@ -382,6 +385,15 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
             rec["commodity_counts"][r["commodity"]] += 1
         if r["po"]:
             rec["po_set"].add(r["po"])
+
+        rec["po_lines"].append((
+            r["order_date"].date().isoformat() if r["order_date"] else "",
+            r["qty"],
+            r["unit_price"],
+            ext,
+            r["po"],
+            r["uom"],
+        ))
 
         rec["qty_all"] += r["qty"]
         rec["spend_all"] += ext
@@ -477,13 +489,161 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         key=lambda d: d["year"],
     )
 
-    # Persist for the xlsx generator
+    # Persist for the xlsx generator + drill-down modal
     _STATE["items"] = out_items
     _STATE["kpis"] = kpis
     _STATE["annual_spend"] = annual_out
     _STATE["supplier_name"] = supplier_counter.most_common(1)[0][0] if supplier_counter else ""
+    # Per-item PO lines are kept Python-side (not shipped to JS in the items
+    # array) to keep the JS payload small. The modal pulls them on demand.
+    _STATE["po_lines_by_key"] = {k: list(rec["po_lines"]) for k, rec in items.items()}
+    _STATE["data_anchor_date"] = now.date().isoformat() if now else None
 
     return {"kpis": kpis, "items": out_items, "annual_spend": annual_out}
+
+
+# ---------------------------------------------------------------------------
+# Per-item history (drill-down modal)
+# ---------------------------------------------------------------------------
+
+def _linear_fit(xs, ys):
+    """Simple least-squares linear regression. Returns (slope, intercept, r2).
+    No numpy — we're in Pyodide and want to keep the dep surface minimal."""
+    n = len(xs)
+    if n < 2:
+        return (0.0, ys[0] if ys else 0.0, 0.0)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    num = 0.0
+    den = 0.0
+    for x, y in zip(xs, ys):
+        num += (x - mean_x) * (y - mean_y)
+        den += (x - mean_x) ** 2
+    slope = num / den if den else 0.0
+    intercept = mean_y - slope * mean_x
+    # R-squared
+    ss_tot = sum((y - mean_y) ** 2 for y in ys)
+    ss_res = 0.0
+    for x, y in zip(xs, ys):
+        pred = slope * x + intercept
+        ss_res += (y - pred) ** 2
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot else 0.0
+    return (slope, intercept, r2)
+
+
+def get_item_history(item_num: str) -> dict:
+    """Return the per-item drill-down payload for the modal.
+
+    Includes the raw PO lines, the linear-trend fit (slope/intercept/R²), and
+    an "expected price today" extrapolation against the dataset's anchor date.
+    Used by the per-item modal to show order history + the expected-price
+    overlay ryan asked for: 'we last ordered 11mo ago at $12.40; trend says
+    we'd expect ~$13.10 today; supplier C bid $18.50 → suspicious'.
+    """
+    if not item_num:
+        return {"error": "item_num required"}
+    key = norm_pn(item_num)
+    po_lines = _STATE.get("po_lines_by_key", {}).get(key, [])
+    if not po_lines:
+        return {"error": f"no history for {item_num}"}
+
+    # Find the matching item record for context
+    items = _STATE.get("items", [])
+    item = next((it for it in items if it["item_num"] == item_num), None)
+
+    # Sort by date ascending
+    sorted_lines = sorted(po_lines, key=lambda r: r[0] or "")
+    line_dicts = [
+        {
+            "date": d,
+            "qty": q,
+            "unit_price": p,
+            "line_total": lt,
+            "po": po,
+            "uom": uom,
+        }
+        for (d, q, p, lt, po, uom) in sorted_lines
+    ]
+
+    # Linear regression on (days_since_first_order, unit_price)
+    first_dt = None
+    xs, ys = [], []
+    for ln in line_dicts:
+        if not ln["date"] or ln["unit_price"] is None:
+            continue
+        try:
+            d = datetime.fromisoformat(ln["date"])
+        except ValueError:
+            continue
+        if first_dt is None:
+            first_dt = d
+        xs.append((d - first_dt).days)
+        ys.append(float(ln["unit_price"]))
+
+    slope, intercept, r2 = _linear_fit(xs, ys)
+    last_x = xs[-1] if xs else 0
+    last_price = ys[-1] if ys else None
+
+    # Expected price at the dataset anchor date
+    expected_today = None
+    days_since_last = None
+    anchor = _STATE.get("data_anchor_date")
+    if anchor and first_dt:
+        try:
+            anchor_dt = datetime.fromisoformat(anchor)
+            anchor_x = (anchor_dt - first_dt).days
+            expected_today = slope * anchor_x + intercept
+            days_since_last = anchor_x - last_x
+        except ValueError:
+            pass
+
+    # Confidence label based on R² + sample size
+    if len(xs) < 3:
+        confidence = "low"
+        confidence_reason = f"only {len(xs)} priced order line(s)"
+    elif r2 < 0.2:
+        confidence = "low"
+        confidence_reason = f"R² {r2:.2f} — prices noisy, trend may not be meaningful"
+    elif r2 < 0.6:
+        confidence = "medium"
+        confidence_reason = f"R² {r2:.2f}"
+    else:
+        confidence = "high"
+        confidence_reason = f"R² {r2:.2f}"
+
+    return {
+        "item_num": item_num,
+        "description": item["description"] if item else "",
+        "mfg_name": item["mfg_name"] if item else "",
+        "mfg_pn": item["mfg_pn"] if item else "",
+        "uom": item["uom"] if item else "",
+        "uom_mixed": item["uom_mixed"] if item else False,
+        "po_lines": line_dicts,
+        "summary": {
+            "po_count": item["po_count"] if item else 0,
+            "qty_12mo": item["qty_12mo"] if item else 0,
+            "spend_12mo": item["spend_12mo"] if item else 0,
+            "qty_24mo": item["qty_24mo"] if item else 0,
+            "spend_24mo": item["spend_24mo"] if item else 0,
+            "qty_36mo": item["qty_36mo"] if item else 0,
+            "spend_36mo": item["spend_36mo"] if item else 0,
+            "qty_all": item["qty_all"] if item else 0,
+            "spend_all": item["spend_all"] if item else 0,
+            "last_order": item["last_order"] if item else None,
+            "first_order": item["first_order"] if item else None,
+            "last_unit_price": last_price,
+        },
+        "trend": {
+            "slope_per_day": slope,
+            "intercept": intercept,
+            "r2": r2,
+            "confidence": confidence,
+            "confidence_reason": confidence_reason,
+            "expected_today": expected_today,
+            "days_since_last_order": days_since_last,
+            "anchor_date": anchor,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
