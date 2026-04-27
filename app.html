@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Auto RFQ Banana — Multi-Supplier RFQ Builder</title>
+<meta name="description" content="Auto RFQ Banana — drop a multi-year supplier export, auto-build the RFQ item list, generate per-supplier RFQ workbooks, ingest returned bids, compare side-by-side. Runs locally in your browser; no data leaves your machine.">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="./pyodide/pyodide.js"></script>
+<link rel="stylesheet" href="./app.css">
+</head>
+<body>
+
+<!-- Disclaimer gate — full-screen acceptance required before the app loads.
+     Canonical version lives in the workpackage skill; do not customize text. -->
+<div id="legal-gate" class="legal-gate" role="dialog" aria-modal="true" aria-labelledby="legal-gate-title">
+  <div class="legal-gate-card">
+    <div class="legal-gate-eyebrow">NOTICE — INTERNAL PRODUCTIVITY TOOL</div>
+    <h1 id="legal-gate-title" class="legal-gate-title">Please read before continuing</h1>
+    <div class="legal-gate-body">
+      <p>Developed by <strong>Ryan Jenkinson</strong> for use in his own procurement workflow at Andersen and shared with colleagues at no cost for their benefit. <strong>This is not an Andersen-sanctioned, IT-approved, or officially endorsed application.</strong></p>
+      <p class="legal-gate-section-head">Runtime profile</p>
+      <ul>
+        <li>No artificial intelligence, machine-learning models, or external services are invoked during analysis.</li>
+        <li>No data leaves your computer at any point during a session — all processing is fully local.</li>
+        <li>The browser functions solely as a user interface to deterministic Python logic executing on your own machine, comparable in nature to advanced formulas running inside a Microsoft Excel workbook.</li>
+      </ul>
+      <p>Outputs should be verified against source data before being used to support any official business action or update to a system of record.</p>
+      <p class="legal-gate-contact">Questions or issues? <a href="mailto:ryan.jenkinson@andersencorp.com">ryan.jenkinson@andersencorp.com</a> — best-effort help only; no guaranteed support or formal SLA.</p>
+    </div>
+    <div class="legal-gate-actions">
+      <button class="btn primary big" id="legal-gate-accept" type="button" autofocus>I Understand — Continue</button>
+      <button class="btn ghost" id="legal-gate-exit" type="button">Exit</button>
+    </div>
+  </div>
+</div>
+
+<!-- Splash with pixel character (auctioneer-with-gavel placeholder; refine later) -->
+<div id="splash">
+  <div class="splash-card">
+    <div class="splash-char-stage">
+      <svg id="splash-char" class="splash-char" width="220" height="300" viewBox="0 0 22 30" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" aria-hidden="true"></svg>
+    </div>
+    <div class="splash-brand">
+      <div class="splash-dot"></div>
+      <div class="splash-title">Auto RFQ Banana</div>
+    </div>
+    <div class="splash-sub">Build · send · ingest · compare multi-supplier RFQs</div>
+    <div class="splash-fineprint">
+      <p>Developed by <strong>Ryan Jenkinson</strong> for his own work — shared at no cost; not Andersen-approved or endorsed.</p>
+      <p><strong>No AI is used</strong> and no data leaves your machine — the browser is just a UI for local Python logic.</p>
+      <p>Best-effort help only: <a href="mailto:ryan.jenkinson@andersencorp.com">ryan.jenkinson@andersencorp.com</a></p>
+    </div>
+    <div class="splash-prompt">
+      <div class="splash-press-start">▸ Press <span class="kbd">Enter</span> to start</div>
+      <div id="splash-status" class="splash-status">booting python…</div>
+    </div>
+  </div>
+</div>
+
+<div id="loading">
+  <div class="pulse"><div class="pulse-core"></div></div>
+  <h1>Loading Python runtime</h1>
+  <p>Pyodide boots in your browser. First load is ~10 MB then cached. Nothing leaves this page.</p>
+  <div id="load-status">initializing…</div>
+</div>
+
+<div class="app">
+  <div class="topbar">
+    <div class="brand-dot"></div>
+    <div>
+      <div class="brand">Auto RFQ Banana <span class="brand-sub">/ build · send · compare</span></div>
+    </div>
+    <div class="steps">
+      <div class="step-dot active" data-step="1"></div>
+      <div class="step-dot" data-step="2"></div>
+      <div class="step-dot" data-step="3"></div>
+      <div class="step-dot" data-step="4"></div>
+    </div>
+  </div>
+
+  <!-- STEP 1: Drop multi-year export -->
+  <section id="step-1" class="step">
+    <h1>Build an RFQ from a multi-year supplier export</h1>
+    <p class="subtitle">Drop the incumbent supplier's multi-year PO history (xlsx export from Coupa / EAM). The app dedupes to unique items, aggregates per-window spend, and builds the candidate RFQ list for your review. Runs locally — nothing is uploaded.</p>
+
+    <div class="file-grid single">
+      <div class="dropzone" id="dz-export">
+        <div class="dropzone-icon">⬆</div>
+        <div class="dropzone-label">Multi-year supplier export</div>
+        <div class="dropzone-sub">.xlsx — long PO history from one supplier (e.g. <code>jhflongcoupa.xlsx</code>)</div>
+        <div class="dropzone-file" id="f-export"></div>
+        <input type="file" id="file-export" accept=".xlsx" style="display:none">
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn primary" id="to-mapping" disabled>Continue to column mapping →</button>
+    </div>
+  </section>
+
+  <!-- STEP 2: Column mapping -->
+  <section id="step-2" class="step" hidden>
+    <h1>Confirm column mapping</h1>
+    <p class="subtitle">We auto-detected the export's columns. Adjust any that look off, then continue. Mapping is remembered for this session.</p>
+    <div id="mapping-table-wrap" class="mapping-table-wrap"></div>
+    <div class="actions">
+      <button class="btn ghost" id="back-to-1">← Back</button>
+      <button class="btn primary" id="to-extract">Build RFQ list →</button>
+    </div>
+  </section>
+
+  <!-- STEP 3: RFQ list + multi-window analytics -->
+  <section id="step-3" class="step" hidden>
+    <h1>Candidate RFQ list</h1>
+    <p class="subtitle">Each item is one row, deduplicated across the export. Multi-window aggregates let you slice by 12 / 24 / 36 month order history. Untick items you don't want in the RFQ; add manual rows below.</p>
+
+    <div id="kpi-row" class="kpi-row"></div>
+
+    <div class="filter-row">
+      <label>Window:
+        <select id="active-window">
+          <option value="12">12 months</option>
+          <option value="24" selected>24 months</option>
+          <option value="36">36 months</option>
+          <option value="all">All time</option>
+        </select>
+      </label>
+      <label>Min spend:
+        <input type="number" id="min-spend" value="0" min="0" step="100">
+      </label>
+      <label>Search:
+        <input type="text" id="rfq-search" placeholder="item / mfg / desc">
+      </label>
+      <span class="muted" id="rfq-count">—</span>
+    </div>
+
+    <div class="rfq-table-wrap">
+      <table id="rfq-table" class="rfq-table">
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="charts-stage" class="charts-stage"></div>
+
+    <div class="actions">
+      <button class="btn ghost" id="back-to-2">← Back</button>
+      <button class="btn ghost" id="export-rfq-list">⬇ Export candidate list (xlsx)</button>
+      <button class="btn primary" id="to-suppliers" disabled>Set up suppliers → (Phase 2)</button>
+    </div>
+  </section>
+
+</div>
+
+<script src="./app.js"></script>
+</body>
+</html>

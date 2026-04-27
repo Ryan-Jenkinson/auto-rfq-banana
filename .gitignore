@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+# Local source-data + scratch dirs (never commit Andersen data)
+samples/
+scratch/
+*.xlsx
+!_template/*.xlsx
+
+# Bundle output
+*_bundle.zip
