@@ -520,12 +520,12 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
 @keyframes splash-pulse { 0%, 100% { opacity: 0.5; transform: scale(0.95); } 50% { opacity: 1; transform: scale(1.05); } }
 .splash-title {
   font-family: var(--display);
-  font-size: 38px;
+  font-size: 42px;
   font-weight: 400;
   font-style: italic;
-  letter-spacing: -0.035em;
+  letter-spacing: 0.01em;        /* caps want a hair of positive tracking */
   line-height: 1;
-  font-variation-settings: "SOFT" 60, "WONK" 1, "opsz" 144;
+  font-variation-settings: "SOFT" 50, "WONK" 1, "opsz" 144;
   color: var(--ink-0);
 }
 .splash-sub {

@@ -61,62 +61,57 @@ window.addEventListener('error', (e) => {
 })();
 
 // ==========================================================================
-// Splash screen — pixel character (auctioneer's gavel) + dismiss on Enter
+// Splash screen — pixel art (bunch of bananas) + dismiss on Enter
 // ==========================================================================
-// Vertical gavel above sound block, with strike sparks at the contact point.
+// Three bananas merging at a brown stem at top, fanning out into separate
+// tips at the bottom. Sparkles at the corners for energy.
 // 22 cols × 30 rows, 2-char tokens space-separated, ".." = transparent.
-// Distinct silhouette from the supplier-pricing wizard.
 const SPLASH_PALETTE = {
-  // Gavel head — warm wood, 4 shades
-  HD: "#4a2f15",   // outline / shadow
-  HM: "#7a4a22",   // body mid
-  HL: "#b07440",   // light face
-  HX: "#e0a06c",   // specular highlight
-  // Handle — same wood, slightly cooler
-  WD: "#5c3819",   // outline
-  WM: "#8e5a2e",   // mid
-  WL: "#c0834a",   // highlight
-  // Sound block — darker wood
-  BD: "#3d2510",   // outline / shadow
-  BM: "#6b4220",   // front face
-  BL: "#a87446",   // mid / top edge
-  BX: "#d8a06b",   // top face highlight
-  // Sparks (banana — matches accent)
-  SP: "#fce985",   // spark
-  SH: "#fff7c4",   // bright spark core
+  // Banana — warm yellow with deep outline (the brand)
+  BO: "#3d2914",   // outline (deep brown, ties to chocolate undertones)
+  BB: "#c89220",   // base / darkest yellow (under-shadow)
+  BM: "#ecc442",   // mid yellow (body)
+  BL: "#ffe066",   // light yellow (highlight side)
+  BH: "#fff5b8",   // brightest highlight (specular)
+  // Stem — short brown nub at top
+  ST: "#2d1d0a",   // stem dark
+  SM: "#533618",   // stem mid
+  // Sparkles (Frosted Mint — ties to ink-0 and the palette)
+  SP: "#C4E7D4",   // dim sparkle
+  SH: "#ffffff",   // bright sparkle core
 };
 
 const SPLASH_GRID = [
-  /*  0 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
-  /*  1 */ ".. .. .. .. .. .. .. SP .. .. .. .. .. SP .. .. .. .. .. .. .. ..",
-  /*  2 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
-  /*  3 */ ".. .. .. .. HD HD HD HD HD HD HD HD HD HD HD HD HD HD HD .. .. ..",
-  /*  4 */ ".. .. .. .. HD HM HM HL HL HL HX HX HX HL HL HL HM HM HD .. .. ..",
-  /*  5 */ ".. .. .. .. HD HM HL HL HL HX HX HX HX HX HL HL HL HM HD .. .. ..",
-  /*  6 */ ".. .. .. .. HD HM HM HL HL HL HX HX HL HL HL HL HM HM HD .. .. ..",
-  /*  7 */ ".. .. .. .. HD HD HD HD HD HD HD HD HD HD HD HD HD HD HD .. .. ..",
-  /*  8 */ ".. .. .. .. .. .. .. .. .. WD WM WL WD .. .. .. .. .. .. .. .. ..",
-  /*  9 */ ".. .. .. .. .. .. .. .. .. WD WM WL WD .. .. .. .. .. .. .. .. ..",
-  /* 10 */ ".. .. .. .. .. .. .. .. .. WD WM WL WD .. .. .. .. .. .. .. .. ..",
-  /* 11 */ ".. .. .. .. .. .. .. .. .. WD WM WL WD .. .. .. .. .. .. .. .. ..",
-  /* 12 */ ".. .. .. .. .. .. .. .. .. WD WM WL WD .. .. .. .. .. .. .. .. ..",
-  /* 13 */ ".. .. .. .. .. .. .. .. .. WD WM WL WD .. .. .. .. .. .. .. .. ..",
-  /* 14 */ ".. .. .. .. .. .. .. .. .. WD WM WL WD .. .. .. .. .. .. .. .. ..",
-  /* 15 */ ".. .. .. .. .. .. .. .. .. WD WM WL WD .. .. .. .. .. .. .. .. ..",
-  /* 16 */ ".. .. .. .. .. .. .. .. WD WM WL WL WL WD .. .. .. .. .. .. .. ..",
-  /* 17 */ ".. .. .. .. .. .. .. WD WM WL WL WL WL WL WD .. .. .. .. .. .. ..",
-  /* 18 */ ".. .. .. .. .. .. WD WM WL WL WL WL WL WL WL WD .. .. .. .. .. ..",
-  /* 19 */ ".. .. .. .. .. WD WM WL WL WL WL WL WL WL WL WL WD .. .. .. .. ..",
-  /* 20 */ ".. .. .. .. SP SH .. .. .. .. .. .. .. .. .. .. SH SP .. .. .. ..",
-  /* 21 */ ".. .. BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD .. .. ..",
-  /* 22 */ ".. BD BX BX BX BX BX BX BX BX BX BX BX BX BX BX BX BX BX BD .. ..",
-  /* 23 */ ".. BD BL BL BL BL BL BL BL BL BL BL BL BL BL BL BL BL BL BD .. ..",
-  /* 24 */ ".. BD BM BL BL BL BL BL BL BL BL BL BL BL BL BL BL BL BL BM BD ..",
-  /* 25 */ ".. BD BM BL BL BL BL BL BL BL BL BL BL BL BL BL BL BL BL BM BD ..",
-  /* 26 */ ".. BD BM BM BM BM BM BM BM BM BM BM BM BM BM BM BM BM BM BM BD ..",
-  /* 27 */ ".. BD BD BM BM BM BM BM BM BM BM BM BM BM BM BM BM BM BM BD BD ..",
-  /* 28 */ ".. BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD BD ..",
-  /* 29 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  /*  0 */ ".. .. .. SP .. .. .. .. .. .. .. .. .. .. .. .. .. .. SH .. .. ..",
+  /*  1 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  /*  2 */ ".. .. .. .. .. .. .. .. .. ST ST .. .. .. .. .. .. .. .. .. .. ..",
+  /*  3 */ ".. .. .. .. .. .. .. .. ST SM SM ST .. .. .. .. .. .. .. .. .. ..",
+  /*  4 */ ".. .. .. .. .. .. .. ST SM SM SM SM ST .. .. .. .. .. .. .. .. ..",
+  /*  5 */ ".. .. .. .. .. .. ST SM SM SM SM SM SM ST .. .. .. .. .. .. .. ..",
+  /*  6 */ ".. .. .. .. .. BO BB BB BB BB BB BB BB BB BO .. .. .. .. .. .. ..",
+  /*  7 */ ".. .. .. .. BO BB BM BM BM BM BM BM BM BM BB BO .. .. .. .. .. ..",
+  /*  8 */ ".. .. .. BO BB BM BL BL BL BL BL BL BL BL BM BB BO .. .. .. .. ..",
+  /*  9 */ ".. .. BO BB BM BL BH BH BL BL BL BH BH BL BM BB BO .. .. .. .. ..",
+  /* 10 */ ".. .. BO BM BL BH BH BL BL BO BL BL BH BH BL BM BO .. .. .. .. ..",
+  /* 11 */ ".. .. BO BM BL BH BL BL BO BO BO BL BL BH BL BM BO .. .. .. .. ..",
+  /* 12 */ ".. .. BO BM BL BL BL BO BB BB BB BO BL BL BL BM BO .. .. .. .. ..",
+  /* 13 */ ".. .. BO BM BL BL BO BB BM BM BM BB BO BL BL BM BO .. .. .. .. ..",
+  /* 14 */ ".. BO BM BL BL BO BB BM BL BL BL BM BB BO BL BL BM BO .. .. .. ..",
+  /* 15 */ ".. BO BM BL BL BO BM BL BH BH BH BL BM BO BL BL BM BO .. .. .. ..",
+  /* 16 */ ".. BO BM BL BO BB BM BL BH BH BH BL BM BB BO BL BM BO .. .. .. ..",
+  /* 17 */ ".. BO BM BL BO BM BL BL BL BL BL BL BL BM BO BL BM BO .. .. .. ..",
+  /* 18 */ ".. BO BM BL BO BM BL BL BL BL BL BL BL BM BO BL BM BO .. .. .. ..",
+  /* 19 */ ".. BO BM BL BO BM BL BL BL BL BL BL BL BM BO BL BM BO .. .. .. ..",
+  /* 20 */ ".. .. BO BM BO BM BM BL BL BL BL BL BM BM BO BM BO .. .. .. .. ..",
+  /* 21 */ ".. .. .. BO BO BM BM BL BL BL BL BL BM BM BO BO .. .. .. .. .. ..",
+  /* 22 */ ".. .. .. .. BO BM BM BM BL BL BL BM BM BM BO .. .. .. .. .. .. ..",
+  /* 23 */ ".. .. .. .. BO BM BM BM BM BM BM BM BM BO .. .. .. .. .. .. .. ..",
+  /* 24 */ ".. .. .. .. .. BO BM BM BM BM BM BM BO .. .. .. .. .. .. .. .. ..",
+  /* 25 */ ".. .. .. .. .. .. BO BM BM BM BM BO .. .. .. .. .. .. .. .. .. ..",
+  /* 26 */ ".. .. .. .. .. .. .. BO BM BM BO .. .. .. .. .. .. .. .. .. .. ..",
+  /* 27 */ ".. .. .. .. .. .. .. .. BO BO .. .. .. .. .. .. .. .. .. .. .. ..",
+  /* 28 */ ".. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..",
+  /* 29 */ ".. SH .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. SP ..",
 ];
 
 (function buildSplashChar() {
@@ -311,10 +306,11 @@ $('back-to-2').addEventListener('click', () => _showStep(2));
 // Step 2: column mapping (auto-detect via aliases + manual override)
 // ==========================================================================
 const RFQ_FIELDS = [
-  { key: 'item_num',    label: 'Item #',                hint: 'Andersen Item Number (or equivalent ERP ID)', required: true },
-  { key: 'eam_pn',      label: 'EAM Part Number',       hint: 'Optional fallback if Item # missing' },
+  { key: 'item_num',    label: 'Item #',                hint: 'Andersen Item Number — usually populated; blank for cXML/PunchOut suppliers like McMaster' },
+  { key: 'eam_pn',      label: 'EAM Part Number',       hint: 'Andersen-side fallback if Item # missing' },
+  { key: 'part_number', label: 'Supplier Part Number',  hint: 'Supplier\'s own catalog SKU (e.g. McMaster\'s 5709A45). Used as fallback dedup key when Item # / EAM are blank' },
   { key: 'description', label: 'Description',           hint: 'Item / part description', required: true },
-  { key: 'mfg_name',    label: 'Manufacturer',          hint: 'Manufacturer name (often blank — that\'s OK)' },
+  { key: 'mfg_name',    label: 'Manufacturer',          hint: 'Manufacturer name (often blank or "N/A" for distributor-branded items — that\'s OK)' },
   { key: 'mfg_pn',      label: 'Manufacturer Part #',   hint: 'OEM part number' },
   { key: 'order_date',  label: 'Order Date',            hint: 'PO date — drives the time-window aggregations', required: true },
   { key: 'qty',         label: 'Quantity',              hint: 'Order qty per line', required: true },
@@ -368,6 +364,11 @@ $('to-extract').addEventListener('click', async () => {
   const missing = RFQ_FIELDS.filter(f => f.required && !(f.key in _mapping)).map(f => f.label);
   if (missing.length) {
     alert('Missing required column mappings:\n  · ' + missing.join('\n  · '));
+    return;
+  }
+  // At least one identifier required (item_num OR eam_pn OR part_number)
+  if (!('item_num' in _mapping) && !('eam_pn' in _mapping) && !('part_number' in _mapping)) {
+    alert('Map at least one identifier column: Item #, EAM Part Number, or Supplier Part Number.');
     return;
   }
   await _runExtract();

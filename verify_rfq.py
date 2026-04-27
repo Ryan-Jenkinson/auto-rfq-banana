@@ -45,22 +45,58 @@ except ImportError:
 ALIASES = {
     "item":  ["item #", "item number", "andersen item", "item num"],
     "eam":   ["eam part number", "eam part", "eam pn", "eam #"],
+    # Supplier's own catalog SKU — fallback dedup key when item / eam are blank
+    # (McMaster cXML orders typically leave the Andersen-side fields empty).
+    # Must NOT match "Manufacturer Part Number" — auto_map runs in dict order
+    # so we don't include "manufacturer part" in this list.
+    "part":  ["part number", "supplier part", "supplier sku", "supplier auxiliary part number"],
     "date":  ["order date", "po date", "transaction date"],
     "qty":   ["quantity", "qty ordered", "order qty", "qty"],
     "price": ["unit price", "price per unit", "price each", "price"],
-    "po":    ["po #", "po number", "purchase order"],
+    "po":    ["po number", "po #", "purchase order"],
 }
 
 
+def _is_blanky(s):
+    """Treat 'N/A' and friends as effectively blank (McMaster pattern)."""
+    if s is None:
+        return True
+    t = str(s).strip().upper()
+    return t in ("", "N/A", "#N/A", "NA", "-", "—", "(BLANK)", "NULL", "NONE")
+
+
 def auto_map(headers):
+    """Two-pass: exact-equality first, then substring fallback. Without exact-
+    first, 'part number' substring-matches 'Supplier Auxiliary Part Number'
+    before reaching the literal 'Part Number' column. McMaster bug 2026-04-26."""
     out = {}
     norm = [(h or "").strip().lower() for h in headers]
+
+    # Pass 1: exact equality (skip MFG cols when matching "part")
     for field, pats in ALIASES.items():
         for pat in pats:
             for i, h in enumerate(norm):
-                if pat == h or (pat in h and h):
-                    if i in out.values():
-                        continue
+                if not h or i in out.values():
+                    continue
+                if field == "part" and "manufacturer" in h:
+                    continue
+                if pat == h:
+                    out[field] = i
+                    break
+            if field in out:
+                break
+
+    # Pass 2: substring fallback
+    for field, pats in ALIASES.items():
+        if field in out:
+            continue
+        for pat in pats:
+            for i, h in enumerate(norm):
+                if not h or i in out.values():
+                    continue
+                if field == "part" and "manufacturer" in h:
+                    continue
+                if pat in h:
                     out[field] = i
                     break
             if field in out:
@@ -125,7 +161,9 @@ def main(path):
         def g(field):
             i = m.get(field)
             return None if (i is None or i >= len(row)) else row[i]
-        item_raw = g("item") or g("eam")
+        item_raw = g("item") or g("eam") or g("part")
+        if _is_blanky(item_raw):
+            item_raw = None
         if not item_raw:
             continue
         d = parse_date(g("date"))
@@ -175,7 +213,9 @@ def main(path):
         def g(field):
             i = m.get(field)
             return None if (i is None or i >= len(row)) else row[i]
-        item_raw = g("item") or g("eam")
+        item_raw = g("item") or g("eam") or g("part")
+        if _is_blanky(item_raw):
+            item_raw = None
         if not item_raw:
             continue
         d = parse_date(g("date"))

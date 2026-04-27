@@ -118,34 +118,67 @@ def canon_mfg(s) -> str:
 EXPORT_ALIASES = {
     "item_num":    ["item #", "item number", "andersen item", "item num", "item id"],
     "eam_pn":      ["eam part number", "eam part", "eam pn", "eam part #", "eam #"],
-    "description": ["description", "detailed item", "item description", "long description", "desc"],
+    "description": ["item name", "detailed item", "description", "item description", "long description", "desc"],
     "mfg_name":    ["manufacturer name", "manufacturer", "mfg name", "mfr name", "make"],
-    "mfg_pn":      ["manufacturer part #", "mfg part #", "mfr part", "mpn", "manufacturer pn", "mfg pn"],
+    "mfg_pn":      ["manufacturer part #", "manufacturer part number", "mfg part #", "mfr part", "mpn", "manufacturer pn", "mfg pn"],
+    # part_number = supplier's own catalog SKU (e.g. McMaster's "5709A45").
+    # MUST come AFTER mfg_pn so "Manufacturer Part Number" gets claimed first.
+    # Used as a fallback dedup key when item_num + eam_pn are both blank
+    # (McMaster orders via cXML mostly leave those Andersen-side fields empty).
+    "part_number": ["part number", "supplier part number", "supplier sku", "supplier auxiliary part number", "catalog number", "catalog #"],
     "order_date":  ["order date", "po date", "transaction date", "date ordered", "po creation date"],
     "qty":         ["quantity", "qty ordered", "qty received", "order qty", "qty"],
     "unit_price":  ["unit price", "price per unit", "unit cost", "price each", "current price", "price"],
-    "po_number":   ["po #", "po number", "purchase order", "po num", "po no"],
+    "po_number":   ["po number", "po #", "purchase order", "po num", "po no"],
     "uom":         ["unit of measure", "uom", "unit measure", "u/m", "purch uom"],
     "commodity":   ["commodity", "category", "product category", "spend category"],
     "supplier":    ["supplier name", "supplier", "vendor name", "vendor"],
 }
 
 
+def _is_blanky(s) -> bool:
+    """Treat 'N/A', '#N/A', '-', '—', '(blank)', etc. as effectively blank.
+    McMaster orders set Manufacturer / MFG Part Number to literal 'N/A'."""
+    if s is None:
+        return True
+    t = str(s).strip().upper()
+    return t in ("", "N/A", "#N/A", "NA", "-", "—", "(BLANK)", "NULL", "NONE")
+
+
 def auto_map_export(headers: list) -> dict:
-    """Given a list of header strings, return {field → header_idx} where matched."""
+    """Given a list of header strings, return {field → header_idx} where matched.
+
+    Two-pass: exact-equality first across all (field, pattern) pairs, THEN
+    substring fallback for fields that didn't get an exact hit. Without this,
+    a substring like "part number" matching "Supplier Auxiliary Part Number"
+    (mostly empty col) wins over the literal "Part Number" column that's
+    actually populated. McMaster bug 2026-04-26."""
     out = {}
     norm_headers = [norm_text(h).lower() if h else "" for h in headers]
+
+    # Pass 1: exact equality
     for field, patterns in EXPORT_ALIASES.items():
         for pat in patterns:
             pat_l = pat.lower()
             for i, h in enumerate(norm_headers):
-                if not h:
+                if not h or i in out.values():
                     continue
-                # Prefer exact-word match before substring; both checked here
-                if h == pat_l or pat_l in h:
-                    # Don't double-assign: skip if already taken by another field
-                    if i in out.values():
-                        continue
+                if h == pat_l:
+                    out[field] = i
+                    break
+            if field in out:
+                break
+
+    # Pass 2: substring fallback for unmapped fields
+    for field, patterns in EXPORT_ALIASES.items():
+        if field in out:
+            continue
+        for pat in patterns:
+            pat_l = pat.lower()
+            for i, h in enumerate(norm_headers):
+                if not h or i in out.values():
+                    continue
+                if pat_l in h:
                     out[field] = i
                     break
             if field in out:
@@ -222,6 +255,7 @@ def _extract_rows(file_bytes, mapping: dict) -> list:
     c_desc = col("description")
     c_mfg = col("mfg_name")
     c_mpn = col("mfg_pn")
+    c_part = col("part_number")
     c_date = col("order_date")
     c_qty = col("qty")
     c_price = col("unit_price")
@@ -229,6 +263,11 @@ def _extract_rows(file_bytes, mapping: dict) -> list:
     c_uom = col("uom")
     c_comm = col("commodity")
     c_sup = col("supplier")
+
+    def _clean(v):
+        """norm_text but also coerce literal 'N/A'-style values to ''."""
+        s = norm_text(v)
+        return "" if _is_blanky(s) else s
 
     rows = []
     first = True
@@ -240,25 +279,31 @@ def _extract_rows(file_bytes, mapping: dict) -> list:
             continue
         def g(i):
             return None if (i is None or i >= len(row)) else row[i]
-        item = norm_text(g(c_item)) if c_item is not None else ""
-        eam = norm_text(g(c_eam)) if c_eam is not None else ""
-        if not item and not eam:
+        item = _clean(g(c_item)) if c_item is not None else ""
+        eam = _clean(g(c_eam)) if c_eam is not None else ""
+        part = _clean(g(c_part)) if c_part is not None else ""
+        # Dedup-key fallback: Andersen Item # → EAM Part # → supplier Part Number.
+        # Distributors that order via cXML (McMaster, Grainger PunchOut, etc.)
+        # often leave the Andersen-side fields blank because the part lives in
+        # the supplier's catalog, not Andersen's item-master.
+        key_raw = item or eam or part
+        if not key_raw:
             continue
-        key_raw = item or eam
         rows.append({
             "key": norm_pn(key_raw),
-            "item_num": item or eam,
+            "item_num": item or eam or part,
             "eam_pn": eam,
-            "description": norm_text(g(c_desc)) if c_desc is not None else "",
-            "mfg_name": norm_text(g(c_mfg)) if c_mfg is not None else "",
-            "mfg_pn": norm_text(g(c_mpn)) if c_mpn is not None else "",
+            "part_number": part,
+            "description": _clean(g(c_desc)) if c_desc is not None else "",
+            "mfg_name": _clean(g(c_mfg)) if c_mfg is not None else "",
+            "mfg_pn": _clean(g(c_mpn)) if c_mpn is not None else "",
             "order_date": parse_date(g(c_date)) if c_date is not None else None,
             "qty": safe_float(g(c_qty)) if c_qty is not None else None,
             "unit_price": safe_float(g(c_price)) if c_price is not None else None,
-            "po": norm_text(g(c_po)) if c_po is not None else "",
-            "uom": norm_text(g(c_uom)) if c_uom is not None else "",
-            "commodity": norm_text(g(c_comm)) if c_comm is not None else "",
-            "supplier": norm_text(g(c_sup)) if c_sup is not None else "",
+            "po": _clean(g(c_po)) if c_po is not None else "",
+            "uom": _clean(g(c_uom)) if c_uom is not None else "",
+            "commodity": _clean(g(c_comm)) if c_comm is not None else "",
+            "supplier": _clean(g(c_sup)) if c_sup is not None else "",
         })
     wb.close()
     return rows
@@ -292,6 +337,7 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         "key": "",
         "item_num": "",
         "eam_pn": "",
+        "part_number": "",
         "description": "",
         "mfg_name_counts": Counter(),
         "mfg_pn_counts": Counter(),
@@ -322,6 +368,7 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         if not rec["item_num"]:
             rec["item_num"] = r["item_num"]
             rec["eam_pn"] = r["eam_pn"]
+            rec["part_number"] = r["part_number"]
         # Description: take the first non-empty seen (descriptions vary slightly across years)
         if not rec["description"] and r["description"]:
             rec["description"] = r["description"]
@@ -373,6 +420,7 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
             "key": rec["key"],
             "item_num": rec["item_num"],
             "eam_pn": rec["eam_pn"],
+            "part_number": rec["part_number"],
             "description": rec["description"],
             "mfg_name": mfg_name,
             "mfg_pn": mfg_pn,
