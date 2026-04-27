@@ -410,6 +410,10 @@ json.dumps(_rfq, default=str)
   _renderKpis();
   _renderRfqTable();
   _renderCharts();
+  // Boot the save manager — this run is now a recoverable session
+  _saveMgr.init();
+  _saveMgr.autosaveLocal();
+  _injectSaveBar();
 }
 
 function _renderKpis() {
@@ -517,13 +521,14 @@ function _renderRfqTable() {
       const it = _rfqResult.items.find(x => x.item_num === k);
       if (it) it.included = cb.checked;
       cb.closest('tr').classList.toggle('excluded', !cb.checked);
+      _saveMgr.markDirty();
     });
   });
 }
 
 ['active-window', 'min-spend', 'rfq-search'].forEach(id => {
   const el = $(id);
-  if (el) el.addEventListener('input', _renderRfqTable);
+  if (el) el.addEventListener('input', () => { _renderRfqTable(); _saveMgr.markDirty(); });
 });
 
 // ==========================================================================
@@ -625,6 +630,359 @@ base64.b64encode(_b).decode('ascii')
     btn.textContent = t;
   }
 });
+
+// ==========================================================================
+// Save manager — 60s autosave to localStorage + manual named saves
+//
+// Pattern source: supplier-pricing/app.js (_commitSessionWrite + bookmark
+// folder pattern). Two storage tiers:
+//   1. localStorage autosave: every 60s if dirty, transparent, no permission
+//      prompt. Stores the latest state per-rfq. Acts as the safety net.
+//   2. Disk saves (named): require File System Access API + a folder pick.
+//      Once picked, manual saves write JSON files into that folder. Falls
+//      back to a download if the API isn't available (Firefox / Safari).
+//
+// State captured (NOT the source xlsx — too large for localStorage):
+//   - rfq_id (stable per session)
+//   - source meta (filename, headers, sheet name, row count)
+//   - column mapping
+//   - per-item decisions (included flag overrides + notes)
+//   - UI state (active window, min spend, search)
+//
+// On restore: user re-loads the source xlsx (we don't bundle the binary in
+// the JSON), mapping + decisions auto-apply after extraction.
+// ==========================================================================
+const _saveMgr = (() => {
+  const VERSION = 1;
+  const AUTOSAVE_PREFIX = 'autorfqbanana:autosave:';
+  const AUTOSAVE_INDEX = 'autorfqbanana:autosave_index';
+  const AUTOSAVE_INTERVAL_MS = 60 * 1000;
+
+  let _rfqId = null;
+  let _folderHandle = null;
+  let _autosaveTimer = null;
+  let _statusTickTimer = null;
+  let _dirty = false;
+  let _lastSavedAt = null;       // Date | null
+  let _lastSaveMethod = null;    // 'localStorage' | 'folder' | 'download'
+  let _onStateChange = null;     // listener for status-bar updates
+
+  function _newRfqId() {
+    return 'rfq_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+  }
+
+  function _captureState() {
+    const decisions = {};
+    if (_rfqResult) {
+      for (const it of _rfqResult.items) {
+        // Default include policy is "spend_24mo > 0". Only persist deltas.
+        const defaultIncluded = (it.spend_24mo || 0) > 0;
+        const ds = {};
+        if (it.included !== defaultIncluded) ds.included = it.included;
+        if (it.note) ds.note = it.note;
+        if (Object.keys(ds).length) decisions[it.item_num] = ds;
+      }
+    }
+    return {
+      version: VERSION,
+      rfq_id: _rfqId,
+      saved_at: new Date().toISOString(),
+      source: _exportFile ? {
+        name: _exportFile.name,
+        size: _exportFile.size,
+        sheet_name: _exportSheetName,
+        row_count: _exportRowCount,
+        headers: _exportHeaders,
+      } : null,
+      mapping: _mapping ? { ..._mapping } : null,
+      decisions: decisions,
+      ui_state: {
+        active_window: $('active-window') ? $('active-window').value : '24',
+        min_spend: $('min-spend') ? $('min-spend').value : '0',
+        search: $('rfq-search') ? $('rfq-search').value : '',
+      },
+    };
+  }
+
+  function _applyState(state) {
+    if (!state) return;
+    if (state.mapping) _mapping = state.mapping;
+    if (state.ui_state) {
+      if ($('active-window') && state.ui_state.active_window) $('active-window').value = state.ui_state.active_window;
+      if ($('min-spend') && state.ui_state.min_spend != null) $('min-spend').value = state.ui_state.min_spend;
+      if ($('rfq-search') && state.ui_state.search != null) $('rfq-search').value = state.ui_state.search;
+    }
+    if (state.decisions && _rfqResult) {
+      for (const it of _rfqResult.items) {
+        const d = state.decisions[it.item_num];
+        if (!d) continue;
+        if (d.included !== undefined) it.included = d.included;
+        if (d.note !== undefined) it.note = d.note;
+      }
+      if (typeof _renderRfqTable === 'function') _renderRfqTable();
+    }
+  }
+
+  function autosaveLocal() {
+    if (!_rfqId) return false;
+    try {
+      const s = _captureState();
+      const json = JSON.stringify(s);
+      // localStorage cap is ~5-10MB per origin — we save mapping + decisions
+      // only (no full items list), so we should always be well under that.
+      // If we ever start saving items, bytecount + warn.
+      localStorage.setItem(AUTOSAVE_PREFIX + _rfqId, json);
+      _updateAutosaveIndex(_rfqId, s);
+      _lastSavedAt = new Date();
+      _lastSaveMethod = 'localStorage';
+      _dirty = false;
+      _notify();
+      return true;
+    } catch (err) {
+      console.warn('[saveMgr] autosave failed:', err);
+      return false;
+    }
+  }
+
+  function _updateAutosaveIndex(rfqId, state) {
+    try {
+      const idx = JSON.parse(localStorage.getItem(AUTOSAVE_INDEX) || '{}');
+      idx[rfqId] = {
+        rfq_id: rfqId,
+        saved_at: state.saved_at,
+        source_name: state.source ? state.source.name : '(no file)',
+      };
+      localStorage.setItem(AUTOSAVE_INDEX, JSON.stringify(idx));
+    } catch (e) { /* index is best-effort */ }
+  }
+
+  function listAutosaves() {
+    try {
+      const idx = JSON.parse(localStorage.getItem(AUTOSAVE_INDEX) || '{}');
+      return Object.values(idx).sort((a, b) => (b.saved_at || '').localeCompare(a.saved_at || ''));
+    } catch (e) { return []; }
+  }
+
+  function loadAutosave(rfqId) {
+    try {
+      const raw = localStorage.getItem(AUTOSAVE_PREFIX + (rfqId || ''));
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (err) {
+      console.warn('[saveMgr] loadAutosave failed:', err);
+      return null;
+    }
+  }
+
+  function deleteAutosave(rfqId) {
+    try {
+      localStorage.removeItem(AUTOSAVE_PREFIX + rfqId);
+      const idx = JSON.parse(localStorage.getItem(AUTOSAVE_INDEX) || '{}');
+      delete idx[rfqId];
+      localStorage.setItem(AUTOSAVE_INDEX, JSON.stringify(idx));
+    } catch (e) { /* swallow */ }
+  }
+
+  async function pickFolder() {
+    if (!('showDirectoryPicker' in window)) {
+      alert(
+        'Folder bookmarking requires Chrome / Edge / Brave (File System Access API).\n\n' +
+        'Manual saves still work — they\'ll download as JSON files instead.'
+      );
+      return false;
+    }
+    try {
+      _folderHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      _notify();
+      return true;
+    } catch (err) {
+      if (err.name !== 'AbortError') console.warn('[saveMgr] folder pick failed:', err);
+      return false;
+    }
+  }
+
+  async function manualSave(name) {
+    const safe = (name || 'save').replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 40) || 'save';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const fname = `Save_${_rfqId}_${safe}_${ts}.json`;
+    const state = _captureState();
+    state.name = name;
+    state.kind = 'named';
+    const json = JSON.stringify(state, null, 2);
+
+    if (_folderHandle) {
+      try {
+        const handle = await _folderHandle.getFileHandle(fname, { create: true });
+        const w = await handle.createWritable();
+        await w.write(json);
+        await w.close();
+        _lastSavedAt = new Date();
+        _lastSaveMethod = 'folder';
+        _dirty = false;
+        _notify();
+        return { ok: true, where: 'folder', name: fname };
+      } catch (err) {
+        console.warn('[saveMgr] folder save failed; falling back to download:', err);
+      }
+    }
+    // Fallback: trigger a download
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = fname;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    _lastSavedAt = new Date();
+    _lastSaveMethod = 'download';
+    _dirty = false;
+    _notify();
+    return { ok: true, where: 'download', name: fname };
+  }
+
+  async function loadFromFile(file) {
+    const text = await file.text();
+    const state = JSON.parse(text);
+    if (state.version !== VERSION) {
+      console.warn('[saveMgr] version mismatch:', state.version, 'expected', VERSION, '— attempting load anyway');
+    }
+    _applyState(state);
+    if (state.rfq_id) _rfqId = state.rfq_id;
+    _notify();
+    return state;
+  }
+
+  function markDirty() { _dirty = true; _notify(); }
+
+  function isDirty() { return _dirty; }
+  function status() {
+    return {
+      rfq_id: _rfqId,
+      dirty: _dirty,
+      last_saved_at: _lastSavedAt,
+      last_save_method: _lastSaveMethod,
+      has_folder: !!_folderHandle,
+    };
+  }
+
+  function _notify() {
+    if (_onStateChange) {
+      try { _onStateChange(status()); } catch (e) { /* swallow */ }
+    }
+  }
+
+  function onChange(fn) { _onStateChange = fn; _notify(); }
+
+  function init(opts) {
+    opts = opts || {};
+    _rfqId = opts.rfqId || _rfqId || _newRfqId();
+    if (_autosaveTimer) clearInterval(_autosaveTimer);
+    _autosaveTimer = setInterval(() => { if (_dirty) autosaveLocal(); }, AUTOSAVE_INTERVAL_MS);
+    if (_statusTickTimer) clearInterval(_statusTickTimer);
+    _statusTickTimer = setInterval(_notify, 1000);  // re-render "Xs ago" labels
+    _notify();
+  }
+
+  return {
+    init, autosaveLocal, manualSave, pickFolder,
+    loadFromFile, loadAutosave, listAutosaves, deleteAutosave,
+    markDirty, isDirty, status, onChange,
+  };
+})();
+
+// Expose for console debugging / future UI wiring
+window._saveMgr = _saveMgr;
+
+// ==========================================================================
+// Save bar UI — injected dynamically (CSS-var styled so it works under
+// any palette / design pass). Appears once a session is initialized.
+// ==========================================================================
+function _injectSaveBar() {
+  if (document.getElementById('save-bar')) return; // idempotent
+  const topbar = document.querySelector('.topbar');
+  if (!topbar) return;
+  const bar = document.createElement('div');
+  bar.id = 'save-bar';
+  bar.style.cssText = [
+    'display:flex','align-items:center','gap:8px','flex-wrap:wrap',
+    'margin-bottom:24px','padding:10px 14px',
+    'background:var(--bg-1)','border:1px solid var(--line)','border-radius:6px',
+    'font-family:var(--ui, var(--body, sans-serif))',
+    'font-size:13px',
+  ].join(';');
+  bar.innerHTML = `
+    <span style="color:var(--ink-2);font-family:var(--mono);font-size:11px;letter-spacing:0.06em;text-transform:uppercase;font-weight:600;">SESSION</span>
+    <span id="save-status" style="color:var(--ink-1);font-family:var(--mono);font-size:12px;flex:1;">no auto-save yet</span>
+    <button class="btn ghost" id="save-folder-btn" type="button" style="padding:6px 12px;font-size:12px;">📁 Save folder…</button>
+    <button class="btn ghost" id="save-as-btn" type="button" style="padding:6px 12px;font-size:12px;">💾 Save as…</button>
+    <button class="btn ghost" id="save-restore-btn" type="button" style="padding:6px 12px;font-size:12px;">⮌ Restore…</button>
+    <input type="file" id="save-restore-input" accept=".json" style="display:none">
+  `;
+  // Insert after topbar
+  topbar.insertAdjacentElement('afterend', bar);
+
+  // Wire buttons
+  document.getElementById('save-folder-btn').addEventListener('click', async () => {
+    const ok = await _saveMgr.pickFolder();
+    if (ok) _flashStatus('Folder bookmarked — manual saves will write here.');
+  });
+  document.getElementById('save-as-btn').addEventListener('click', async () => {
+    const name = prompt('Name this save point (e.g. "before exclusions" or "post-review"):');
+    if (name === null) return; // cancelled
+    const res = await _saveMgr.manualSave(name || 'save');
+    if (res.ok) {
+      _flashStatus(`Saved · ${res.where} · ${res.name}`);
+    }
+  });
+  document.getElementById('save-restore-btn').addEventListener('click', () => {
+    document.getElementById('save-restore-input').click();
+  });
+  document.getElementById('save-restore-input').addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const state = await _saveMgr.loadFromFile(f);
+      _flashStatus(`Restored · ${state.name || state.rfq_id} · re-extracting if needed…`);
+      // If we have a current source file + saved mapping, re-run extract to
+      // surface the state in-app. Otherwise the user needs to re-pick a source.
+      if (_exportBytes && state.mapping) {
+        await _runExtract();
+        _saveMgr.init({ rfqId: state.rfq_id });
+      }
+    } catch (err) {
+      alert('Restore failed: ' + (err.message || err));
+    }
+  });
+
+  // Subscribe to status updates
+  _saveMgr.onChange((s) => {
+    const el = document.getElementById('save-status');
+    if (!el) return;
+    if (!s.last_saved_at) {
+      el.textContent = 'no auto-save yet';
+      el.style.color = 'var(--ink-2)';
+      return;
+    }
+    const sec = Math.max(0, Math.floor((Date.now() - s.last_saved_at.getTime()) / 1000));
+    const ago = sec < 60 ? `${sec}s ago` : `${Math.floor(sec/60)}m ago`;
+    const folder = s.has_folder ? ' · folder bookmarked' : '';
+    if (s.dirty) {
+      el.textContent = `unsaved changes · last auto-save ${ago}${folder}`;
+      el.style.color = 'var(--accent, var(--red))';
+    } else {
+      el.textContent = `auto-saved ${ago}${folder}`;
+      el.style.color = 'var(--green, var(--ink-1))';
+    }
+  });
+}
+
+function _flashStatus(msg) {
+  const el = document.getElementById('save-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = 'var(--green, var(--ink-0))';
+  // Next 1s status tick will overwrite this with the live status; that's fine
+  // — the flash is just a momentary confirmation.
+}
 
 // ==========================================================================
 // Helpers
