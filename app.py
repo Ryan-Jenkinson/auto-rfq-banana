@@ -145,6 +145,137 @@ def _is_blanky(s) -> bool:
     return t in ("", "N/A", "#N/A", "NA", "-", "—", "(BLANK)", "NULL", "NONE")
 
 
+# ---------------------------------------------------------------------------
+# UOM normalization
+#
+# Suppliers spell the same UOM many ways — EA/Each/EACH/each. Map them to a
+# canonical short form for comparison + display. Risky changes (Box→Each,
+# Roll→Feet, Pair→Each) are flagged but never auto-converted without an
+# explicit conversion factor.
+# ---------------------------------------------------------------------------
+
+UOM_CANONICAL = {
+    # Each
+    "EA": "EA", "EACH": "EA", "EACHES": "EA", "EAS": "EA",
+    "PCE": "EA", "PIECE": "EA", "PIECES": "EA", "PC": "EA", "UNIT": "EA",
+    # Box
+    "BX": "BX", "BOX": "BX", "BOXES": "BX",
+    # Pack
+    "PK": "PK", "PACK": "PK", "PACKAGE": "PK", "PACKAGES": "PK", "PKG": "PK",
+    # Foot
+    "FT": "FT", "FOOT": "FT", "FEET": "FT",
+    # Inch
+    "IN": "IN", "INCH": "IN", "INCHES": "IN",
+    # Pound
+    "LB": "LB", "LBS": "LB", "POUND": "LB", "POUNDS": "LB",
+    # Kilogram
+    "KG": "KG", "KILO": "KG", "KILOGRAM": "KG", "KILOGRAMS": "KG",
+    # Gallon / quart / pint / ounce
+    "GAL": "GAL", "GALLON": "GAL", "GALLONS": "GAL",
+    "QT": "QT", "QUART": "QT", "QUARTS": "QT",
+    "PT": "PT", "PINT": "PT", "PINTS": "PT",
+    "OZ": "OZ", "OUNCE": "OZ", "OUNCES": "OZ",
+    # Roll / case / dozen / pair / set / kit
+    "RL": "RL", "ROLL": "RL", "ROLLS": "RL",
+    "CS": "CS", "CASE": "CS", "CASES": "CS",
+    "DZ": "DZ", "DOZ": "DZ", "DOZEN": "DZ",
+    "PR": "PR", "PAIR": "PR", "PAIRS": "PR",
+    "ST": "SET", "SET": "SET", "SETS": "SET",
+    "KT": "KIT", "KIT": "KIT", "KITS": "KIT",
+    # Metric length
+    "M": "M", "METER": "M", "METERS": "M", "METRE": "M",
+    "CM": "CM", "CENTIMETER": "CM", "CENTIMETERS": "CM",
+    "MM": "MM", "MILLIMETER": "MM", "MILLIMETERS": "MM",
+    # Bag / bundle
+    "BG": "BG", "BAG": "BG", "BAGS": "BG",
+    "BD": "BD", "BUNDLE": "BD", "BUNDLES": "BD",
+}
+
+
+def canon_uom(s) -> str:
+    """Return the canonical UOM short form. Empty string if unknown/blank."""
+    if not s:
+        return ""
+    t = str(s).strip().upper()
+    if not t or _is_blanky(t):
+        return ""
+    # Strip trailing periods (E.A. → EA)
+    t = t.rstrip(".").rstrip("/")
+    return UOM_CANONICAL.get(t, t)
+
+
+# UOM pairs that are inherently risky to compare or convert without a
+# conversion factor. Direction matters: ("BX", "EA") means treating Box as
+# Each is the wrong move. We flag these on the per-item record so the UI can
+# surface the concern; never auto-convert.
+RISKY_UOM_CHANGES = {
+    ("BX", "EA"), ("EA", "BX"),
+    ("PK", "EA"), ("EA", "PK"),
+    ("CS", "EA"), ("EA", "CS"),
+    ("RL", "FT"), ("FT", "RL"),
+    ("RL", "IN"), ("IN", "RL"),
+    ("PR", "EA"), ("EA", "PR"),
+    ("DZ", "EA"), ("EA", "DZ"),
+    ("GAL", "OZ"), ("OZ", "GAL"),
+    ("GAL", "QT"), ("QT", "GAL"),
+    ("LB", "EA"), ("EA", "LB"),
+    ("BG", "EA"), ("EA", "BG"),
+    ("KIT", "EA"), ("EA", "KIT"),
+    ("SET", "EA"), ("EA", "SET"),
+}
+
+
+def is_risky_uom_change(from_uom: str, to_uom: str) -> bool:
+    a = canon_uom(from_uom)
+    b = canon_uom(to_uom)
+    if not a or not b or a == b:
+        return False
+    return (a, b) in RISKY_UOM_CHANGES
+
+
+# ---------------------------------------------------------------------------
+# Description-pattern flags
+#
+# Items whose description suggests they don't belong in a standard RFQ:
+# services, freight, custom one-offs, etc. Surface these as flags so the
+# user can drop them from the candidate list intentionally.
+# ---------------------------------------------------------------------------
+
+DESC_PATTERN_FLAGS = {
+    "service":  ["service", "labor", "installation install", "tech support", "consulting"],
+    "freight":  ["freight", "shipping charge", "delivery charge", "expedite"],
+    "tariff":   ["tariff", "duty", "customs charge"],
+    "custom":   ["custom", "made-to-order", "made to order", "special order", "bespoke", "non-standard"],
+    "repair":   ["repair", "rebuild", "refurbish", "remanufactured"],
+    "rental":   ["rental", "lease", "loaner"],
+    "misc":     ["misc", "miscellaneous", "general supplies", "various", "assorted"],
+    "obsolete": ["obsolete", "discontinued", "no longer available", "end of life", "eol"],
+    "generic":  [],   # placeholder — handled separately by length check
+}
+
+
+def description_pattern_flags(desc: str) -> list:
+    """Return a list of pattern category names that fired for this description.
+    Used for both Step 3 curation and the readiness scoring."""
+    if not desc:
+        return ["generic"]
+    d = str(desc).strip().lower()
+    if not d:
+        return ["generic"]
+    flags = []
+    for category, patterns in DESC_PATTERN_FLAGS.items():
+        for pat in patterns:
+            # Word-boundary-ish match: flank with spaces or string edges
+            if pat in d:
+                flags.append(category)
+                break
+    # Generic: very short descriptions like "Cord Grip" / "Brackets"
+    # or descriptions with no spaces (single-word items)
+    if "generic" not in flags and (len(d) < 12 or " " not in d):
+        flags.append("generic")
+    return flags
+
+
 def auto_map_export(headers: list) -> dict:
     """Given a list of header strings, return {field → header_idx} where matched.
 
@@ -425,9 +556,20 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         mfg_name = rec["mfg_name_counts"].most_common(1)[0][0] if rec["mfg_name_counts"] else ""
         mfg_pn = rec["mfg_pn_counts"].most_common(1)[0][0] if rec["mfg_pn_counts"] else ""
         commodity = rec["commodity_counts"].most_common(1)[0][0] if rec["commodity_counts"] else ""
-        uoms = rec["uom_counts"].most_common()
-        uom = uoms[0][0] if uoms else ""
-        uom_mixed = len(uoms) > 1
+        uoms_raw = rec["uom_counts"].most_common()
+        uom_raw = uoms_raw[0][0] if uoms_raw else ""
+        # Canonicalize before deciding "mixed" — Each/EA/EACH all map to EA so
+        # they shouldn't trip the mixed-UOM warning.
+        canon_counts = Counter()
+        for u, n in uoms_raw:
+            cu = canon_uom(u)
+            if cu:
+                canon_counts[cu] += n
+        canon_top = canon_counts.most_common()
+        uom = canon_top[0][0] if canon_top else canon_uom(uom_raw)
+        uom_mixed = len(canon_top) > 1
+        # Description-pattern flags — "freight", "obsolete", "generic", etc.
+        desc_flags = description_pattern_flags(rec["description"])
 
         # Last unit price = EXACT unit price of the most recent priced order line.
         # No median, no smoothing — RFQ reporting must be to-the-penny.
@@ -454,7 +596,10 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
             "mfg_pn": mfg_pn,
             "commodity": commodity,
             "uom": uom,
+            "uom_raw": uom_raw,
             "uom_mixed": uom_mixed,
+            "uom_distinct": [u for u, _ in canon_top],
+            "desc_flags": desc_flags,
             "po_count": len(rec["po_set"]),
             "qty_12mo": rec["qty_12mo"],
             "qty_24mo": rec["qty_24mo"],

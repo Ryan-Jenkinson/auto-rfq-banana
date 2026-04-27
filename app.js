@@ -468,6 +468,8 @@ function _renderRfqTable() {
   const wKey = _activeWindowKey();
   const minSpend = parseFloat($('min-spend').value || '0');
   const search = ($('rfq-search').value || '').trim().toLowerCase();
+  const tierFilter = ($('tier-filter') ? $('tier-filter').value : 'all');
+  const includeFilter = ($('include-filter') ? $('include-filter').value : 'all');
 
   // filter
   let filtered = items.filter(it => {
@@ -477,6 +479,11 @@ function _renderRfqTable() {
       const hay = `${it.item_num} ${it.mfg_pn} ${it.description} ${it.mfg_name}`.toLowerCase();
       if (hay.indexOf(search) === -1) return false;
     }
+    if (tierFilter === 'STRONG' && it.tier !== 'STRONG') return false;
+    if (tierFilter === 'STRONG_MODERATE' && it.tier !== 'STRONG' && it.tier !== 'MODERATE') return false;
+    if (tierFilter === 'WEAK' && it.tier !== 'WEAK' && it.tier !== 'SKIP') return false;
+    if (includeFilter === 'included' && !it.included) return false;
+    if (includeFilter === 'excluded' && it.included) return false;
     return true;
   });
   // sort by current-window spend desc
@@ -495,6 +502,7 @@ function _renderRfqTable() {
   let head = `<tr>
     <th class="cell-include">RFQ</th>
     <th>Item #</th>
+    <th>Tier</th>
     <th>Description</th>
     <th>MFG</th>
     <th>MFG PN</th>
@@ -514,13 +522,29 @@ function _renderRfqTable() {
   // Render at most 500 rows in DOM at once (perf); show a "+N more" hint if larger
   const cap = 500;
   const slice = filtered.slice(0, cap);
+  const tierColor = (t) => t === 'STRONG' ? 'var(--green)' : t === 'MODERATE' ? 'var(--accent)' : t === 'WEAK' ? 'var(--cyan)' : 'var(--red)';
   for (const it of slice) {
     const flags = [];
-    if (it.uom_mixed) flags.push('<span class="flag-chip warn">UOM mixed</span>');
-    if (!it.mfg_name) flags.push('<span class="flag-chip warn">MFG blank</span>');
+    if (it.uom_mixed) flags.push('<span class="flag-chip warn" title="More than one UOM in history">UOM mixed</span>');
+    if (!it.mfg_name) flags.push('<span class="flag-chip warn" title="Manufacturer name missing">MFG blank</span>');
+    for (const df of (it.desc_flags || [])) {
+      const label = df.toUpperCase();
+      if (_RED_DESC_FLAGS.has(df)) {
+        flags.push(`<span class="flag-chip red" title="Description suggests this is a ${df} line — usually doesn't belong in an RFQ. Smart-trim will untick.">${label}</span>`);
+      } else if (df === 'custom' || df === 'misc' || df === 'repair') {
+        flags.push(`<span class="flag-chip warn" title="Description pattern suggests caution before including in RFQ">${label}</span>`);
+      }
+      // 'generic' is informational only — not rendered as a chip (would
+      // clutter on McMaster data where 90% of items are generic).
+    }
+    const tier = it.tier || 'WEAK';
+    const score = it.score != null ? it.score : 0;
+    const tierC = tierColor(tier);
+    const reasons = (it.score_reasons || []).join('; ');
     rows += `<tr data-item="${_escapeHtml(it.item_num)}" class="${it.included ? '' : 'excluded'}">
       <td class="cell-include"><input type="checkbox" ${it.included ? 'checked' : ''} data-toggle="${_escapeHtml(it.item_num)}"></td>
       <td><code>${_escapeHtml(it.item_num)}</code></td>
+      <td><span class="flag-chip" style="background:transparent;color:${tierC};border:1px solid ${tierC};font-weight:600;" title="Score ${score}/100${reasons ? ' — ' + reasons.replace(/"/g,'') : ''}">${tier} ${score}</span></td>
       <td class="cell-desc">${_escapeHtml(it.description)} ${flags.join(' ')}</td>
       <td class="cell-mfg">${_escapeHtml(it.mfg_name || '')}</td>
       <td><code>${_escapeHtml(it.mfg_pn || '')}</code></td>
@@ -536,7 +560,7 @@ function _renderRfqTable() {
     </tr>`;
   }
   if (filtered.length > cap) {
-    rows += `<tr><td colspan="14" style="padding:14px;text-align:center;color:var(--ink-2)">… and ${(filtered.length - cap).toLocaleString()} more rows hidden (narrow filters or use the export)</td></tr>`;
+    rows += `<tr><td colspan="15" style="padding:14px;text-align:center;color:var(--ink-2)">… and ${(filtered.length - cap).toLocaleString()} more rows hidden (narrow filters or use the export)</td></tr>`;
   }
   $('rfq-table').querySelector('tbody').innerHTML = rows;
 
@@ -563,10 +587,88 @@ function _renderRfqTable() {
   });
 }
 
-['active-window', 'min-spend', 'rfq-search'].forEach(id => {
+['active-window', 'min-spend', 'rfq-search', 'tier-filter', 'include-filter'].forEach(id => {
   const el = $(id);
-  if (el) el.addEventListener('input', () => { _renderRfqTable(); _saveMgr.markDirty(); });
+  if (!el) return;
+  const evt = (el.tagName === 'SELECT') ? 'change' : 'input';
+  el.addEventListener(evt, () => { _renderRfqTable(); _saveMgr.markDirty(); });
 });
+
+// Bulk include/exclude/smart-trim actions
+const _RED_DESC_FLAGS = new Set(['service', 'freight', 'tariff', 'obsolete', 'rental']);
+
+function _bulkSetIncluded(target) {
+  if (!_rfqResult) return;
+  const items = _rfqResult.items;
+  const wKey = _activeWindowKey();
+  const minSpend = parseFloat($('min-spend').value || '0');
+  const search = ($('rfq-search').value || '').trim().toLowerCase();
+  const tierFilter = $('tier-filter') ? $('tier-filter').value : 'all';
+  const includeFilter = $('include-filter') ? $('include-filter').value : 'all';
+  let touched = 0;
+  for (const it of items) {
+    const sp = wKey === 'all' ? it.spend_all : it[`spend${wKey}`];
+    if ((sp || 0) < minSpend) continue;
+    if (search) {
+      const hay = `${it.item_num} ${it.mfg_pn} ${it.description} ${it.mfg_name}`.toLowerCase();
+      if (hay.indexOf(search) === -1) continue;
+    }
+    if (tierFilter === 'STRONG' && it.tier !== 'STRONG') continue;
+    if (tierFilter === 'STRONG_MODERATE' && it.tier !== 'STRONG' && it.tier !== 'MODERATE') continue;
+    if (tierFilter === 'WEAK' && it.tier !== 'WEAK' && it.tier !== 'SKIP') continue;
+    if (includeFilter === 'included' && !it.included) continue;
+    if (includeFilter === 'excluded' && it.included) continue;
+    if (it.included !== target) {
+      it.included = target;
+      touched++;
+    }
+  }
+  return touched;
+}
+
+if ($('bulk-include-all')) {
+  $('bulk-include-all').addEventListener('click', () => {
+    const n = _bulkSetIncluded(true);
+    $('trim-status').textContent = `Included ${n.toLocaleString()} items.`;
+    _renderRfqTable();
+    _saveMgr.markDirty();
+  });
+}
+if ($('bulk-exclude-all')) {
+  $('bulk-exclude-all').addEventListener('click', () => {
+    const n = _bulkSetIncluded(false);
+    $('trim-status').textContent = `Excluded ${n.toLocaleString()} items.`;
+    _renderRfqTable();
+    _saveMgr.markDirty();
+  });
+}
+if ($('smart-trim')) {
+  $('smart-trim').addEventListener('click', () => {
+    if (!_rfqResult) return;
+    if (!confirm(
+      'Smart trim will untick:\n' +
+      '  • Items in WEAK or SKIP tier (low spend / few orders / poor data)\n' +
+      '  • Items with concerning description patterns (service / freight / tariff / obsolete / rental)\n\n' +
+      'You can re-tick individual items afterward. Proceed?'
+    )) return;
+    let trimmed = 0;
+    let kept = 0;
+    for (const it of _rfqResult.items) {
+      const isWeak = (it.tier === 'WEAK' || it.tier === 'SKIP');
+      const dflags = it.desc_flags || [];
+      const hasRedFlag = dflags.some(f => _RED_DESC_FLAGS.has(f));
+      if ((isWeak || hasRedFlag) && it.included) {
+        it.included = false;
+        trimmed++;
+      } else if (it.included) {
+        kept++;
+      }
+    }
+    $('trim-status').textContent = `Trimmed ${trimmed.toLocaleString()} items · ${kept.toLocaleString()} still included`;
+    _renderRfqTable();
+    _saveMgr.markDirty();
+  });
+}
 
 // ==========================================================================
 // Charts (table-first; charts live below the table per ryan's rule)

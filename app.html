@@ -132,10 +132,32 @@
       <label>Min spend:
         <input type="number" id="min-spend" value="0" min="0" step="100">
       </label>
+      <label>Tier:
+        <select id="tier-filter">
+          <option value="all" selected>All tiers</option>
+          <option value="STRONG">Strong only</option>
+          <option value="STRONG_MODERATE">Strong + moderate</option>
+          <option value="WEAK">Weak / skip only</option>
+        </select>
+      </label>
+      <label>Show:
+        <select id="include-filter">
+          <option value="all" selected>All items</option>
+          <option value="included">Included only</option>
+          <option value="excluded">Excluded only</option>
+        </select>
+      </label>
       <label>Search:
         <input type="text" id="rfq-search" placeholder="item / mfg / desc">
       </label>
       <span class="muted" id="rfq-count">—</span>
+    </div>
+
+    <div class="actions" style="margin-top:0;margin-bottom:14px;">
+      <button class="btn ghost" id="bulk-include-all" style="padding:6px 12px;font-size:12px;">Include all visible</button>
+      <button class="btn ghost" id="bulk-exclude-all" style="padding:6px 12px;font-size:12px;">Exclude all visible</button>
+      <button class="btn ghost" id="smart-trim" title="Untick items with weak/skip tier OR concerning description patterns (service / freight / tariff / obsolete / rental)" style="padding:6px 12px;font-size:12px;">⚡ Smart trim</button>
+      <span class="muted" id="trim-status"></span>
     </div>
 
     <div class="rfq-table-wrap">
