@@ -345,16 +345,125 @@ const RFQ_FIELDS = [
   { key: 'supplier',    label: 'Supplier',              hint: 'Supplier name — usually one value across the export' },
 ];
 
-async function _renderMappingTable() {
+// ----- Column-mapping templates (saved per source format) -----
+const MAPPING_TEMPLATES_KEY = 'autorfqbanana:mapping_templates';
+
+function _listMappingTemplates() {
+  try { return JSON.parse(localStorage.getItem(MAPPING_TEMPLATES_KEY) || '{}'); }
+  catch (e) { return {}; }
+}
+function _writeMappingTemplates(t) {
+  try { localStorage.setItem(MAPPING_TEMPLATES_KEY, JSON.stringify(t)); }
+  catch (e) { console.warn('mapping templates write failed', e); }
+}
+function _headerFingerprint(headers) {
+  // Stable fingerprint = first 16 chars of each header concatenated, lowercased
+  return (headers || []).map(h => (h || '').toString().trim().toLowerCase().slice(0, 16)).join('|');
+}
+function _templatesMatchingCurrentFile() {
+  if (!_exportHeaders) return [];
+  const fp = _headerFingerprint(_exportHeaders);
+  const templates = _listMappingTemplates();
+  return Object.entries(templates)
+    .filter(([_, t]) => t.fingerprint === fp)
+    .map(([name, t]) => ({ name, ...t }));
+}
+
+function _renderMappingTemplatesRow() {
+  const wrap = $('mapping-templates-row');
+  if (!wrap) return;
+  const matches = _templatesMatchingCurrentFile();
+  const all = _listMappingTemplates();
+  const others = Object.keys(all).filter(n => !matches.find(m => m.name === n));
+  if (!matches.length && !others.length) {
+    wrap.innerHTML = '<div style="color:var(--ink-2);font-family:var(--mono);font-size:11px;font-style:italic;">No saved templates yet. After confirming the mapping, click "💾 Save as template…" to remember this header shape for next time.</div>';
+    return;
+  }
+  let html = '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;font-family:var(--ui);">';
+  if (matches.length) {
+    html += '<span style="font-size:11px;color:var(--green);text-transform:uppercase;letter-spacing:0.1em;font-weight:600;">Auto-match:</span>';
+    for (const m of matches) {
+      html += `<button class="btn ghost" data-apply-template="${_escapeHtml(m.name)}" style="padding:5px 12px;font-size:12px;border-color:var(--green);">↩ ${_escapeHtml(m.name)}</button>`;
+    }
+  }
+  if (others.length) {
+    html += '<span style="font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.1em;font-weight:600;margin-left:14px;">Other saved:</span>';
+    for (const name of others) {
+      html += `<button class="btn ghost" data-apply-template="${_escapeHtml(name)}" style="padding:5px 12px;font-size:12px;">↩ ${_escapeHtml(name)}</button>`;
+    }
+  }
+  html += '<span style="margin-left:auto;"></span>';
+  for (const name of Object.keys(all)) {
+    html += `<button class="btn ghost" data-delete-template="${_escapeHtml(name)}" title="Delete template ${_escapeHtml(name)}" style="padding:5px 8px;font-size:11px;color:var(--ink-2);">×${_escapeHtml(name)}</button>`;
+  }
+  html += '</div>';
+  wrap.innerHTML = html;
+  wrap.querySelectorAll('[data-apply-template]').forEach(btn => {
+    btn.addEventListener('click', () => _applyMappingTemplate(btn.getAttribute('data-apply-template')));
+  });
+  wrap.querySelectorAll('[data-delete-template]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const n = btn.getAttribute('data-delete-template');
+      if (!confirm(`Delete saved template "${n}"?`)) return;
+      const t = _listMappingTemplates();
+      delete t[n];
+      _writeMappingTemplates(t);
+      _renderMappingTemplatesRow();
+    });
+  });
+}
+
+function _applyMappingTemplate(name) {
+  const t = _listMappingTemplates()[name];
+  if (!t || !t.mapping) return;
+  // Re-render the table with the saved mapping pre-selected
+  _renderMappingTable(t.mapping).then(() => {
+    // Visual confirmation
+    const row = $('mapping-templates-row');
+    if (row) {
+      const note = document.createElement('div');
+      note.style.cssText = 'margin-top:10px;color:var(--green);font-family:var(--mono);font-size:11px;';
+      note.textContent = `✓ Applied "${name}"`;
+      row.appendChild(note);
+      setTimeout(() => note.remove(), 3000);
+    }
+  });
+}
+
+async function _saveCurrentMappingAsTemplate() {
+  const current = _readMapping();
+  if (!Object.keys(current).length) {
+    alert('Map at least one column before saving as a template.');
+    return;
+  }
+  const name = prompt('Name this mapping template (e.g. "Coupa-McMaster-export"):');
+  if (!name) return;
+  const t = _listMappingTemplates();
+  t[name] = {
+    created_at: new Date().toISOString(),
+    fingerprint: _headerFingerprint(_exportHeaders),
+    headers_count: (_exportHeaders || []).length,
+    mapping: current,
+  };
+  _writeMappingTemplates(t);
+  _renderMappingTemplatesRow();
+}
+
+if ($('save-mapping-template')) {
+  $('save-mapping-template').addEventListener('click', _saveCurrentMappingAsTemplate);
+}
+
+async function _renderMappingTable(presetMapping) {
   if (!_exportHeaders) return;
-  // Ask Python for auto-detected mapping
+  // Ask Python for auto-detected mapping (overridden by presetMapping if provided)
   _py.globals.set('_headers_in', _exportHeaders);
   const autoMap = await _py.runPythonAsync(`
 import json
 from app_engine import auto_map_export
 json.dumps(auto_map_export(_headers_in.to_py()))
 `);
-  const auto = JSON.parse(autoMap);
+  const auto = presetMapping || JSON.parse(autoMap);
+  _renderMappingTemplatesRow();
 
   const wrap = $('mapping-table-wrap');
   let html = '<table class="map-table"><tbody>';
@@ -418,10 +527,92 @@ json.dumps(_rfq, default=str)
   _renderKpis();
   _renderRfqTable();
   _renderCharts();
+  _renderConflictsBanner();
   // Boot the save manager — this run is now a recoverable session
   _saveMgr.init();
   _saveMgr.autosaveLocal();
   _injectSaveBar();
+}
+
+async function _renderConflictsBanner() {
+  if (!_rfqResult) return;
+  let banner = document.getElementById('conflicts-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'conflicts-banner';
+    banner.style.cssText = 'margin-bottom:18px;';
+    const kpi = $('kpi-row');
+    if (kpi && kpi.parentNode) kpi.parentNode.insertBefore(banner, kpi);
+  }
+  banner.innerHTML = '<div style="padding:14px;color:var(--ink-2);font-family:var(--mono);font-size:11px;">scanning for item conflicts…</div>';
+  try {
+    const json = await _py.runPythonAsync(`
+import json
+from app_engine import detect_item_conflicts, _STATE
+json.dumps(detect_item_conflicts(_STATE.get("items", [])), default=str)
+`);
+    const c = JSON.parse(json);
+    const s = c.summary || {};
+    if (!s.n_conflicts_total) {
+      banner.innerHTML = '';
+      return;
+    }
+    banner.innerHTML = `
+      <div style="background:rgba(255,77,109,0.06);border:1px solid var(--red);border-radius:6px;padding:12px 16px;display:flex;align-items:center;gap:14px;font-family:var(--ui);font-size:13px;">
+        <span style="color:var(--red);font-weight:700;">⚠ ${s.n_conflicts_total} data-hygiene conflict${s.n_conflicts_total===1?'':'s'}</span>
+        <span style="color:var(--ink-1);">${s.n_items_affected} item${s.n_items_affected===1?'':'s'} affected · ${s.n_mfg_pn_multi_item} same-MFG-PN-multi-item · ${s.n_desc_multi_item} same-desc-multi-item · ${s.n_mfg_pn_multi_mfr} multi-manufacturer</span>
+        <button class="btn ghost" id="conflicts-view-btn" style="padding:5px 12px;font-size:11px;margin-left:auto;">View details</button>
+      </div>
+    `;
+    document.getElementById('conflicts-view-btn').addEventListener('click', () => _showConflictsModal(c));
+  } catch (e) {
+    console.warn('[conflicts]', e);
+    banner.innerHTML = '';
+  }
+}
+
+function _showConflictsModal(conflicts) {
+  let modal = document.getElementById('conflicts-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'conflicts-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:5500;background:rgba(8,12,22,0.78);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:24px;';
+    document.body.appendChild(modal);
+  }
+  modal.style.display = 'flex';
+  let body = '';
+  for (const [type, items] of Object.entries(conflicts.by_type || {})) {
+    if (!items.length) continue;
+    body += `<h3 style="font-family:var(--ui);font-size:13px;font-weight:600;color:var(--accent);margin:18px 0 8px;text-transform:none;letter-spacing:0;">${type.replace(/_/g,' ')} (${items.length})</h3>`;
+    body += '<div style="border:1px solid var(--line);border-radius:4px;overflow:auto;max-height:300px;"><table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);"><tbody>';
+    for (const c of items.slice(0, 100)) {
+      body += '<tr style="border-bottom:1px solid var(--line);">';
+      if (type === 'MFG_PN_MULTI_ITEM') {
+        body += `<td style="padding:8px 12px;color:var(--ink-1);">MFG PN <code>${_escapeHtml(c.mfg_pn)}</code> appears under ${c.n_items} item numbers: <strong>${c.item_nums.slice(0,5).map(_escapeHtml).join(', ')}${c.item_nums.length>5?' …':''}</strong></td>`;
+      } else if (type === 'DESC_MULTI_ITEM') {
+        body += `<td style="padding:8px 12px;color:var(--ink-1);">"${_escapeHtml(c.description)}" appears as ${c.n_items} item numbers: <strong>${c.item_nums.slice(0,5).map(_escapeHtml).join(', ')}${c.item_nums.length>5?' …':''}</strong></td>`;
+      } else if (type === 'MFG_PN_MULTI_MFR') {
+        body += `<td style="padding:8px 12px;color:var(--ink-1);">MFG PN <code>${_escapeHtml(c.mfg_pn)}</code> attributed to ${c.manufacturers.length} manufacturers: <strong>${c.manufacturers.slice(0,5).map(_escapeHtml).join(', ')}${c.manufacturers.length>5?' …':''}</strong></td>`;
+      }
+      body += '</tr>';
+    }
+    body += '</tbody></table></div>';
+  }
+  modal.innerHTML = `
+    <div style="background:var(--bg-1);border:1px solid var(--line);border-radius:8px;max-width:920px;width:100%;max-height:90vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 24px 80px rgba(0,0,0,0.6);font-family:var(--ui);">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:22px 26px 14px;border-bottom:1px solid var(--line);">
+        <div>
+          <div style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">DATA HYGIENE</div>
+          <div style="font-size:22px;font-weight:600;color:var(--ink-0);">Item conflicts</div>
+          <div style="font-size:13px;color:var(--ink-1);margin-top:6px;">These conflicts won't break the RFQ but they suggest cleanup opportunities — could be duplicate item-master entries, supplier-side typos, or genuine variants worth distinguishing.</div>
+        </div>
+        <button id="cf-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;">×</button>
+      </div>
+      <div style="overflow:auto;flex:1;padding:0 26px 22px;">${body}</div>
+    </div>
+  `;
+  document.getElementById('cf-close').addEventListener('click', () => { modal.style.display = 'none'; });
+  modal.addEventListener('click', (e) => { if (e.target === modal) modal.style.display = 'none'; });
 }
 
 function _renderKpis() {

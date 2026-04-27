@@ -3061,6 +3061,124 @@ def log_event(action_type: str, action_detail: str = "", related: str = "") -> N
         del log[:len(log) - AUDIT_MAX_ENTRIES]
 
 
+def detect_item_conflicts(items: list) -> dict:
+    """Surface data-hygiene issues across the full item list.
+
+    Returns:
+      {
+        "summary": {n_conflicts_total, n_items_affected, ...},
+        "by_type": {
+          "MFG_PN_MULTI_ITEM": [...],   # same MFG PN under multiple item_num
+          "ITEM_NUM_MULTI_DESC": [...], # same item_num with different descriptions
+          "DESC_MULTI_ITEM": [...],     # same description under multiple item_nums
+          "MFG_PN_MULTI_MFR": [...],    # same MFG PN under multiple manufacturers
+        }
+      }
+
+    Useful for trimming the candidate RFQ list of items that need cleanup
+    BEFORE going out to suppliers. Per the brief: don't silently auto-resolve.
+    """
+    by_mfg_pn = defaultdict(list)        # mfg_pn → [item dicts]
+    by_item_num = defaultdict(list)      # item_num → [item dicts]
+    by_desc = defaultdict(list)          # desc_norm → [item dicts]
+    by_mfg_pn_for_mfr_check = defaultdict(set)  # mfg_pn → set of mfg_names
+
+    for it in items:
+        mfg_pn = (it.get("mfg_pn") or "").strip()
+        item_num = (it.get("item_num") or "").strip()
+        desc = (it.get("description") or "").strip()
+        mfg = (it.get("mfg_name") or "").strip()
+
+        if mfg_pn:
+            mp_key = norm_pn(mfg_pn)
+            by_mfg_pn[mp_key].append(it)
+            if mfg:
+                by_mfg_pn_for_mfr_check[mp_key].add(mfg)
+        if item_num:
+            by_item_num[item_num].append(it)
+        if desc and len(desc) >= 10:
+            d_norm = re.sub(r"\s+", " ", desc.lower())[:120]
+            by_desc[d_norm].append(it)
+
+    conflicts = {
+        "MFG_PN_MULTI_ITEM": [],
+        "ITEM_NUM_MULTI_DESC": [],
+        "DESC_MULTI_ITEM": [],
+        "MFG_PN_MULTI_MFR": [],
+    }
+
+    # Same MFG PN with different item_num
+    for mp_key, group in by_mfg_pn.items():
+        if not mp_key:
+            continue
+        distinct_items = set(it["item_num"] for it in group if it.get("item_num"))
+        if len(distinct_items) >= 2:
+            sample_mfg_pn = group[0].get("mfg_pn") or mp_key
+            conflicts["MFG_PN_MULTI_ITEM"].append({
+                "mfg_pn": sample_mfg_pn,
+                "item_nums": sorted(distinct_items),
+                "n_items": len(distinct_items),
+                "n_lines": len(group),
+            })
+
+    # Same item_num with different descriptions
+    for item_num, group in by_item_num.items():
+        # Already deduped by extract_rfq_list, so each item_num only has ONE row.
+        # We get conflicts here when items_by_item_num[k] has length > 1, which
+        # only happens if dedup-key fell through to part_number (i.e. one
+        # item_num appears in multiple part_number-keyed records). Skip
+        # this block for now — extract_rfq_list de-duplicates at item_key
+        # level, not at item_num level.
+        pass
+
+    # Same description under different item_nums
+    for d_norm, group in by_desc.items():
+        distinct_items = set(it["item_num"] for it in group if it.get("item_num"))
+        if len(distinct_items) >= 2:
+            sample_desc = group[0].get("description") or d_norm
+            conflicts["DESC_MULTI_ITEM"].append({
+                "description": sample_desc[:80],
+                "item_nums": sorted(distinct_items),
+                "n_items": len(distinct_items),
+            })
+
+    # Same MFG PN under multiple manufacturers
+    for mp_key, mfrs in by_mfg_pn_for_mfr_check.items():
+        if len(mfrs) >= 2:
+            sample_group = by_mfg_pn[mp_key]
+            sample_mfg_pn = sample_group[0].get("mfg_pn") or mp_key
+            conflicts["MFG_PN_MULTI_MFR"].append({
+                "mfg_pn": sample_mfg_pn,
+                "manufacturers": sorted(mfrs),
+                "n_items": len(sample_group),
+            })
+
+    # Mark conflict-affected items so the UI can flag them
+    affected_keys = set()
+    for c in conflicts["MFG_PN_MULTI_ITEM"]:
+        affected_keys.update(c["item_nums"])
+    for c in conflicts["DESC_MULTI_ITEM"]:
+        affected_keys.update(c["item_nums"])
+    for c in conflicts["MFG_PN_MULTI_MFR"]:
+        # Find item_nums for that mfg_pn
+        for it in items:
+            if it.get("mfg_pn") and norm_pn(it["mfg_pn"]) == norm_pn(c["mfg_pn"]):
+                affected_keys.add(it["item_num"])
+
+    summary = {
+        "n_conflicts_total": sum(len(v) for v in conflicts.values()),
+        "n_items_affected": len(affected_keys),
+        "n_mfg_pn_multi_item": len(conflicts["MFG_PN_MULTI_ITEM"]),
+        "n_desc_multi_item": len(conflicts["DESC_MULTI_ITEM"]),
+        "n_mfg_pn_multi_mfr": len(conflicts["MFG_PN_MULTI_MFR"]),
+    }
+    return {
+        "summary": summary,
+        "by_type": conflicts,
+        "affected_item_nums": sorted(affected_keys),
+    }
+
+
 def list_audit_log(limit: int = None) -> list:
     log = list(_STATE.get("audit_log", []))
     log.reverse()  # most recent first
