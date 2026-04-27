@@ -139,13 +139,19 @@ McMaster headline numbers when extracted: 11,169 items / $2,660,088 total / 9,20
 
 ## Roadmap (what's NOT yet built)
 
+Active queue:
 - **Validation severity tiers** + row-level validation table on import (Error / Warning / Info)
 - **Saved column-mapping templates per supplier** (one-click re-apply)
 - **Item conflict detection** (same MFG PN with different item numbers, etc.)
 - **Internal-stakeholder verification loop** — using Coupa export contact columns (Requested By / Department / Last Updated By / Receiving Warehouse / Storeroom). Per-requestor PDF + xlsx packet for "is this the right part?" round-trip.
 - **Period-end report generator** — uses difficulty_history snapshots + audit_log + scenario series to produce a leadership-ready PDF/xlsx
-- **Audit log viewer UI** — engine logs events; viewer modal not yet wired
 - **Bid-feedback signal feeding into difficulty rating** — retroactively bump difficulty when many bids come back flagged
 - **Anonymized comparison view** (mask supplier names for one-off pulls)
+
+Larger items to do after everything else is finished:
+
+- **Award decision documentation (legal-hold record)** — for every awarded item, generate a defensible "why this supplier" explanation that includes: all bids received (with prices, status flags), the recommendation engine's output + reason, the scenario applied, any manual overrides + their stated rationale, the threshold values active at the time, and the historical baseline. Output format: a per-RFQ "Decision Log" xlsx + matching PDF, bundled with the award letters and retained for **several years for legal**. Should be uneditable after creation (immutable snapshot — don't re-derive from current state when reopened, embed the data verbatim). Tie into the existing audit log so the Decision Log includes the action trail.
+
+- **Full user guide / advanced strategy book** — multi-section docs site (or richly-formatted PDF) with: Quick Start (5-min path: drop file → smart trim → generate outbound) → Basics (each step explained) → Advanced (scoring weights, threshold tuning, scenario design, consolidation strategy) → Strategies and theory (RFQ award technique theory, when to consolidate vs split, push-back tactics, what outliers actually mean, how to read the difficulty rating). Full screenshots throughout via an automated browser tool (Playwright MCP / similar) so the guide stays in sync as the UI evolves.
 
 See `~/.claude/plans/i-want-to-make-compressed-glacier.md` for the original plan + the ChatGPT brief at `/tmp/rfq_brief/rfq_claude_code_brief/` for the broader feature catalog.
