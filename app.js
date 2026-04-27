@@ -1117,9 +1117,11 @@ function _renderBidSummary() {
 async function _refreshConsolidationAndMatrix() {
   const consolEl = $('consolidation-block');
   const compEl = $('comparison-section');
+  const scenEl = $('scenarios-section');
   if (!Object.keys(_loadedBids).length) {
     consolEl.innerHTML = '';
     compEl.innerHTML = '';
+    if (scenEl) scenEl.innerHTML = '';
     $('bid-summary-row').innerHTML = '';
     return;
   }
@@ -1128,10 +1130,11 @@ async function _refreshConsolidationAndMatrix() {
 
   const out = await _py.runPythonAsync(`
 import json
-from app_engine import compute_comparison_matrix, compute_consolidation_analysis
+from app_engine import compute_comparison_matrix, compute_consolidation_analysis, list_award_scenarios
 result = {
   "matrix": compute_comparison_matrix(),
   "consolidation": compute_consolidation_analysis(),
+  "scenarios": list_award_scenarios(),
 }
 json.dumps(result, default=str)
 `);
@@ -1139,6 +1142,174 @@ json.dumps(result, default=str)
   _renderBidCoverageKPIs(data.matrix);
   _renderConsolidation(data.consolidation);
   _renderComparisonMatrix(data.matrix);
+  _renderScenariosBlock(data.scenarios, data.consolidation);
+}
+
+// ----- Award scenarios block -----
+function _renderScenariosBlock(scenarios, consol) {
+  const el = $('scenarios-section');
+  if (!el) return;
+  const fmt$ = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtPct = (n) => n == null ? '—' : (n).toFixed(1) + '%';
+
+  let html = '<h2 style="margin-top:0;">Award scenarios</h2>';
+  html += '<p class="subtitle" style="margin-bottom:18px;">Save named what-ifs (lowest-price / consolidate to one supplier / incumbent-preferred / qualified-only). Compare two side-by-side to see where the awards differ.</p>';
+
+  // Quick-create row
+  html += `<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap;">
+    <button class="btn ghost" data-scenario-quick="lowest_price">＋ Lowest price</button>
+    <button class="btn ghost" data-scenario-quick="lowest_qualified">＋ Lowest qualified (no UOM/sub)</button>`;
+  // One consolidate-to button per supplier
+  for (const sup of (Object.keys(_loadedBids) || [])) {
+    html += `<button class="btn ghost" data-scenario-consolidate="${_escapeHtml(sup)}">＋ Consolidate to ${_escapeHtml(sup)}</button>`;
+  }
+  html += `<button class="btn ghost" data-scenario-quick="incumbent_preferred">＋ Incumbent preferred</button>`;
+  html += `</div>`;
+
+  if (!scenarios || !scenarios.length) {
+    html += `<div style="padding:32px;text-align:center;color:var(--ink-2);border:1px dashed var(--line);border-radius:6px;font-family:var(--ui);">No scenarios saved yet. Click one of the buttons above to save your first what-if.</div>`;
+    el.innerHTML = html;
+    _wireScenarioButtons();
+    return;
+  }
+
+  // Scenarios table
+  html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;margin-bottom:18px;"><table style="width:100%;border-collapse:collapse;font-size:13px;font-family:var(--mono);">';
+  html += `<thead style="background:var(--bg-2);"><tr>
+    <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;"><input type="checkbox" id="scen-select-all" style="vertical-align:middle;margin-right:6px;">Name</th>
+    <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Strategy</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Items awarded</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Award total</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Historical</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Savings</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Switched</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Saved at</th>
+    <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;"></th>
+  </tr></thead><tbody>`;
+  for (const s of scenarios) {
+    const t = s.totals || {};
+    let stratLabel = s.strategy;
+    if (s.strategy === 'consolidate_to' && s.parameters && s.parameters.supplier) {
+      stratLabel = `consolidate → ${s.parameters.supplier}`;
+    }
+    html += `<tr style="border-bottom:1px solid var(--line);">
+      <td style="padding:12px 14px;color:var(--ink-0);font-weight:600;"><input type="checkbox" class="scen-pick" data-scen-name="${_escapeHtml(s.name)}" style="vertical-align:middle;margin-right:8px;">${_escapeHtml(s.name)}</td>
+      <td style="padding:12px 14px;color:var(--ink-1);">${_escapeHtml(stratLabel)}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${(t.n_awarded||0).toLocaleString()} <span style="color:var(--ink-2);">/ ${(t.n_items||0).toLocaleString()}</span></td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${fmt$(t.award_total)}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${fmt$(t.historical_total)}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--green);font-weight:600;">${fmt$(t.savings_total)} <span style="color:var(--ink-2);">(${fmtPct(t.savings_pct)})</span></td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${(t.items_switched||0).toLocaleString()}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-2);font-size:11px;">${(s.saved_at||'').slice(0,16).replace('T',' ')}</td>
+      <td style="padding:12px 14px;text-align:right;"><button class="btn ghost" data-scen-delete="${_escapeHtml(s.name)}" style="padding:4px 10px;font-size:11px;">×</button></td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  html += `<div style="display:flex;gap:10px;margin-bottom:18px;">
+    <button class="btn primary" id="scen-compare-btn">⇄ Compare selected (pick exactly 2)</button>
+  </div>`;
+
+  html += '<div id="scenarios-compare-result"></div>';
+  el.innerHTML = html;
+  _wireScenarioButtons();
+}
+
+function _wireScenarioButtons() {
+  document.querySelectorAll('[data-scenario-quick]').forEach(btn => {
+    btn.addEventListener('click', () => _saveScenarioQuick(btn.getAttribute('data-scenario-quick')));
+  });
+  document.querySelectorAll('[data-scenario-consolidate]').forEach(btn => {
+    btn.addEventListener('click', () => _saveScenarioQuick('consolidate_to', btn.getAttribute('data-scenario-consolidate')));
+  });
+  document.querySelectorAll('[data-scen-delete]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const name = btn.getAttribute('data-scen-delete');
+      if (!confirm(`Delete scenario "${name}"?`)) return;
+      _py.globals.set('_scen_name', name);
+      await _py.runPythonAsync(`
+from app_engine import delete_award_scenario
+delete_award_scenario(_scen_name)
+`);
+      _saveMgr.markDirty();
+      await _refreshBidViews();
+    });
+  });
+  if ($('scen-compare-btn')) {
+    $('scen-compare-btn').addEventListener('click', _runScenarioCompare);
+  }
+}
+
+async function _saveScenarioQuick(strategy, consolidate_supplier) {
+  let suggestedName = strategy.replace('_', '-');
+  if (strategy === 'consolidate_to' && consolidate_supplier) {
+    suggestedName = `Consol-${consolidate_supplier}`;
+  } else if (strategy === 'lowest_price') suggestedName = 'Lowest price';
+  else if (strategy === 'lowest_qualified') suggestedName = 'Lowest qualified';
+  else if (strategy === 'incumbent_preferred') suggestedName = 'Incumbent preferred';
+  const name = prompt('Scenario name:', suggestedName);
+  if (!name) return;
+  const params = (strategy === 'consolidate_to' && consolidate_supplier) ? {supplier: consolidate_supplier} : {};
+  _py.globals.set('_scen_name', name);
+  _py.globals.set('_scen_strategy', strategy);
+  _py.globals.set('_scen_params', params);
+  await _py.runPythonAsync(`
+from app_engine import save_award_scenario
+save_award_scenario(_scen_name, _scen_strategy, _scen_params.to_py())
+`);
+  _saveMgr.markDirty();
+  await _refreshBidViews();
+}
+
+async function _runScenarioCompare() {
+  const picks = Array.from(document.querySelectorAll('.scen-pick:checked')).map(cb => cb.getAttribute('data-scen-name'));
+  if (picks.length !== 2) { alert('Pick exactly 2 scenarios to compare.'); return; }
+  const out = $('scenarios-compare-result');
+  out.innerHTML = '<div style="padding:14px;color:var(--ink-2);font-family:var(--mono);font-size:12px;">Comparing…</div>';
+  _py.globals.set('_scen_a', picks[0]);
+  _py.globals.set('_scen_b', picks[1]);
+  const json = await _py.runPythonAsync(`
+import json
+from app_engine import compare_award_scenarios
+json.dumps(compare_award_scenarios(_scen_a, _scen_b), default=str)
+`);
+  const cmp = JSON.parse(json);
+  const fmt$ = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const sd = cmp.summary_delta || {};
+  const colorDelta = (n) => n > 0 ? 'var(--red)' : n < 0 ? 'var(--green)' : 'var(--ink-1)';
+  let html = `<div style="background:var(--bg-1);border:1px solid var(--accent);border-radius:6px;padding:24px;margin-top:18px;">
+    <h3 style="margin:0 0 14px;font-family:var(--ui);font-size:14px;font-weight:600;color:var(--ink-0);text-transform:none;letter-spacing:0;">Side-by-side: ${_escapeHtml(picks[0])} → ${_escapeHtml(picks[1])}</h3>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:18px;">
+      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Award total</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:${colorDelta(sd.award_total)};margin-top:4px;">${sd.award_total >= 0 ? '+' : ''}${fmt$(sd.award_total)}</div></div>
+      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Savings</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:${colorDelta(-sd.savings_total)};margin-top:4px;">${sd.savings_total >= 0 ? '+' : ''}${fmt$(sd.savings_total)}</div></div>
+      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Items switched</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--ink-0);margin-top:4px;">${sd.items_switched >= 0 ? '+' : ''}${(sd.items_switched||0).toLocaleString()}</div></div>
+      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ No-award items</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--ink-0);margin-top:4px;">${sd.n_no_award >= 0 ? '+' : ''}${(sd.n_no_award||0).toLocaleString()}</div></div>
+    </div>
+    <div style="font-family:var(--mono);font-size:12px;color:var(--ink-2);margin-bottom:8px;">${(cmp.n_items_differ||0).toLocaleString()} items have a different award decision</div>`;
+  if (cmp.diffs && cmp.diffs.length) {
+    html += '<div style="border:1px solid var(--line);border-radius:4px;overflow:auto;max-height:400px;"><table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);"><thead style="background:var(--bg-2);position:sticky;top:0;"><tr>';
+    html += `<th style="padding:8px 10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item #</th>
+      <th style="padding:8px 10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Description</th>
+      <th style="padding:8px 10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty</th>
+      <th style="padding:8px 10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">${_escapeHtml(picks[0])}</th>
+      <th style="padding:8px 10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">${_escapeHtml(picks[1])}</th>
+      <th style="padding:8px 10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Δ value</th>
+    </tr></thead><tbody>`;
+    for (const d of cmp.diffs) {
+      const dvColor = d.value_delta > 0 ? 'var(--red)' : 'var(--green)';
+      html += `<tr style="border-bottom:1px solid var(--line);">
+        <td style="padding:8px 10px;color:var(--ink-0);">${_escapeHtml(d.item_num)}</td>
+        <td style="padding:8px 10px;color:var(--ink-1);max-width:240px;">${_escapeHtml(_truncate(d.description||'', 50))}</td>
+        <td style="padding:8px 10px;text-align:right;color:var(--ink-0);">${(d.qty_24mo||0).toLocaleString()}</td>
+        <td style="padding:8px 10px;color:var(--ink-1);">${_escapeHtml(d.supplier_a||'—')} ${d.price_a != null ? '$'+d.price_a.toFixed(2) : ''}</td>
+        <td style="padding:8px 10px;color:var(--ink-1);">${_escapeHtml(d.supplier_b||'—')} ${d.price_b != null ? '$'+d.price_b.toFixed(2) : ''}</td>
+        <td style="padding:8px 10px;text-align:right;color:${dvColor};font-weight:600;">${d.value_delta >= 0 ? '+' : ''}${fmt$(d.value_delta)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+  html += '</div>';
+  out.innerHTML = html;
 }
 
 function _renderBidCoverageKPIs(matrix) {

@@ -2984,6 +2984,333 @@ def list_loaded_supplier_names() -> list:
 
 
 # ---------------------------------------------------------------------------
+# Award scenarios — named, saveable, side-by-side comparison.
+#
+# A "scenario" is a strategy for awarding the RFQ:
+#   - lowest_price       : per item, pick the lowest non-flagged bid
+#   - lowest_qualified   : like lowest_price but excludes UOM_DISC + SUBSTITUTE
+#   - incumbent_preferred: stay with the historical supplier when their bid
+#                          is within `min_savings_pct_to_switch` of lowest
+#   - consolidate_to     : award everything to one named supplier (with carves
+#                          where another supplier's price beats them by
+#                          carve_out_min_savings_pct)
+#   - manual             : user-defined per-item award
+#
+# Scenarios are stored on _STATE so they persist with the session save state.
+# Each scenario carries its strategy + parameters + manual overrides + a
+# computed totals snapshot (so re-loading is fast even before re-evaluation).
+# ---------------------------------------------------------------------------
+
+SCENARIO_STRATEGIES = (
+    "lowest_price",
+    "lowest_qualified",
+    "incumbent_preferred",
+    "consolidate_to",
+    "manual",
+)
+
+
+def _get_scenarios() -> dict:
+    return _STATE.setdefault("scenarios", {})
+
+
+def list_award_scenarios() -> list:
+    """Return all scenarios as a list (most-recent-saved first)."""
+    sc = _get_scenarios()
+    out = []
+    for name, s in sc.items():
+        out.append({
+            "name": name,
+            "strategy": s.get("strategy"),
+            "parameters": s.get("parameters", {}),
+            "saved_at": s.get("saved_at"),
+            "totals": s.get("totals", {}),
+            "n_overrides": len(s.get("overrides") or {}),
+        })
+    out.sort(key=lambda x: x.get("saved_at") or "", reverse=True)
+    return out
+
+
+def delete_award_scenario(name: str) -> bool:
+    sc = _get_scenarios()
+    if name in sc:
+        del sc[name]
+        return True
+    return False
+
+
+def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, included_keys=None) -> dict:
+    """Run an award strategy against current items + bids, returning the per-item
+    award decisions + roll-up totals.
+
+    overrides: {rfq_key: {"supplier": supplier_name | None, "reason": str}}
+               Manual per-item awards (highest priority, beats strategy).
+    """
+    th = get_thresholds()
+    items = _STATE.get("items", [])
+    if included_keys is not None:
+        keep = set(included_keys)
+        items = [it for it in items if it["item_num"] in keep]
+
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+    suppliers = list(bids_by_supplier.keys())
+    bid_lookup = {}
+    for sup, parsed in bids_by_supplier.items():
+        for b in parsed.get("bids", []):
+            if b["status"] in (BID_STATUS_PRICED, BID_STATUS_UOM_DISC, BID_STATUS_SUBSTITUTE) \
+               and b["effective_price"] is not None and b["effective_price"] > 0:
+                bid_lookup[(sup, b["rfq_key"])] = b
+
+    overrides = overrides or {}
+    parameters = parameters or {}
+    consolidate_supplier = parameters.get("supplier") if strategy == "consolidate_to" else None
+    incumbent_threshold = parameters.get("incumbent_keep_threshold_pct", th["min_savings_pct_to_switch"])
+    carve_threshold = parameters.get("carve_threshold", th["carve_out_min_savings_pct"])
+    exclude_uom = parameters.get("exclude_uom_disc", strategy == "lowest_qualified")
+    exclude_subs = parameters.get("exclude_substitutes", strategy == "lowest_qualified")
+
+    awards = []
+    n_no_award = 0
+    n_manual = 0
+    n_carved = 0
+    award_total = 0.0
+    historical_total = 0.0
+    items_switched = 0
+    incumbent_retained = 0
+    by_supplier = {}
+
+    for it in items:
+        rfq_key = it["key"]
+        qty = it.get("qty_24mo") or 0
+        hist_price = it.get("last_unit_price") or 0
+        # Note: incumbent supplier from historical data; may be the same
+        # supplier name as one of the bidders, OR a different name (e.g.
+        # "MCMASTER-CARR") that doesn't match any bidder
+        incumbent = (it.get("supplier") if "supplier" in it else None) or _STATE.get("supplier_name", "")
+
+        # Manual override beats everything
+        if rfq_key in overrides:
+            ov = overrides[rfq_key]
+            sup = ov.get("supplier")
+            if sup:
+                bid = bid_lookup.get((sup, rfq_key))
+                price = bid["effective_price"] if bid else None
+                awards.append({
+                    "rfq_key": rfq_key,
+                    "item_num": it["item_num"],
+                    "description": it["description"],
+                    "qty_24mo": qty,
+                    "awarded_supplier": sup,
+                    "awarded_price": price,
+                    "awarded_value": (price or 0) * qty,
+                    "historical_price": hist_price,
+                    "historical_value": hist_price * qty,
+                    "savings_value": (hist_price - (price or 0)) * qty if hist_price and price else 0,
+                    "decision_basis": f"MANUAL: {ov.get('reason') or 'user override'}",
+                })
+                n_manual += 1
+                if price is not None and price > 0:
+                    award_total += price * qty
+                historical_total += hist_price * qty
+                by_supplier[sup] = by_supplier.get(sup, 0) + (price or 0) * qty
+                continue
+            else:
+                # Explicit "no award" override
+                awards.append({
+                    "rfq_key": rfq_key, "item_num": it["item_num"], "description": it["description"],
+                    "qty_24mo": qty, "awarded_supplier": None, "awarded_price": None,
+                    "awarded_value": 0, "historical_price": hist_price,
+                    "historical_value": hist_price * qty, "savings_value": 0,
+                    "decision_basis": f"MANUAL: {ov.get('reason') or 'no award'}",
+                })
+                n_no_award += 1
+                historical_total += hist_price * qty
+                continue
+
+        # Gather eligible bids for this item per the strategy filters
+        candidates = []
+        for sup in suppliers:
+            b = bid_lookup.get((sup, rfq_key))
+            if not b:
+                continue
+            if exclude_uom and b["status"] == BID_STATUS_UOM_DISC:
+                continue
+            if exclude_subs and b["status"] == BID_STATUS_SUBSTITUTE:
+                continue
+            candidates.append((sup, b["effective_price"], b["status"]))
+
+        if not candidates:
+            awards.append({
+                "rfq_key": rfq_key, "item_num": it["item_num"], "description": it["description"],
+                "qty_24mo": qty, "awarded_supplier": None, "awarded_price": None,
+                "awarded_value": 0, "historical_price": hist_price,
+                "historical_value": hist_price * qty, "savings_value": 0,
+                "decision_basis": "NO_BID — no eligible supplier",
+            })
+            n_no_award += 1
+            historical_total += hist_price * qty
+            continue
+
+        # Pick the awarded supplier per strategy
+        candidates.sort(key=lambda c: c[1])  # cheapest first
+        chosen_sup, chosen_price, chosen_status = candidates[0]
+        decision = "lowest"
+
+        if strategy == "incumbent_preferred":
+            # If the incumbent has a bid, prefer them unless competition saves
+            # at least incumbent_threshold pct
+            inc_bid = next((c for c in candidates if c[0].lower() == (incumbent or "").lower()), None)
+            if inc_bid:
+                inc_price = inc_bid[1]
+                if chosen_price <= 0 or (inc_price - chosen_price) / inc_price < incumbent_threshold:
+                    chosen_sup, chosen_price, chosen_status = inc_bid
+                    decision = f"INCUMBENT_KEPT (savings to switch < {incumbent_threshold*100:.0f}%)"
+
+        elif strategy == "consolidate_to" and consolidate_supplier:
+            # Default to consolidate winner unless another supplier saves >= carve_threshold
+            target_bid = next((c for c in candidates if c[0] == consolidate_supplier), None)
+            if target_bid:
+                target_price = target_bid[1]
+                if chosen_price < target_price * (1 - carve_threshold):
+                    decision = f"CARVE: {chosen_sup} saves {((target_price-chosen_price)/target_price*100):.0f}% vs {consolidate_supplier}"
+                    n_carved += 1
+                else:
+                    chosen_sup, chosen_price, chosen_status = target_bid
+                    decision = f"CONSOLIDATE_TO {consolidate_supplier}"
+            else:
+                # Consolidation winner didn't bid this item — fall through to lowest
+                decision = f"WINNER_NOBID — fell through to {chosen_sup} (lowest)"
+
+        # If chosen supplier matches incumbent, count retained
+        if incumbent and chosen_sup.lower() == (incumbent or "").lower():
+            incumbent_retained += 1
+        else:
+            items_switched += 1
+
+        award_value = chosen_price * qty
+        award_total += award_value
+        historical_total += hist_price * qty
+        by_supplier[chosen_sup] = by_supplier.get(chosen_sup, 0) + award_value
+
+        awards.append({
+            "rfq_key": rfq_key, "item_num": it["item_num"], "description": it["description"],
+            "qty_24mo": qty, "awarded_supplier": chosen_sup, "awarded_price": chosen_price,
+            "awarded_value": award_value, "historical_price": hist_price,
+            "historical_value": hist_price * qty, "savings_value": (hist_price - chosen_price) * qty if hist_price else 0,
+            "decision_basis": decision,
+        })
+
+    return {
+        "strategy": strategy,
+        "parameters": parameters,
+        "n_items": len(awards),
+        "n_awarded": len([a for a in awards if a["awarded_supplier"]]),
+        "n_no_award": n_no_award,
+        "n_manual_overrides": n_manual,
+        "n_carved": n_carved,
+        "items_switched": items_switched,
+        "incumbent_retained": incumbent_retained,
+        "award_total": award_total,
+        "historical_total": historical_total,
+        "savings_total": historical_total - award_total,
+        "savings_pct": (historical_total - award_total) / historical_total * 100.0 if historical_total else 0.0,
+        "award_by_supplier": by_supplier,
+        "awards": awards,
+    }
+
+
+def save_award_scenario(name: str, strategy: str, parameters: dict = None,
+                        overrides: dict = None, included_keys=None,
+                        notes: str = "") -> dict:
+    """Evaluate the strategy + parameters and save the result as a named scenario."""
+    if not name:
+        raise ValueError("name required")
+    if strategy not in SCENARIO_STRATEGIES:
+        raise ValueError(f"strategy must be one of {SCENARIO_STRATEGIES}")
+    parameters = parameters or {}
+    overrides = overrides or {}
+
+    evaluated = _evaluate_scenario(strategy, parameters, overrides, included_keys)
+
+    # Persist (drop the per-item awards array from the saved scenario — it's
+    # large; re-derived on demand. Keep totals + parameters + overrides.)
+    sc = _get_scenarios()
+    sc[name] = {
+        "name": name,
+        "strategy": strategy,
+        "parameters": parameters,
+        "overrides": overrides,
+        "included_keys": list(included_keys) if included_keys is not None else None,
+        "notes": notes,
+        "saved_at": datetime.now().isoformat(),
+        "totals": {k: evaluated[k] for k in
+                   ("n_items", "n_awarded", "n_no_award", "n_manual_overrides",
+                    "n_carved", "items_switched", "incumbent_retained",
+                    "award_total", "historical_total", "savings_total",
+                    "savings_pct", "award_by_supplier")},
+    }
+    return sc[name]
+
+
+def evaluate_award_scenario(name: str) -> dict:
+    """Re-run a saved scenario against current items + bids and return the
+    full per-item awards array + roll-up totals."""
+    sc = _get_scenarios()
+    s = sc.get(name)
+    if not s:
+        raise ValueError(f"No scenario named {name!r}")
+    return _evaluate_scenario(
+        s["strategy"], s.get("parameters", {}),
+        s.get("overrides", {}), s.get("included_keys"),
+    )
+
+
+def compare_award_scenarios(name_a: str, name_b: str) -> dict:
+    """Side-by-side comparison of two scenarios — totals delta + per-item
+    differences (items where the awarded supplier differs)."""
+    a = evaluate_award_scenario(name_a)
+    b = evaluate_award_scenario(name_b)
+    awards_a = {x["rfq_key"]: x for x in a["awards"]}
+    awards_b = {x["rfq_key"]: x for x in b["awards"]}
+    all_keys = set(awards_a) | set(awards_b)
+    diffs = []
+    for k in all_keys:
+        ax = awards_a.get(k) or {}
+        bx = awards_b.get(k) or {}
+        sup_a = ax.get("awarded_supplier")
+        sup_b = bx.get("awarded_supplier")
+        if sup_a != sup_b or ax.get("awarded_price") != bx.get("awarded_price"):
+            diffs.append({
+                "rfq_key": k,
+                "item_num": ax.get("item_num") or bx.get("item_num"),
+                "description": ax.get("description") or bx.get("description"),
+                "qty_24mo": ax.get("qty_24mo") or bx.get("qty_24mo") or 0,
+                "supplier_a": sup_a, "price_a": ax.get("awarded_price"), "value_a": ax.get("awarded_value"),
+                "supplier_b": sup_b, "price_b": bx.get("awarded_price"), "value_b": bx.get("awarded_value"),
+                "value_delta": (bx.get("awarded_value") or 0) - (ax.get("awarded_value") or 0),
+            })
+    diffs.sort(key=lambda d: abs(d["value_delta"]), reverse=True)
+    # Drop the per-item awards arrays from a/b before returning to keep payload manageable
+    summary_a = {k: v for k, v in a.items() if k != "awards"}
+    summary_b = {k: v for k, v in b.items() if k != "awards"}
+    return {
+        "scenario_a": {"name": name_a, **summary_a},
+        "scenario_b": {"name": name_b, **summary_b},
+        "summary_delta": {
+            "award_total":     b["award_total"]     - a["award_total"],
+            "historical_total":b["historical_total"]- a["historical_total"],
+            "savings_total":   b["savings_total"]   - a["savings_total"],
+            "items_switched":  b["items_switched"]  - a["items_switched"],
+            "incumbent_retained": b["incumbent_retained"] - a["incumbent_retained"],
+            "n_awarded":       b["n_awarded"]       - a["n_awarded"],
+            "n_no_award":      b["n_no_award"]      - a["n_no_award"],
+        },
+        "n_items_differ": len(diffs),
+        "diffs": diffs[:500],   # cap
+    }
+
+
+# ---------------------------------------------------------------------------
 # Register module so app.js can `from app_engine import ...`
 # ---------------------------------------------------------------------------
 sys.modules["app_engine"] = sys.modules[__name__]
