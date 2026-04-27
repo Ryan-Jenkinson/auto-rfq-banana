@@ -663,7 +663,10 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
     # Score each item + compute file-level difficulty rating
     _STATE["data_anchor_date"] = now.date().isoformat() if now else None
     score_items_in_place(out_items, anchor_date=now)
+    add_demand_concern_flags(out_items, anchor_date=now)
     difficulty = compute_difficulty_rating(out_items, kpis)
+    # Persist difficulty as a timestamped snapshot for period-end reporting
+    record_difficulty_snapshot(difficulty)
 
     # Persist for the xlsx generator + drill-down modal
     _STATE["items"] = out_items
@@ -790,6 +793,61 @@ def score_item(it: dict, anchor_date) -> dict:
         "default_include": tier in ("STRONG", "MODERATE"),
         "days_since_last_order": days_since_last,
     }
+
+
+def add_demand_concern_flags(items: list, anchor_date) -> None:
+    """Flag items whose demand pattern is suspicious for RFQ. Per the brief:
+    one-time spikes, dropped-off demand, surging demand, single-order
+    dominance, etc. These are surfaced as `demand_flags` on each item record.
+    """
+    for it in items:
+        flags = []
+        q12 = it.get("qty_12mo") or 0
+        q24 = it.get("qty_24mo") or 0
+        q36 = it.get("qty_36mo") or 0
+        q_all = it.get("qty_all") or 0
+        po_count = it.get("po_count") or 0
+        last_iso = it.get("last_order")
+
+        # 12-mo zero but older usage exists
+        if q12 == 0 and q_all > 0:
+            flags.append("DORMANT_12MO")
+
+        # Demand drop > 50% (compare 12mo annualized to prior-12-to-24mo annualized)
+        prior_12_24 = q24 - q12  # months 13-24
+        if prior_12_24 > 0:
+            change = (q12 - prior_12_24) / prior_12_24
+            if change <= -0.5:
+                flags.append("DEMAND_DROP_50")
+            elif change >= 0.5:
+                flags.append("DEMAND_SURGE_50")
+
+        # One order dominates >80% of usage
+        if po_count == 1 and q_all > 0:
+            flags.append("SINGLE_ORDER")
+        elif po_count > 0 and q_all > 0:
+            # Approximate: if total qty / po_count is wildly unbalanced
+            avg_per_po = q_all / po_count
+            # If the 24mo qty is concentrated (one PO at 80%+ of 24mo) — heuristic
+            # only available with PO line detail, deferred
+            pass
+
+        # Last order > 12 months ago — already in scoring as recency penalty,
+        # but we surface it explicitly here too
+        if last_iso and anchor_date:
+            try:
+                last_dt = datetime.fromisoformat(last_iso)
+                days_since = (anchor_date - last_dt).days
+                if days_since > 365:
+                    flags.append("STALE_OVER_12MO")
+            except (ValueError, TypeError):
+                pass
+
+        # Order count low overall
+        if 0 < po_count <= 2:
+            flags.append("FEW_ORDERS")
+
+        it["demand_flags"] = flags
 
 
 def score_items_in_place(items: list, anchor_date) -> None:
@@ -1720,6 +1778,42 @@ def compute_comparison_matrix(included_keys=None) -> dict:
             "recommendation_counts": rec_counts,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Difficulty snapshot history — appended each extract for period-end reporting.
+# Stored as a list on _STATE so the save-state JSON captures the full series.
+# ---------------------------------------------------------------------------
+
+def record_difficulty_snapshot(difficulty: dict) -> None:
+    if not isinstance(difficulty, dict) or not difficulty.get("score"):
+        return
+    history = _STATE.get("difficulty_history", [])
+    snap = {
+        "snapshot_at": difficulty.get("snapshot_at") or datetime.now().isoformat(),
+        "score": difficulty.get("score"),
+        "level": difficulty.get("level"),
+        "summary": difficulty.get("summary"),
+        "signals": dict(difficulty.get("signals") or {}),
+    }
+    # Don't duplicate — if last snapshot has the same signals, skip
+    if history:
+        last = history[-1]
+        if last.get("score") == snap["score"] and last.get("signals") == snap["signals"]:
+            return
+    history.append(snap)
+    # Cap at 50 snapshots so the save state doesn't grow unbounded
+    if len(history) > 50:
+        history = history[-50:]
+    _STATE["difficulty_history"] = history
+
+
+def list_difficulty_history() -> list:
+    return list(_STATE.get("difficulty_history", []))
+
+
+def clear_difficulty_history() -> None:
+    _STATE["difficulty_history"] = []
 
 
 # ---------------------------------------------------------------------------

@@ -537,6 +537,20 @@ function _renderRfqTable() {
       // 'generic' is informational only — not rendered as a chip (would
       // clutter on McMaster data where 90% of items are generic).
     }
+    // Demand-pattern flags (compact)
+    const demandLabels = {
+      DORMANT_12MO:    {short: 'DORM',   color: 'red',  hover: 'No orders in the last 12 months but older usage exists'},
+      DEMAND_DROP_50:  {short: 'DROP',   color: 'warn', hover: '12-mo demand dropped >50% vs prior year'},
+      DEMAND_SURGE_50: {short: 'SURGE',  color: 'warn', hover: '12-mo demand surged >50% vs prior year — verify the new baseline'},
+      SINGLE_ORDER:    {short: '1×',     color: 'red',  hover: 'Item has only ever been ordered once — likely one-off, not RFQ-worthy'},
+      FEW_ORDERS:      {short: '2×',     color: 'warn', hover: 'Item has only been ordered twice — may not warrant a long-term contract'},
+      STALE_OVER_12MO: {short: 'STALE',  color: 'warn', hover: 'Last order was more than 12 months ago'},
+    };
+    for (const dmf of (it.demand_flags || [])) {
+      const meta = demandLabels[dmf];
+      if (!meta) continue;
+      flags.push(`<span class="flag-chip ${meta.color}" title="${meta.hover}">${meta.short}</span>`);
+    }
     const tier = it.tier || 'WEAK';
     const score = it.score != null ? it.score : 0;
     const tierC = tierColor(tier);
@@ -831,6 +845,111 @@ base64.b64encode(_b).decode('ascii')
     btn.textContent = t;
   }
 });
+
+// ==========================================================================
+// Thresholds settings modal — exposes the engine knobs to the user.
+// ==========================================================================
+const THRESHOLD_FIELDS = [
+  { key: 'carve_out_min_savings_pct',     label: 'Carve-out min savings',          unit: '%', step: 0.05, min: 0, max: 1, scale: 100, hint: 'A different supplier wins a carve-out only if they save at least this fraction of the consolidation winner\'s price.' },
+  { key: 'pushback_threshold_pct',        label: 'Push-back threshold',            unit: '%', step: 0.01, min: 0, max: 1, scale: 100, hint: 'Quote >X% above your historical paid price gets a PUSH_BACK recommendation.' },
+  { key: 'min_savings_pct_to_switch',     label: 'Min savings to switch supplier', unit: '%', step: 0.01, min: 0, max: 1, scale: 100, hint: 'Below this savings %, MANUAL_REVIEW instead of ACCEPT — avoids switching for trivial savings.' },
+  { key: 'outlier_factor',                label: 'Outlier multiplier',             unit: '×', step: 0.5,  min: 1.5, max: 10, scale: 1, hint: 'A bid is an outlier if >= Nx the median bid OR <= 1/N of median.' },
+  { key: 'spike_factor',                  label: 'Price-spike multiplier',         unit: '×', step: 0.1,  min: 1.1, max: 10, scale: 1, hint: 'On the per-item chart, latest price is a "spike" if >= Nx the 90-day median.' },
+  { key: 'uom_suspect_ratio',             label: 'UOM-suspect price ratio',        unit: '×', step: 1,    min: 5, max: 100, scale: 1, hint: 'Carve-out savings flagged "verify UOM" if winner-vs-carve price ratio exceeds this. Catches per-each vs per-package errors.' },
+  { key: 'max_acceptable_lead_time_days', label: 'Max acceptable lead time',       unit: 'd', step: 1,    min: 1, max: 365, scale: 1, hint: 'Bids with lead time above this get flagged in award filtering.' },
+  { key: 'high_spend_no_bid_threshold',   label: 'High-spend no-bid threshold',    unit: '$', step: 100,  min: 0, max: 100000, scale: 1, hint: 'No-bid items with 24-mo spend above this get a follow-up flag (worth chasing).' },
+  { key: 'min_spend_for_review',          label: 'Min spend for review',           unit: '$', step: 50,   min: 0, max: 10000, scale: 1, hint: 'Items below this 24-mo spend may not warrant manual review effort.' },
+];
+
+async function _openThresholdsModal() {
+  if (!_pyAppLoaded) { alert('Python is still loading. Try again in a moment.'); return; }
+  const cur = JSON.parse(await _py.runPythonAsync(`
+import json
+from app_engine import get_thresholds
+json.dumps(get_thresholds())
+`));
+  let modal = document.getElementById('thresholds-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'thresholds-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:5500;background:rgba(8,12,22,0.78);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:24px;';
+    document.body.appendChild(modal);
+  }
+  modal.style.display = 'flex';
+  const rows = THRESHOLD_FIELDS.map(f => {
+    const v = cur[f.key];
+    const display = v != null ? (v * f.scale).toString() : '';
+    return `<tr style="border-bottom:1px solid var(--line);">
+      <td style="padding:14px 16px 6px;">
+        <div style="font-family:var(--ui);font-size:13px;font-weight:600;color:var(--ink-0);">${_escapeHtml(f.label)}</div>
+        <div style="font-family:var(--ui);font-size:11px;color:var(--ink-2);margin-top:2px;line-height:1.4;max-width:480px;">${_escapeHtml(f.hint)}</div>
+      </td>
+      <td style="padding:14px 16px 6px;text-align:right;white-space:nowrap;">
+        <input type="number" data-th-key="${_escapeHtml(f.key)}" data-th-scale="${f.scale}" value="${_escapeHtml(display)}" step="${f.step}" min="${f.min*f.scale}" max="${f.max*f.scale}" style="width:100px;background:var(--bg-2);color:var(--ink-0);border:1px solid var(--line);border-radius:4px;padding:6px 8px;font-family:var(--mono);font-size:13px;text-align:right;">
+        <span style="color:var(--ink-2);font-family:var(--mono);font-size:12px;margin-left:6px;">${f.unit}</span>
+      </td>
+    </tr>`;
+  }).join('');
+  modal.innerHTML = `
+    <div style="background:var(--bg-1);border:1px solid var(--line);border-radius:8px;max-width:760px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 24px 80px rgba(0,0,0,0.6);font-family:var(--ui);">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:22px 26px 14px;border-bottom:1px solid var(--line);">
+        <div>
+          <div style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">PROJECT SETTINGS</div>
+          <div style="font-size:22px;font-weight:600;color:var(--ink-0);">Recommendation thresholds</div>
+          <div style="font-size:13px;color:var(--ink-1);margin-top:6px;">Tune the engine. Changes apply to the recommendation engine, the consolidation analysis, and the per-item spike detection. Persisted with the session.</div>
+        </div>
+        <button id="th-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;">×</button>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-family:var(--ui);">${rows}</table>
+      <div style="display:flex;justify-content:flex-end;gap:10px;padding:18px 26px;border-top:1px solid var(--line);">
+        <button class="btn ghost" id="th-reset" type="button">Reset to defaults</button>
+        <button class="btn ghost" id="th-cancel" type="button">Cancel</button>
+        <button class="btn primary" id="th-save" type="button">Save & re-run</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('th-close').addEventListener('click', () => { modal.style.display = 'none'; });
+  document.getElementById('th-cancel').addEventListener('click', () => { modal.style.display = 'none'; });
+  document.getElementById('th-reset').addEventListener('click', async () => {
+    if (!confirm('Reset all thresholds to defaults?')) return;
+    await _py.runPythonAsync(`
+from app_engine import reset_thresholds
+reset_thresholds()
+None
+`);
+    modal.style.display = 'none';
+    _saveMgr.markDirty();
+    await _refreshBidViews();
+  });
+  document.getElementById('th-save').addEventListener('click', async () => {
+    const updates = {};
+    modal.querySelectorAll('input[data-th-key]').forEach(input => {
+      const key = input.getAttribute('data-th-key');
+      const scale = parseFloat(input.getAttribute('data-th-scale')) || 1;
+      const raw = parseFloat(input.value);
+      if (!isNaN(raw)) updates[key] = raw / scale;
+    });
+    _py.globals.set('_th_updates', updates);
+    await _py.runPythonAsync(`
+from app_engine import set_thresholds
+set_thresholds(_th_updates.to_py())
+None
+`);
+    modal.style.display = 'none';
+    _saveMgr.markDirty();
+    // Re-render any views that depend on thresholds
+    if (_rfqResult) {
+      _renderRfqTable();
+    }
+    if (Object.keys(_loadedBids).length) {
+      await _refreshBidViews();
+    }
+  });
+}
+
+if ($('open-settings')) {
+  $('open-settings').addEventListener('click', _openThresholdsModal);
+}
 
 // ==========================================================================
 // Step 4 — Returned-bid intake + comparison matrix + consolidation
