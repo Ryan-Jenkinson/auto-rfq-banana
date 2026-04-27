@@ -101,16 +101,16 @@ button.btn.ghost:hover:not(:disabled) { background: var(--bg-2); border-color: v
 button.btn.big { padding: 12px 22px; font-size: 14px; }
 
 /* ---------- KPI tiles ---------- */
-.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 32px; }
-.kpi { background: var(--bg-1); border: 1px solid var(--line); border-radius: 6px; padding: 20px 20px 18px; position: relative; display: flex; flex-direction: column; min-height: 130px; }
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-bottom: 32px; }
+.kpi { background: var(--bg-1); border: 1px solid var(--line); border-radius: 6px; padding: 20px 22px 18px; position: relative; display: flex; flex-direction: column; min-height: 130px; }
 .kpi-label { font-family: var(--ui); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--ink-2); font-weight: 600; margin-bottom: 12px; }
-/* KPI value is the hero. JS now formats big dollar values as compact
-   ($2.66M / $939K) so they fit at 36px without wrapping. nowrap
-   guarantees no mid-number text-wrap regardless of tile width. */
+/* KPI value is the hero. Exact pennies (no rounding/abbreviation) per ryan,
+   so values can be ~13 chars ($X,XXX,XXX.XX). 28px keeps them on one line
+   inside a 260px tile. nowrap is a hard belt-and-suspenders. */
 .kpi-value {
   font-family: var(--mono);
   font-weight: 600;
-  font-size: 36px;
+  font-size: 28px;
   line-height: 1.1;
   color: var(--accent);
   letter-spacing: -0.02em;

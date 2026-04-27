@@ -423,16 +423,9 @@ function _renderKpis() {
   if (!_rfqResult) return;
   const k = _rfqResult.kpis;
   const d = _rfqResult.difficulty;
-  // Compact dollar format — keeps headline numbers under ~7 chars so they
-  // never wrap at 36px regardless of tile width. Full precision in the sub.
-  const fmt$Compact = (n) => {
-    if (n == null) return '—';
-    const a = Math.abs(n);
-    if (a >= 1e6) return '$' + (n / 1e6).toFixed(2) + 'M';
-    if (a >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
-    return '$' + Math.round(n).toLocaleString();
-  };
-  const fmt$Full = (n) => n == null ? '—' : '$' + Math.round(n).toLocaleString();
+  // Exact-penny dollar formatter — RFQ reporting requires no rounding.
+  // No more compact $X.XM / $XK. Per ryan: "no rounding or medians in rfqs".
+  const fmt$ = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   let difficultyTile = '';
   if (d) {
@@ -448,11 +441,11 @@ function _renderKpis() {
 
   $('kpi-row').innerHTML = `
     <div class="kpi"><div class="kpi-label">Items</div><div class="kpi-value">${k.item_count.toLocaleString()}</div><div class="kpi-sub">unique part numbers</div></div>
-    <div class="kpi"><div class="kpi-label">Total spend (all)</div><div class="kpi-value">${fmt$Compact(k.total_spend)}</div><div class="kpi-sub">${fmt$Full(k.total_spend)} · ${k.po_count.toLocaleString()} POs · ${k.line_count.toLocaleString()} lines</div></div>
-    <div class="kpi"><div class="kpi-label">Date range</div><div class="kpi-value">${k.years_span.toFixed(1)} yr</div><div class="kpi-sub">${k.first_order} → ${k.last_order}</div></div>
-    <div class="kpi"><div class="kpi-label">12-mo spend</div><div class="kpi-value">${fmt$Compact(k.spend_12mo)}</div><div class="kpi-sub">${fmt$Full(k.spend_12mo)} · ${k.items_12mo.toLocaleString()} items active</div></div>
-    <div class="kpi"><div class="kpi-label">24-mo spend</div><div class="kpi-value">${fmt$Compact(k.spend_24mo)}</div><div class="kpi-sub">${fmt$Full(k.spend_24mo)} · ${k.items_24mo.toLocaleString()} items active</div></div>
-    <div class="kpi"><div class="kpi-label">36-mo spend</div><div class="kpi-value">${fmt$Compact(k.spend_36mo)}</div><div class="kpi-sub">${fmt$Full(k.spend_36mo)} · ${k.items_36mo.toLocaleString()} items active</div></div>
+    <div class="kpi"><div class="kpi-label">Total spend (all)</div><div class="kpi-value">${fmt$(k.total_spend)}</div><div class="kpi-sub">${k.po_count.toLocaleString()} POs · ${k.line_count.toLocaleString()} lines</div></div>
+    <div class="kpi"><div class="kpi-label">Date range</div><div class="kpi-value">${k.years_span.toFixed(2)} yr</div><div class="kpi-sub">${k.first_order} → ${k.last_order}</div></div>
+    <div class="kpi"><div class="kpi-label">12-mo spend</div><div class="kpi-value">${fmt$(k.spend_12mo)}</div><div class="kpi-sub">${k.items_12mo.toLocaleString()} items active</div></div>
+    <div class="kpi"><div class="kpi-label">24-mo spend</div><div class="kpi-value">${fmt$(k.spend_24mo)}</div><div class="kpi-sub">${k.items_24mo.toLocaleString()} items active</div></div>
+    <div class="kpi"><div class="kpi-label">36-mo spend</div><div class="kpi-value">${fmt$(k.spend_36mo)}</div><div class="kpi-sub">${k.items_36mo.toLocaleString()} items active</div></div>
     ${difficultyTile}
   `;
 }
@@ -490,8 +483,9 @@ function _renderRfqTable() {
 
   $('rfq-count').textContent = `${filtered.length.toLocaleString()} of ${items.length.toLocaleString()} items shown`;
 
-  const fmt = (n) => n == null ? '—' : '$' + Math.round(n).toLocaleString();
-  const fmtQty = (n) => n == null ? '—' : Math.round(n).toLocaleString();
+  // Exact pennies on every $ value, no rounding — per ryan: RFQs need precision
+  const fmt = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtQty = (n) => n == null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 
   let head = `<tr>
     <th class="cell-include">RFQ</th>

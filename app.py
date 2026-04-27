@@ -428,6 +428,22 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         uoms = rec["uom_counts"].most_common()
         uom = uoms[0][0] if uoms else ""
         uom_mixed = len(uoms) > 1
+
+        # Last unit price = EXACT unit price of the most recent priced order line.
+        # No median, no smoothing — RFQ reporting must be to-the-penny.
+        # Tiebreak when multiple lines share the latest date: highest PO #
+        # (later transaction), then iteration order.
+        priced_lines = [l for l in rec["po_lines"] if l[2] is not None]
+        if priced_lines:
+            latest = max(priced_lines, key=lambda l: (l[0] or "", l[4] or ""))
+            current_price = latest[2]
+        else:
+            current_price = rec["last_unit_price"]
+
+        # Window spends restated at the current (representative) price so the
+        # per-row table math is internally consistent: qty × price = total.
+        # Per ryan: "5 bananas × $5 each = $25". KPI totals at the top stay
+        # as historical actuals — those are computed from rec["spend_*"].
         out_items.append({
             "key": rec["key"],
             "item_num": rec["item_num"],
@@ -440,26 +456,36 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
             "uom": uom,
             "uom_mixed": uom_mixed,
             "po_count": len(rec["po_set"]),
-            "qty_12mo": rec["qty_12mo"], "spend_12mo": rec["spend_12mo"],
-            "qty_24mo": rec["qty_24mo"], "spend_24mo": rec["spend_24mo"],
-            "qty_36mo": rec["qty_36mo"], "spend_36mo": rec["spend_36mo"],
-            "qty_all": rec["qty_all"],   "spend_all": rec["spend_all"],
-            "last_unit_price": rec["last_unit_price"],
+            "qty_12mo": rec["qty_12mo"],
+            "qty_24mo": rec["qty_24mo"],
+            "qty_36mo": rec["qty_36mo"],
+            "qty_all": rec["qty_all"],
+            # Spend columns = qty × current price (internally consistent, RFQ-relevant)
+            "spend_12mo": (rec["qty_12mo"] or 0) * (current_price or 0),
+            "spend_24mo": (rec["qty_24mo"] or 0) * (current_price or 0),
+            "spend_36mo": (rec["qty_36mo"] or 0) * (current_price or 0),
+            "spend_all":  (rec["qty_all"]  or 0) * (current_price or 0),
+            # Historical actuals retained for KPI totals + reference
+            "spend_12mo_actual": rec["spend_12mo"],
+            "spend_24mo_actual": rec["spend_24mo"],
+            "spend_36mo_actual": rec["spend_36mo"],
+            "spend_all_actual":  rec["spend_all"],
+            "last_unit_price": current_price,
             "first_order": rec["first_order"].date().isoformat() if rec["first_order"] else None,
             "last_order": rec["last_order_dt"].date().isoformat() if rec["last_order_dt"] else None,
-            # Default include policy: include if any spend in the 24-month window
-            # (skip totally dormant items by default — user can re-include manually)
-            "included": rec["spend_24mo"] > 0,
+            # Default include: any qty in the 24-month window
+            "included": rec["qty_24mo"] > 0,
         })
 
-    # KPIs
-    items_24mo = sum(1 for it in out_items if it["spend_24mo"] > 0)
-    items_12mo = sum(1 for it in out_items if it["spend_12mo"] > 0)
-    items_36mo = sum(1 for it in out_items if it["spend_36mo"] > 0)
-    total_spend = sum(it["spend_all"] for it in out_items)
-    spend_12mo = sum(it["spend_12mo"] for it in out_items)
-    spend_24mo = sum(it["spend_24mo"] for it in out_items)
-    spend_36mo = sum(it["spend_36mo"] for it in out_items)
+    # KPIs — use HISTORICAL actuals (spend_X_actual). Per-row table shows
+    # qty × current_price, but file-level totals reconcile to source.
+    items_24mo = sum(1 for it in out_items if it["qty_24mo"] > 0)
+    items_12mo = sum(1 for it in out_items if it["qty_12mo"] > 0)
+    items_36mo = sum(1 for it in out_items if it["qty_36mo"] > 0)
+    total_spend = sum(it["spend_all_actual"] for it in out_items)
+    spend_12mo = sum(it["spend_12mo_actual"] for it in out_items)
+    spend_24mo = sum(it["spend_24mo_actual"] for it in out_items)
+    spend_36mo = sum(it["spend_36mo_actual"] for it in out_items)
     all_pos = set()
     for rec in items.values():
         all_pos |= rec["po_set"]
@@ -536,7 +562,9 @@ def score_item(it: dict, anchor_date) -> dict:
     Anchor_date should be the dataset's max order date (so 'recency' is
     measured against the data, not wall-clock — same anchor as the windows).
     """
-    spend_24 = it.get("spend_24mo") or 0.0
+    # Use historical actual (not the qty × current_price projection) — scoring
+    # is about "did this item have meaningful real spend"
+    spend_24 = it.get("spend_24mo_actual") or it.get("spend_24mo") or 0.0
     spend_score = min(1.0, spend_24 / SCORE_SPEND_FULL_24MO)
 
     # Recency: parse last_order ISO; days since vs anchor
