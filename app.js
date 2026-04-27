@@ -951,6 +951,65 @@ if ($('open-settings')) {
   $('open-settings').addEventListener('click', _openThresholdsModal);
 }
 
+async function _openAuditModal() {
+  if (!_pyAppLoaded) { alert('Python is still loading. Try again in a moment.'); return; }
+  const json = await _py.runPythonAsync(`
+import json
+from app_engine import list_audit_log
+json.dumps(list_audit_log(200), default=str)
+`);
+  const entries = JSON.parse(json);
+  let modal = document.getElementById('audit-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'audit-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:5500;background:rgba(8,12,22,0.78);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:24px;';
+    document.body.appendChild(modal);
+  }
+  modal.style.display = 'flex';
+  let body = '';
+  if (!entries.length) {
+    body = '<div style="padding:40px;text-align:center;color:var(--ink-2);font-family:var(--mono);font-size:13px;">No audit events yet. Drop a file or save a scenario to start the log.</div>';
+  } else {
+    body = '<table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;">';
+    body += '<thead style="background:var(--bg-2);position:sticky;top:0;"><tr>';
+    body += '<th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">When</th>';
+    body += '<th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Action</th>';
+    body += '<th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Detail</th>';
+    body += '<th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Related</th>';
+    body += '</tr></thead><tbody>';
+    for (const e of entries) {
+      const ts = (e.timestamp || '').slice(0, 19).replace('T', ' ');
+      body += `<tr style="border-bottom:1px solid var(--line);">
+        <td style="padding:8px 14px;color:var(--ink-2);">${_escapeHtml(ts)}</td>
+        <td style="padding:8px 14px;color:var(--accent);">${_escapeHtml(e.action_type || '')}</td>
+        <td style="padding:8px 14px;color:var(--ink-1);">${_escapeHtml(e.action_detail || '')}</td>
+        <td style="padding:8px 14px;color:var(--cyan);">${_escapeHtml(e.related || '')}</td>
+      </tr>`;
+    }
+    body += '</tbody></table>';
+  }
+  modal.innerHTML = `
+    <div style="background:var(--bg-1);border:1px solid var(--line);border-radius:8px;max-width:1000px;width:100%;max-height:90vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 24px 80px rgba(0,0,0,0.6);font-family:var(--ui);">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:22px 26px 14px;border-bottom:1px solid var(--line);">
+        <div>
+          <div style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">SESSION ACTIVITY</div>
+          <div style="font-size:22px;font-weight:600;color:var(--ink-0);">Audit log</div>
+          <div style="font-size:13px;color:var(--ink-1);margin-top:6px;">${entries.length} most-recent action${entries.length === 1 ? '' : 's'}. Persisted with the session save state.</div>
+        </div>
+        <button id="audit-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;">×</button>
+      </div>
+      <div style="overflow:auto;flex:1;">${body}</div>
+    </div>
+  `;
+  document.getElementById('audit-close').addEventListener('click', () => { modal.style.display = 'none'; });
+  modal.addEventListener('click', (e) => { if (e.target === modal) modal.style.display = 'none'; });
+}
+
+if ($('open-audit')) {
+  $('open-audit').addEventListener('click', _openAuditModal);
+}
+
 // ==========================================================================
 // Step 4 — Returned-bid intake + comparison matrix + consolidation
 // ==========================================================================
