@@ -75,6 +75,7 @@
       <div class="brand">Auto RFQ Banana <span class="brand-sub">/ build · send · compare</span></div>
     </div>
     <div style="margin-left:auto;display:flex;align-items:center;gap:14px;">
+      <button id="open-profile" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⌂ PROFILE</button>
       <button id="open-audit" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⊞ AUDIT</button>
       <button id="open-settings" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⚙ THRESHOLDS</button>
       <div class="steps">
@@ -103,6 +104,20 @@
 
     <div class="actions">
       <button class="btn primary" id="to-mapping" disabled>Continue to column mapping →</button>
+    </div>
+
+    <div id="reopen-block" style="margin-top:36px;padding:18px 22px;background:var(--bg-1);border:1px solid var(--line);border-radius:6px;">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:280px;">
+          <div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.16em;font-weight:600;margin-bottom:4px;">Reopen a previous session</div>
+          <div style="font-size:14px;color:var(--ink-0);margin-bottom:6px;">Restore mapping, scenarios, supplier bids, thresholds, and audit trail from a saved JSON.</div>
+          <div style="font-size:12px;color:var(--ink-2);font-style:italic;">You'll still need to drop the source xlsx (we don't bundle source data into the save). Saved decisions and bids re-apply automatically once the source is loaded.</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn ghost" id="reopen-from-file" type="button">📂 Pick saved JSON…</button>
+          <input type="file" id="reopen-file-input" accept=".json" style="display:none">
+        </div>
+      </div>
     </div>
   </section>
 

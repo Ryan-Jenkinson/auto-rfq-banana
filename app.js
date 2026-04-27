@@ -1201,6 +1201,95 @@ if ($('open-audit')) {
   $('open-audit').addEventListener('click', _openAuditModal);
 }
 
+// ---------- User profile modal ----------
+async function _openProfileModal() {
+  if (!_pyAppLoaded) { alert('Python is still loading. Try again in a moment.'); return; }
+  const profile = JSON.parse(await _py.runPythonAsync(`
+import json
+from app_engine import get_user_profile
+json.dumps(get_user_profile())
+`));
+  let modal = document.getElementById('profile-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'profile-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:5500;background:rgba(8,12,22,0.78);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:24px;';
+    document.body.appendChild(modal);
+  }
+  modal.style.display = 'flex';
+  const fld = (label, key, hint) => `
+    <div style="margin-bottom:14px;">
+      <label style="display:block;font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;font-weight:600;margin-bottom:6px;">${label}</label>
+      <input type="text" data-profile-key="${key}" value="${_escapeHtml(profile[key] || '')}" style="width:100%;background:var(--bg-2);color:var(--ink-0);border:1px solid var(--line);border-radius:4px;padding:10px 12px;font-family:var(--ui);font-size:14px;">
+      ${hint ? `<div style="font-size:11px;color:var(--ink-2);margin-top:4px;font-style:italic;">${_escapeHtml(hint)}</div>` : ''}
+    </div>
+  `;
+  modal.innerHTML = `
+    <div style="background:var(--bg-1);border:1px solid var(--line);border-radius:8px;max-width:560px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 24px 80px rgba(0,0,0,0.6);font-family:var(--ui);">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:22px 26px 14px;border-bottom:1px solid var(--line);">
+        <div>
+          <div style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">YOUR PROFILE</div>
+          <div style="font-size:22px;font-weight:600;color:var(--ink-0);">Operator information</div>
+          <div style="font-size:13px;color:var(--ink-1);margin-top:6px;">Used as the contact on outbound RFQ files, supplier follow-up packets, and award letters. Persisted with the session.</div>
+        </div>
+        <button id="prof-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;">×</button>
+      </div>
+      <div style="padding:22px 26px;">
+        ${fld('Your name', 'name', 'How you appear to suppliers — e.g. "Jane Doe"')}
+        ${fld('Your email', 'email', 'Where suppliers should send responses')}
+        ${fld('Your title', 'title', 'Optional — e.g. "Procurement Analyst"')}
+        ${fld('Company', 'company', 'Default: Andersen')}
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:10px;padding:14px 26px;border-top:1px solid var(--line);">
+        <button class="btn ghost" id="prof-cancel" type="button">Cancel</button>
+        <button class="btn primary" id="prof-save" type="button">Save profile</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('prof-close').addEventListener('click', () => { modal.style.display = 'none'; });
+  document.getElementById('prof-cancel').addEventListener('click', () => { modal.style.display = 'none'; });
+  document.getElementById('prof-save').addEventListener('click', async () => {
+    const updates = {};
+    modal.querySelectorAll('input[data-profile-key]').forEach(input => {
+      updates[input.getAttribute('data-profile-key')] = input.value.trim();
+    });
+    _py.globals.set('_profile_updates', updates);
+    await _py.runPythonAsync(`
+from app_engine import set_user_profile
+set_user_profile(_profile_updates.to_py())
+`);
+    modal.style.display = 'none';
+    _saveMgr.markDirty();
+  });
+}
+if ($('open-profile')) {
+  $('open-profile').addEventListener('click', _openProfileModal);
+}
+
+// ---------- Reopen previous session (Step 1 affordance) ----------
+if ($('reopen-from-file')) {
+  $('reopen-from-file').addEventListener('click', () => {
+    $('reopen-file-input').click();
+  });
+}
+if ($('reopen-file-input')) {
+  $('reopen-file-input').addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const state = await _saveMgr.loadFromFile(f);
+      const banner = document.createElement('div');
+      banner.style.cssText = 'margin-top:14px;padding:12px 16px;background:rgba(125,216,122,0.08);border:1px solid var(--green);border-radius:4px;color:var(--green);font-family:var(--mono);font-size:12px;';
+      banner.innerHTML = `✓ Restored session <strong>${_escapeHtml(state.rfq_id || 'unknown')}</strong>. ${state.source ? `Now drop the source file <code>${_escapeHtml(state.source.name)}</code> (or any compatible export) to re-extract the items.` : 'Drop a source xlsx to continue.'}`;
+      $('reopen-block').appendChild(banner);
+      setTimeout(() => banner.remove(), 12000);
+    } catch (err) {
+      console.error('[reopen]', err);
+      alert('Restore failed: ' + (err.message || err));
+    }
+  });
+}
+
 // ==========================================================================
 // Step 4 — Returned-bid intake + comparison matrix + consolidation
 // ==========================================================================
@@ -1454,6 +1543,7 @@ function _renderScenariosBlock(scenarios, consol) {
       <td style="padding:12px 14px;text-align:right;white-space:nowrap;">
         <button class="btn ghost" data-scen-letters="${_escapeHtml(s.name)}" title="Generate one award letter xlsx per awarded supplier" style="padding:4px 10px;font-size:11px;">📨 Letters</button>
         <button class="btn ghost" data-scen-summary="${_escapeHtml(s.name)}" title="Generate the internal-audience full-detail summary xlsx" style="padding:4px 10px;font-size:11px;">📊 Internal</button>
+        <button class="btn ghost" data-scen-decision="${_escapeHtml(s.name)}" title="Generate the legal-hold decision log (xlsx + markdown for Copilot)" style="padding:4px 10px;font-size:11px;">📜 Decision Log</button>
         <button class="btn ghost" data-scen-delete="${_escapeHtml(s.name)}" style="padding:4px 10px;font-size:11px;">×</button>
       </td>
     </tr>`;
@@ -1498,6 +1588,60 @@ delete_award_scenario(_scen_name)
   document.querySelectorAll('[data-scen-summary]').forEach(btn => {
     btn.addEventListener('click', () => _generateInternalSummary(btn.getAttribute('data-scen-summary'), btn));
   });
+  document.querySelectorAll('[data-scen-decision]').forEach(btn => {
+    btn.addEventListener('click', () => _generateDecisionLog(btn.getAttribute('data-scen-decision'), btn));
+  });
+}
+
+async function _generateDecisionLog(scenarioName, btn) {
+  const today = new Date();
+  const rfqId = prompt('RFQ ID for the decision log:', `RFQ-${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-001`);
+  if (!rfqId) return;
+  if (btn) { btn.disabled = true; var orig = btn.textContent; btn.textContent = 'Generating…'; }
+  try {
+    _py.globals.set('_dl_scenario', scenarioName);
+    _py.globals.set('_dl_rfq_id', rfqId);
+    // xlsx
+    const xlsxB64 = await _py.runPythonAsync(`
+import base64
+from app_engine import gen_decision_log_xlsx
+_b = gen_decision_log_xlsx(_dl_scenario, rfq_id=_dl_rfq_id)
+base64.b64encode(_b).decode('ascii')
+`);
+    const xb = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
+    const xblob = new Blob([xb], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const xurl = URL.createObjectURL(xblob);
+    const xa = document.createElement('a');
+    const safeName = scenarioName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    xa.href = xurl; xa.download = `DecisionLog_${safeName}_${rfqId}.xlsx`;
+    document.body.appendChild(xa); xa.click(); xa.remove();
+    setTimeout(() => URL.revokeObjectURL(xurl), 1500);
+
+    // Markdown (for Copilot)
+    await new Promise(r => setTimeout(r, 400));
+    const md = await _py.runPythonAsync(`
+from app_engine import gen_decision_log_markdown
+gen_decision_log_markdown(_dl_scenario, rfq_id=_dl_rfq_id)
+`);
+    const mblob = new Blob([md], { type: 'text/markdown' });
+    const murl = URL.createObjectURL(mblob);
+    const ma = document.createElement('a');
+    ma.href = murl; ma.download = `DecisionLog_${safeName}_${rfqId}.md`;
+    document.body.appendChild(ma); ma.click(); ma.remove();
+    setTimeout(() => URL.revokeObjectURL(murl), 1500);
+
+    alert(
+      `Decision log generated:\n\n` +
+      `  • DecisionLog_${safeName}_${rfqId}.xlsx — full immutable record (legal-hold)\n` +
+      `  • DecisionLog_${safeName}_${rfqId}.md — markdown version you can paste into M365 Copilot\n\n` +
+      `Retain the xlsx for at least 7 years per the legal-hold convention. The markdown is for your own follow-up — paste a section into Copilot and ask for an executive summary, supplier reply draft, or push-back checklist.`
+    );
+  } catch (err) {
+    console.error('[decision log]', err);
+    alert('Decision log generation failed: ' + (err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
+  }
 }
 
 async function _generateAwardLetters(scenarioName, btn) {

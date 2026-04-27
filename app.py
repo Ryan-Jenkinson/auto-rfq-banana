@@ -2064,6 +2064,37 @@ def reset_thresholds() -> dict:
     return get_thresholds()
 
 
+# ---------------------------------------------------------------------------
+# User profile — operator name + contact info used in outbound xlsx files.
+# Persisted with the session save state so different operators on the same
+# machine can each have their own.
+# ---------------------------------------------------------------------------
+
+DEFAULT_USER_PROFILE = {
+    "name": "",
+    "email": "",
+    "title": "Procurement Analyst",
+    "company": "Andersen",
+}
+
+
+def get_user_profile() -> dict:
+    p = _STATE.get("user_profile", {}) or {}
+    out = dict(DEFAULT_USER_PROFILE)
+    out.update(p)
+    return out
+
+
+def set_user_profile(updates: dict) -> dict:
+    cur = _STATE.get("user_profile", {}) or {}
+    for k in ("name", "email", "title", "company"):
+        if k in (updates or {}):
+            cur[k] = (updates[k] or "").strip()
+    _STATE["user_profile"] = cur
+    log_event("set_user_profile", "user profile updated")
+    return get_user_profile()
+
+
 # Legacy alias (kept for back-compat with existing call sites; use thresholds)
 DEFAULT_CARVE_OUT_THRESHOLD = 0.30
 
@@ -2677,11 +2708,97 @@ def gen_supplier_followup_xlsx(supplier_name: str, included_keys=None) -> bytes:
 # the unique join key for round-trip ingest.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Visual style palette for supplier-bound xlsx files. Inspired by polished
+# supplier-side templates (e.g. Grainger's "Data Spreadsheet" with bright-
+# green response columns + bold compact headers).
+# ---------------------------------------------------------------------------
+COLOR_BRAND_DARK   = "0a0e1a"   # deep navy ground (header bands)
+COLOR_BRAND_AMBER  = "ffb733"   # accent
+COLOR_BRAND_AMBER_DEEP = "e89c1a"
+COLOR_BAND_DARK    = "1c2540"   # secondary band
+COLOR_RESPONSE_YELLOW = "FFF59D"  # supplier-response cells (your move)
+COLOR_RESPONSE_GREEN  = "C8E6C9"  # supplier-response cells (alt: "fill this in")
+COLOR_REFERENCE_GRAY  = "ECEFF1"  # read-only reference cells
+COLOR_BORDER       = "999999"
+COLOR_INFO_BLUE    = "E3F2FD"
+COLOR_WARN_RED     = "FFCDD2"
+COLOR_TEXT_LIGHT   = "FFFFFF"
+COLOR_TEXT_INK     = "1c2540"
+COLOR_INK_MUTED    = "5C6B80"
+
+
+def _fill(rgb): return PatternFill("solid", fgColor=rgb)
+def _border(thin_color=COLOR_BORDER, weight="thin"):
+    s = Side(border_style=weight, color=thin_color)
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def _write_banner_row(ws, row_idx: int, text: str, span_cols: int,
+                      fill_color: str = COLOR_BRAND_DARK,
+                      text_color: str = COLOR_BRAND_AMBER,
+                      font_size: int = 18,
+                      height: int = 38):
+    """Write a merged title bar across `span_cols` columns at row `row_idx`."""
+    ws.cell(row=row_idx, column=1, value=text)
+    ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=span_cols)
+    cell = ws.cell(row=row_idx, column=1)
+    cell.font = Font(bold=True, color=text_color, size=font_size)
+    cell.fill = _fill(fill_color)
+    cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[row_idx].height = height
+
+
+def _write_subbanner(ws, row_idx: int, text: str, span_cols: int,
+                     fill_color: str = COLOR_BAND_DARK,
+                     text_color: str = COLOR_TEXT_LIGHT,
+                     font_size: int = 12, height: int = 26):
+    ws.cell(row=row_idx, column=1, value=text)
+    ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=span_cols)
+    cell = ws.cell(row=row_idx, column=1)
+    cell.font = Font(bold=True, color=text_color, size=font_size)
+    cell.fill = _fill(fill_color)
+    cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[row_idx].height = height
+
+
+def _style_table_header(ws, row_idx: int, n_cols: int,
+                        fill_color: str = COLOR_BRAND_DARK,
+                        text_color: str = COLOR_TEXT_LIGHT,
+                        font_size: int = 10):
+    border = _border(weight="thin")
+    for c in range(1, n_cols + 1):
+        cell = ws.cell(row=row_idx, column=c)
+        cell.font = Font(bold=True, color=text_color, size=font_size)
+        cell.fill = _fill(fill_color)
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        cell.border = border
+    ws.row_dimensions[row_idx].height = 32
+
+
+def _alternate_row_stripes(ws, start_row: int, end_row: int, n_cols: int,
+                           stripe_color: str = "F5F7FA"):
+    fill = _fill(stripe_color)
+    for r in range(start_row, end_row + 1):
+        if (r - start_row) % 2 == 1:
+            for c in range(1, n_cols + 1):
+                cell = ws.cell(row=r, column=c)
+                if not (cell.fill and cell.fill.patternType and cell.fill.fgColor.rgb not in (None, "00000000")):
+                    cell.fill = fill
+
+
 def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
                           response_due_date: str = "",
-                          contact_name: str = "Ryan Jenkinson",
-                          contact_email: str = "ryan.jenkinson@andersencorp.com",
+                          contact_name: str = "",
+                          contact_email: str = "",
                           included_keys=None) -> bytes:
+    # Pull from user profile if not explicitly passed
+    profile = get_user_profile()
+    if not contact_name:
+        contact_name = profile.get("name") or "(operator name not set)"
+    if not contact_email:
+        contact_email = profile.get("email") or "(operator email not set)"
+    contact_company = profile.get("company") or "Andersen"
     """Generate one supplier's outbound RFQ workbook.
 
     Strict isolation rules baked in:
@@ -2709,68 +2826,85 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
         response_due_date = (datetime.now() + _td(days=14)).strftime("%Y-%m-%d")
 
     wb = Workbook()
-    HEADER_FILL = PatternFill("solid", fgColor="0a0e1a")
-    BAND_FILL = PatternFill("solid", fgColor="2a3658")
-    YELLOW_FILL = PatternFill("solid", fgColor="FFF59D")
-    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
-    BANNER_FONT = Font(bold=True, color="ffb733", size=16)
-    LABEL_FONT = Font(bold=True, color="000000", size=11)
-    BODY_FONT = Font(size=11)
-    THIN = Side(border_style="thin", color="999999")
-    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
     # ---- TAB 1: Instructions ----
     ws = wb.active
     ws.title = "Instructions"
-    ws.append([f"REQUEST FOR QUOTATION — {rfq_id}"])
-    ws["A1"].font = BANNER_FONT
-    ws.append([f"Issued to: {supplier_name}"])
-    ws.append([f"Issue date: {datetime.now().strftime('%Y-%m-%d')}"])
-    ws.append([f"Response due: {response_due_date}"])
-    ws.append([f"Contact: {contact_name} — {contact_email}"])
+    _write_banner_row(ws, 1, f"REQUEST FOR QUOTATION  ·  {rfq_id}", span_cols=4, font_size=20, height=46)
+    _write_subbanner(ws, 2, f"Issued to: {supplier_name}", span_cols=4, font_size=14, height=30)
+    # Meta row
+    meta = [
+        ("Issue date",        datetime.now().strftime('%Y-%m-%d')),
+        ("Response due",      response_due_date),
+        (f"{contact_company} contact",  f"{contact_name} — {contact_email}"),
+        ("RFQ identifier",    rfq_id),
+    ]
     ws.append([])
-    ws.append(["Instructions"])
-    ws["A7"].font = LABEL_FONT
+    for label, val in meta:
+        ws.append([label, val])
+        cell_label = ws.cell(row=ws.max_row, column=1)
+        cell_label.font = Font(bold=True, color=COLOR_TEXT_INK, size=11)
+        cell_label.fill = _fill(COLOR_REFERENCE_GRAY)
+        cell_label.alignment = Alignment(vertical="center", indent=1)
+        cell_val = ws.cell(row=ws.max_row, column=2)
+        cell_val.font = Font(size=11)
+        cell_val.alignment = Alignment(vertical="center", indent=1)
+        ws.row_dimensions[ws.max_row].height = 22
+
+    ws.append([])
+    _write_subbanner(ws, ws.max_row + 1, "INSTRUCTIONS  ·  HOW TO COMPLETE THIS RFQ", span_cols=4)
+    ws.append([])
     instructions = [
-        "1. Please complete the 'Supplier Response Template' tab. Yellow cells are for your responses.",
-        "2. Do not change the order of rows or columns. Hidden columns are used for round-trip matching.",
-        "3. Quote each item in the UOM specified. If you must quote in a different UOM, use the 'Quote UOM' field and add a note.",
-        "4. If you cannot bid on an item, mark 'No Bid' = Yes and select a reason from the dropdown.",
-        "5. If you offer an alternate part, fill in 'Alternate Part Offered' = Yes and complete the alternate part columns.",
+        "1. Open the 'Supplier Response Template' tab. Yellow cells are for your responses; gray reference cells are read-only.",
+        "2. Do not change the order of rows or columns. Hidden columns (item_key, rfq_line_id) are used for round-trip matching when you return the file.",
+        "3. Quote each item in the UOM specified in the gray reference column. If you must quote in a different UOM, set 'Quote UOM' accordingly and add a note in 'Supplier Notes'.",
+        "4. If you cannot bid an item, mark 'No Bid' = Yes and select a reason from the dropdown. If you have a comment, add it in 'Supplier Notes'.",
+        "5. If you offer an alternate part, set 'Alternate Part Offered' = Yes and complete the alternate part columns.",
         "6. Lead time should be in calendar days from PO receipt.",
-        "7. Quote validity: please indicate how long your prices are firm.",
-        "8. All prices should be net (excluding freight unless otherwise noted in 'Freight Included').",
-        "9. Please return the completed workbook to the contact above by the due date.",
-        "10. Any item you do not respond to will be treated as a no-bid.",
+        "7. Quote validity: please indicate how long your prices are firm in the 'Valid Through Date' column.",
+        "8. All prices should be NET (excluding freight unless 'Freight Included' = Yes).",
+        "9. Please return the completed workbook to the Andersen contact above by the response-due date.",
+        "10. Any item without a response will be treated as a no-bid.",
     ]
     for line in instructions:
         ws.append([line])
+        cell = ws.cell(row=ws.max_row, column=1)
+        cell.font = Font(size=11)
+        cell.alignment = Alignment(wrap_text=True, vertical="top", indent=1)
+        ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=4)
+        ws.row_dimensions[ws.max_row].height = 32
+
     ws.append([])
-    ws.append(["Tabs in this workbook:"])
-    ws[f"A{ws.max_row}"].font = LABEL_FONT
+    _write_subbanner(ws, ws.max_row + 1, "WORKBOOK CONTENTS", span_cols=4)
+    ws.append([])
     for tab_line in [
-        "  • Instructions (this tab)",
-        "  • RFQ Lines — read-only summary of items being requested",
-        "  • Terms and Assumptions — ground rules for this RFQ",
-        "  • Data Dictionary — definition of each column",
-        "  • Supplier Response Template — fill in your responses here",
+        "  •  Instructions  —  this tab",
+        "  •  RFQ Lines  —  read-only summary of items being requested",
+        "  •  Terms and Assumptions  —  ground rules for this RFQ",
+        "  •  Data Dictionary  —  definition of each column in the response template",
+        "  •  Supplier Response Template  —  YOUR INPUT GOES HERE",
     ]:
         ws.append([tab_line])
-    ws.column_dimensions["A"].width = 110
+        cell = ws.cell(row=ws.max_row, column=1)
+        cell.font = Font(size=11)
+        cell.alignment = Alignment(vertical="center", indent=1)
+        ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=4)
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 90
+    ws.column_dimensions["C"].width = 1
+    ws.column_dimensions["D"].width = 1
 
     # ---- TAB 2: RFQ Lines (read-only summary) ----
     ws2 = wb.create_sheet("RFQ Lines")
-    ws2.append([f"RFQ Lines — {len(items):,} items requested"])
-    ws2["A1"].font = BANNER_FONT
-    ws2.append([])
     headers = ["Line #", "Andersen Item #", "EAM Part #", "Manufacturer Part #",
                "Manufacturer", "Description", "Commodity", "Annual Qty", "UOM"]
+    _write_banner_row(ws2, 1, f"RFQ LINES  ·  {len(items):,} items requested", span_cols=len(headers))
+    _write_subbanner(ws2, 2, "Read-only summary — for your reference. Quote in the 'Supplier Response Template' tab.", span_cols=len(headers), font_size=10, height=22)
+    ws2.append([])
     ws2.append(headers)
-    for c in ws2[3]:
-        c.font = HEADER_FONT
-        c.fill = HEADER_FILL
-        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    _style_table_header(ws2, ws2.max_row, len(headers))
     sorted_items = sorted(items, key=lambda x: (x.get("qty_24mo") or 0) * (x.get("last_unit_price") or 0), reverse=True)
+    data_start = ws2.max_row + 1
     for i, it in enumerate(sorted_items, start=1):
         ws2.append([
             i,
@@ -2783,13 +2917,20 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
             it.get("qty_24mo") or 0,
             it.get("uom") or "",
         ])
+    _alternate_row_stripes(ws2, data_start, ws2.max_row, len(headers))
+    # Borders + alignment on data rows
+    border = _border()
+    for r in range(data_start, ws2.max_row + 1):
+        for c in range(1, len(headers) + 1):
+            cell = ws2.cell(row=r, column=c)
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
     autosize(ws2)
-    ws2.freeze_panes = "A4"
+    ws2.freeze_panes = f"A{data_start}"
 
     # ---- TAB 3: Terms and Assumptions ----
     ws3 = wb.create_sheet("Terms and Assumptions")
-    ws3.append(["Terms and Assumptions"])
-    ws3["A1"].font = BANNER_FONT
+    _write_banner_row(ws3, 1, "TERMS AND ASSUMPTIONS", span_cols=2)
     ws3.append([])
     terms = [
         ("Quote currency", "USD unless otherwise stated."),
@@ -2804,26 +2945,30 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
         ("Round-trip data", "Hidden columns in the response template (item_key, rfq_line_id) are used for matching your response back to our items. Do not delete or modify these columns."),
     ]
     ws3.append(["Topic", "Detail"])
-    for c in ws3[3]:
-        c.font = HEADER_FONT
-        c.fill = HEADER_FILL
+    _style_table_header(ws3, ws3.max_row, 2)
+    border = _border()
+    data_start_3 = ws3.max_row + 1
     for topic, detail in terms:
         ws3.append([topic, detail])
-    ws3.column_dimensions["A"].width = 24
-    ws3.column_dimensions["B"].width = 100
-    for row in ws3.iter_rows(min_row=4):
-        for c in row:
-            c.alignment = Alignment(vertical="top", wrap_text=True)
+        ws3.cell(row=ws3.max_row, column=1).font = Font(bold=True, size=11, color=COLOR_TEXT_INK)
+        ws3.cell(row=ws3.max_row, column=1).fill = _fill(COLOR_REFERENCE_GRAY)
+    _alternate_row_stripes(ws3, data_start_3, ws3.max_row, 2)
+    for r in range(data_start_3, ws3.max_row + 1):
+        for c in range(1, 3):
+            cell = ws3.cell(row=r, column=c)
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+        ws3.row_dimensions[r].height = 32
+    ws3.column_dimensions["A"].width = 26
+    ws3.column_dimensions["B"].width = 110
 
     # ---- TAB 4: Data Dictionary ----
     ws4 = wb.create_sheet("Data Dictionary")
-    ws4.append(["Data Dictionary — every column defined"])
-    ws4["A1"].font = BANNER_FONT
+    _write_banner_row(ws4, 1, "DATA DICTIONARY  ·  every column defined", span_cols=3)
     ws4.append([])
     ws4.append(["Column", "Required?", "Definition"])
-    for c in ws4[3]:
-        c.font = HEADER_FONT
-        c.fill = HEADER_FILL
+    _style_table_header(ws4, ws4.max_row, 3)
+    data_start_4 = ws4.max_row + 1
     dictionary = [
         ("Andersen Item #", "Reference", "Our internal item identifier."),
         ("EAM Part #", "Reference", "Our EAM/maintenance system part number (primary key for most suppliers)."),
@@ -2852,19 +2997,37 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
     ]
     for col, req, defn in dictionary:
         ws4.append([col, req, defn])
-    ws4.column_dimensions["A"].width = 30
-    ws4.column_dimensions["B"].width = 18
-    ws4.column_dimensions["C"].width = 80
-    for row in ws4.iter_rows(min_row=4):
-        for c in row:
-            c.alignment = Alignment(vertical="top", wrap_text=True)
+    border = _border()
+    _alternate_row_stripes(ws4, data_start_4, ws4.max_row, 3)
+    for r in range(data_start_4, ws4.max_row + 1):
+        for c in range(1, 4):
+            cell = ws4.cell(row=r, column=c)
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+        # Bold the column-name col
+        ws4.cell(row=r, column=1).font = Font(bold=True, color=COLOR_TEXT_INK, size=11)
+        # Color-code the Required? column
+        req_val = (ws4.cell(row=r, column=2).value or "").lower()
+        if "required" in req_val:
+            ws4.cell(row=r, column=2).font = Font(bold=True, color="C62828", size=10)
+        elif "do not edit" in req_val:
+            ws4.cell(row=r, column=2).font = Font(bold=True, color="6A1B9A", size=10)
+        elif "recommended" in req_val:
+            ws4.cell(row=r, column=2).font = Font(bold=True, color="EF6C00", size=10)
+        else:
+            ws4.cell(row=r, column=2).font = Font(color=COLOR_INK_MUTED, size=10)
+    ws4.column_dimensions["A"].width = 32
+    ws4.column_dimensions["B"].width = 22
+    ws4.column_dimensions["C"].width = 90
 
     # ---- TAB 5: Supplier Response Template ----
     ws5 = wb.create_sheet("Supplier Response Template")
-    ws5.append([f"Supplier Response Template — {supplier_name} — {rfq_id}"])
-    ws5["A1"].font = BANNER_FONT
-    ws5.append(["Yellow cells are for your responses. Do not modify other columns."])
-    ws5["A2"].font = Font(italic=True, color="666666")
+    n_template_cols = 26
+    _write_banner_row(ws5, 1, f"SUPPLIER RESPONSE TEMPLATE  ·  {supplier_name}  ·  {rfq_id}", span_cols=n_template_cols, font_size=18, height=42)
+    _write_subbanner(ws5, 2,
+                     "  YELLOW cells = your input  ·  GRAY cells = read-only reference (do not modify)  ·  Hidden cols Y/Z = round-trip keys (do not delete)",
+                     span_cols=n_template_cols, font_size=10, height=22,
+                     fill_color=COLOR_BRAND_AMBER, text_color=COLOR_TEXT_INK)
     ws5.append([])
     template_headers = [
         # Reference (read-only) cols
@@ -2898,11 +3061,23 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
         "rfq_line_id",       # Z (hidden)
     ]
     ws5.append(template_headers)
-    for c in ws5[4]:
-        c.font = HEADER_FONT
-        c.fill = HEADER_FILL
-        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        c.border = BORDER
+    # Style the header row — different fill for reference (gray) vs response (amber)
+    HDR_FILL_REF = _fill(COLOR_BRAND_DARK)
+    HDR_FILL_RESP = _fill(COLOR_BRAND_AMBER)
+    HDR_FILL_HIDDEN = _fill("CCCCCC")
+    border = _border()
+    for c_idx in range(1, n_template_cols + 1):
+        cell = ws5.cell(row=4, column=c_idx)
+        cell.font = Font(bold=True, color=COLOR_TEXT_LIGHT if c_idx <= 7 else COLOR_TEXT_INK, size=10)
+        if c_idx <= 7:           # Reference cols (A-G)
+            cell.fill = HDR_FILL_REF
+        elif c_idx <= 24:        # Response cols (H-X)
+            cell.fill = HDR_FILL_RESP
+        else:                    # Hidden round-trip cols (Y-Z)
+            cell.fill = HDR_FILL_HIDDEN
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
+        cell.border = border
+    ws5.row_dimensions[4].height = 38
 
     # Row data
     for i, it in enumerate(sorted_items, start=1):
@@ -2920,17 +3095,20 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
             rfq_line_id,               # Z rfq_line_id
         ])
 
-    # Yellow-fill response cells (cols H..X = 8..24) for all data rows
+    # Color-code response cells (yellow) vs reference cells (gray) for all data rows
     n_data_rows = len(sorted_items)
+    YELLOW_FILL = _fill(COLOR_RESPONSE_YELLOW)
+    REF_FILL = _fill(COLOR_REFERENCE_GRAY)
     for r_idx in range(5, 5 + n_data_rows):
-        for col_idx in range(8, 25):  # H through X inclusive
+        for col_idx in range(8, 25):  # H through X inclusive — supplier responses
             c = ws5.cell(row=r_idx, column=col_idx)
             c.fill = YELLOW_FILL
-            c.border = BORDER
-        # Reference columns (A..G) — light fill so it's clear they're not editable
-        for col_idx in range(1, 8):
+            c.border = border
+        for col_idx in range(1, 8):  # A..G — read-only reference
             c = ws5.cell(row=r_idx, column=col_idx)
-            c.border = BORDER
+            c.fill = REF_FILL
+            c.border = border
+            c.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
 
     # Number formats
     for r in ws5.iter_rows(min_row=5, min_col=6, max_col=6):  # F = Annual Qty
@@ -3030,6 +3208,7 @@ def serialize_state() -> dict:
         "supplier_name":        _STATE.get("supplier_name", ""),
         "data_anchor_date":     _STATE.get("data_anchor_date"),
         "audit_log":            _STATE.get("audit_log", []),
+        "user_profile":         _STATE.get("user_profile", {}),
     }
 
 
@@ -3207,6 +3386,10 @@ def restore_state(payload: dict) -> None:
         _STATE["supplier_name"] = payload["supplier_name"]
     if "data_anchor_date" in payload:
         _STATE["data_anchor_date"] = payload["data_anchor_date"]
+    if "audit_log" in payload and isinstance(payload["audit_log"], list):
+        _STATE["audit_log"] = payload["audit_log"]
+    if "user_profile" in payload and isinstance(payload["user_profile"], dict):
+        _STATE["user_profile"] = payload["user_profile"]
 
 
 # ---------------------------------------------------------------------------
@@ -3559,8 +3742,14 @@ class IsolationViolation(Exception):
 
 def gen_award_letter_xlsx(scenario_name: str, supplier_name: str,
                           rfq_id: str = "",
-                          contact_name: str = "Ryan Jenkinson",
-                          contact_email: str = "ryan.jenkinson@andersencorp.com") -> bytes:
+                          contact_name: str = "",
+                          contact_email: str = "") -> bytes:
+    profile = get_user_profile()
+    if not contact_name:
+        contact_name = profile.get("name") or "(operator name not set)"
+    if not contact_email:
+        contact_email = profile.get("email") or "(operator email not set)"
+    contact_company = profile.get("company") or "Andersen"
     """Build the award-letter xlsx for one awarded supplier from a saved
     scenario. Strict isolation enforced both during row collection and
     via a defensive re-scan before write."""
@@ -3744,6 +3933,1025 @@ def gen_award_letters_for_scenario(scenario_name: str, rfq_id: str = "") -> dict
             # Skip suppliers with no awards or isolation issues — surface in result
             out[sup] = None
     return out
+
+
+# ---------------------------------------------------------------------------
+# Award decision documentation — legal-hold record explaining WHY each award
+# was made. Template-based prose (no AI). Designed for retention for several
+# years; should be IMMUTABLE after creation (data embedded verbatim, not
+# re-derived from current state). Generated alongside the award letters.
+#
+# Each award gets a multi-paragraph explanation:
+#   1. PRIMARY REASON — why this supplier was chosen
+#   2. ALTERNATIVES CONSIDERED — why other bidders weren't chosen (per supplier)
+#   3. EXPECTED OUTCOME — qty / annual value / savings vs historical
+#   4. RISK FACTORS — lead time, MOQ, single-source, UOM verification needed
+#   5. METHODOLOGY NOTE — what scenario / strategy / thresholds were active
+# ---------------------------------------------------------------------------
+
+# ----------------- PRIMARY REASON templates -----------------
+# Keyed by the decision_basis prefix string emitted by _evaluate_scenario.
+# Each template is paragraph prose with named variables. Template language
+# is intentionally consistent (not varied) — legal docs benefit from
+# predictable phrasing.
+
+PRIMARY_REASON_TEMPLATES = {
+    "lowest": (
+        "{supplier} was awarded this item as the lowest qualified quote received, "
+        "at {price} per {uom}. "
+        "{n_competing_text}"
+        "Total annualized award value at this price is {annual_value}, "
+        "representing an estimated {savings_text} versus our historical paid price of {hist_price} per {uom}."
+    ),
+    "lowest_no_history": (
+        "{supplier} was awarded this item as the lowest qualified quote received, "
+        "at {price} per {uom}. {n_competing_text}"
+        "No historical paid price was available for direct savings comparison; "
+        "this award establishes the baseline going forward."
+    ),
+    "INCUMBENT_KEPT": (
+        "Award retained with the incumbent supplier {supplier} at {price} per {uom}. "
+        "While {comp_supplier} did submit a lower quote ({comp_price} per {uom}, "
+        "or {comp_savings_pct} below the incumbent), the savings from switching "
+        "fall below our project-level switching threshold of {switch_threshold_pct}. "
+        "Continuity with the incumbent supplier preserves established quality, "
+        "lead-time, and operational relationships, and avoids the administrative "
+        "cost and risk of supplier transition for a marginal-savings opportunity."
+    ),
+    "CONSOLIDATE_TO": (
+        "{supplier} was awarded this item as part of a deliberate consolidation "
+        "strategy under this RFQ. The procurement objective is to award the "
+        "majority of the requested items to a single supplier where pricing is "
+        "reasonably competitive, in order to reduce split-supplier complexity, "
+        "simplify ordering and receiving, consolidate freight, and strengthen "
+        "the negotiating position with the awarded supplier. {supplier}'s "
+        "quoted price of {price} per {uom} was competitive with the alternatives "
+        "received and within the carve-out tolerance of {carve_threshold_pct}, "
+        "so this item was awarded to the consolidation supplier rather than "
+        "carved out separately. {savings_text_vs_history}"
+    ),
+    "CARVE": (
+        "{supplier} was awarded this item as a deliberate exception (carve-out) "
+        "to the broader consolidation strategy. While the consolidation supplier "
+        "({consol_supplier}) also bid this item ({consol_price} per {uom}), "
+        "{supplier}'s quote of {price} per {uom} represents a {carve_savings_pct} "
+        "savings versus the consolidation supplier on this specific item — exceeding "
+        "our project-level carve-out threshold of {carve_threshold_pct}. "
+        "On the estimated annual quantity of {qty} units, this represents "
+        "{carve_savings_total} of additional annual savings versus consolidating "
+        "this item. The materiality of the per-item savings justifies the "
+        "operational complexity of a split award for this line. {savings_text_vs_history}"
+    ),
+    "WINNER_NOBID": (
+        "{supplier} was awarded this item because the consolidation winner "
+        "({consol_supplier}) did not provide a quote for it. Of the {n_responding} "
+        "suppliers who did respond, {supplier} offered the lowest qualified price "
+        "at {price} per {uom}. {savings_text_vs_history}"
+    ),
+    "MANUAL": (
+        "{supplier} was awarded this item by manual decision of the procurement "
+        "operator, overriding the engine's automated recommendation. The operator's "
+        "stated rationale: \"{manual_reason}\". This award reflects the operator's "
+        "judgment based on factors that may not be fully captured by the automated "
+        "scoring (e.g., supplier relationship, prior quality experience, strategic "
+        "alignment, or item criticality). All bid data has been preserved for review."
+    ),
+    "MANUAL_NO_AWARD": (
+        "No supplier was awarded this item, by manual decision of the procurement "
+        "operator. Operator rationale: \"{manual_reason}\". The bid data and "
+        "engine recommendation are preserved for reference."
+    ),
+    "NO_BID": (
+        "No supplier was awarded this item because no qualified bid was received. "
+        "{n_no_bid_text}"
+        "{recommendation_text}"
+    ),
+    "lowest_qualified": (
+        "{supplier} was awarded this item at {price} per {uom} as the lowest "
+        "qualified quote. {excluded_text}"
+        "Total annualized award value at this price is {annual_value}, "
+        "representing an estimated {savings_text} versus our historical paid price of {hist_price} per {uom}."
+    ),
+}
+
+# ----------------- ALTERNATIVES-CONSIDERED templates (per non-winning bidder) -----------------
+
+ALT_REASON_TEMPLATES = {
+    "PRICE_HIGHER": (
+        "{supplier}: quoted {price} per {uom}, which is {pct_higher} higher than the awarded price. "
+        "Lower-cost option was awarded."
+    ),
+    "PRICE_HIGHER_BUT_QUALIFIED": (
+        "{supplier}: quoted {price} per {uom} (qualified bid). At {pct_higher} above the awarded price, "
+        "this bid was not selected on a price-only comparison."
+    ),
+    "UOM_DISCREPANCY": (
+        "{supplier}: quoted {price} per {uom}, but flagged a unit-of-measure discrepancy "
+        "in their notes (\"{notes_excerpt}\"). Without UOM normalization or supplier "
+        "confirmation, this quote could not be directly compared to the others. "
+        "Will follow up via the supplier follow-up packet."
+    ),
+    "SUBSTITUTE_OFFERED": (
+        "{supplier}: quoted {price} per {uom} for an alternate part ({alt_part_text}). "
+        "Substitute parts require form/fit/function validation before award; "
+        "the bid was preserved but not selected pending substitute approval."
+    ),
+    "NEED_INFO": (
+        "{supplier}: did not provide a price; their response indicated that additional "
+        "information was needed (\"{notes_excerpt}\"). Will follow up with clarification."
+    ),
+    "NO_BID": (
+        "{supplier}: declined to quote this item{notes_excerpt_text}."
+    ),
+    "OUTLIER_HIGH": (
+        "{supplier}: quoted {price} per {uom}, which is {factor:.1f}× the median of the "
+        "received bids. This is statistically anomalous and likely indicates a "
+        "wrong-part match, pricing error, or UOM mismatch on the supplier side. "
+        "Excluded from award consideration pending supplier clarification."
+    ),
+    "OUTLIER_LOW": (
+        "{supplier}: quoted {price} per {uom}, which is only {factor:.2f}× the median bid. "
+        "This is suspiciously low and was not awarded on price alone — the operator "
+        "should verify part identity and UOM with the supplier before treating "
+        "as a real opportunity."
+    ),
+    "DID_NOT_RESPOND": (
+        "{supplier}: did not respond on this item (no row submitted in their bid response file)."
+    ),
+}
+
+# ----------------- EXPECTED OUTCOME templates -----------------
+
+OUTCOME_TEMPLATES = {
+    "WITH_SAVINGS": (
+        "Estimated annual quantity is {qty} units, derived from the trailing 24 months "
+        "of consumption. At the awarded unit price of {price} per {uom}, total "
+        "annualized award value is {annual_value}. Versus the historical paid price "
+        "of {hist_price} per {uom}, this award is projected to deliver {savings_amount} "
+        "in annual savings, or approximately {savings_pct} of historical spend on this item."
+    ),
+    "WITH_INCREASE": (
+        "Estimated annual quantity is {qty} units, derived from the trailing 24 months "
+        "of consumption. At the awarded unit price of {price} per {uom}, total "
+        "annualized award value is {annual_value}. The awarded price is {increase_pct} "
+        "higher than the historical paid price of {hist_price} per {uom}, representing "
+        "an annualized cost increase of {increase_amount}. Acceptance reflects the "
+        "absence of a more competitive qualified quote in this RFQ."
+    ),
+    "NO_HISTORY": (
+        "Estimated annual quantity is {qty} units, derived from the trailing 24 months "
+        "of consumption. At the awarded unit price of {price} per {uom}, total "
+        "annualized award value is {annual_value}. No historical paid price is on file "
+        "for this item, so this award establishes the new baseline."
+    ),
+    "ZERO_QTY": (
+        "Annual quantity estimate is zero based on the trailing 24-month order history "
+        "(this item has not been ordered in that window). The awarded unit price of {price} "
+        "per {uom} will apply if and when the item is ordered, but no annualized value "
+        "is being committed."
+    ),
+}
+
+# ----------------- RISK FACTOR templates (appended when conditions are met) -----------------
+
+RISK_TEMPLATES = {
+    "SINGLE_SOURCE_AWARD": (
+        "Risk: This item received only one qualified bid, from {supplier}. "
+        "Until the next RFQ cycle, Andersen has no competitive backup for this item. "
+        "Operator should monitor lead times and pricing closely."
+    ),
+    "UOM_VERIFICATION_REQUIRED": (
+        "Risk: The awarded supplier flagged a UOM discrepancy on their quote. "
+        "Procurement should confirm the UOM in writing before issuing the first PO; "
+        "the apparent savings may not be real once UOM is normalized."
+    ),
+    "SUBSTITUTE_PENDING_VALIDATION": (
+        "Risk: The awarded supplier offered an alternate part ({alt_part_text}). "
+        "Form/fit/function equivalence has not yet been validated by engineering. "
+        "First-article approval should precede full release to production."
+    ),
+    "DEMAND_VOLATILITY": (
+        "Risk: This item's recent demand pattern shows {demand_change_text}, "
+        "so the annualized quantity estimate carries above-average uncertainty. "
+        "Actual order volumes may differ materially from the estimate; "
+        "supplier capacity planning should not assume the estimate is firm."
+    ),
+    "DORMANT_ITEM": (
+        "Risk: This item has not been ordered in the last 12 months. "
+        "Award price is a forward-looking commitment that may never be invoked. "
+        "Consider whether this item should remain in the active item master."
+    ),
+    "ONE_TIME_BUY_HISTORY": (
+        "Risk: This item has only been ordered once historically. "
+        "Annual quantity estimates are unreliable for one-time-buy patterns; "
+        "actual demand may be much higher or zero."
+    ),
+    "PRICE_SPIKE_CONTEXT": (
+        "Note: The historical paid price reflects a recent price change. "
+        "The latest line in our purchase history was {latest_price} per {uom}, which is "
+        "{spike_pct} above the 90-day median ({median_price} per {uom}). "
+        "Operator should be aware that the savings calculation is sensitive to which "
+        "historical baseline is used."
+    ),
+    "GENERIC_DESCRIPTION": (
+        "Risk: This item's description in our system is generic or short, which makes "
+        "supplier cross-referencing difficult. Confirm that the awarded supplier is "
+        "quoting the same physical part by reviewing the manufacturer part number."
+    ),
+}
+
+
+def _format_money(v):
+    if v is None:
+        return "—"
+    return f"${v:,.2f}"
+
+
+def _format_pct(v):
+    if v is None:
+        return "—"
+    return f"{v*100:.1f}%"
+
+
+def _format_factor(v):
+    if v is None:
+        return "—"
+    return f"{v:.2f}×"
+
+
+def _safe_text(s, fallback=""):
+    if s is None:
+        return fallback
+    s = str(s).strip()
+    return s if s else fallback
+
+
+def _excerpt_notes(notes, max_len=120):
+    if not notes:
+        return ""
+    n = str(notes).strip()
+    if len(n) > max_len:
+        n = n[:max_len].rsplit(" ", 1)[0] + "…"
+    return n
+
+
+def generate_award_rationale(award_record: dict, comparison_row: dict, scenario: dict) -> dict:
+    """Build the full multi-paragraph rationale for one award. Returns:
+        {
+          "primary_reason": str,            — paragraph 1: why this supplier
+          "alternatives_considered": [str], — paragraph 2: per-non-winner reasoning
+          "expected_outcome": str,          — paragraph 3: annual qty / value / savings
+          "risk_factors": [str],            — paragraph 4: warnings (may be empty)
+          "methodology_note": str,          — paragraph 5: scenario / thresholds
+          "full_text": str,                 — concatenation suitable for a single cell
+        }
+
+    All paragraphs are template-based (no AI). Numbers are formatted to-the-penny
+    or to-the-percent for legal-grade precision.
+    """
+    th = get_thresholds()
+    awarded_supplier = award_record.get("awarded_supplier")
+    awarded_price = award_record.get("awarded_price")
+    qty = award_record.get("qty_24mo") or 0
+    annual_value = award_record.get("awarded_value") or 0
+    hist_price = award_record.get("historical_price") or 0
+    historical_value = award_record.get("historical_value") or 0
+    savings_value = award_record.get("savings_value") or 0
+    decision_basis = award_record.get("decision_basis") or ""
+    item_uom = (comparison_row.get("uom") if comparison_row else None) or "unit"
+    bids = (comparison_row.get("bids") if comparison_row else None) or {}
+
+    def _bid_for(sup):
+        return bids.get(sup) or {}
+
+    # ---------- PRIMARY REASON ----------
+    primary = ""
+    qty_basis = "the trailing 24 months of order history"
+
+    if not awarded_supplier:
+        # No-award branch
+        n_no_bid = sum(1 for b in bids.values() if b.get("status") == "NO_BID")
+        n_need_info = sum(1 for b in bids.values() if b.get("status") == "NEED_INFO")
+        rec_text = ""
+        if hist_price > 0 and qty > 0:
+            rec_text = (
+                f"Recommend either re-issuing the request to a broader supplier list, "
+                f"sole-sourcing with the incumbent, or removing this item from the active RFQ. "
+                f"The historical annual run-rate at this item is approximately "
+                f"{_format_money(hist_price * qty)}, which provides context for the level of effort warranted."
+            )
+        else:
+            rec_text = (
+                "Given the limited or absent historical run-rate, recommend dropping this item from "
+                "the active RFQ unless a specific need is identified."
+            )
+        if decision_basis.startswith("MANUAL"):
+            manual_reason = decision_basis.replace("MANUAL: ", "").replace("MANUAL", "").strip(": ")
+            primary = PRIMARY_REASON_TEMPLATES["MANUAL_NO_AWARD"].format(
+                manual_reason=manual_reason or "no rationale provided"
+            )
+        else:
+            no_bid_text = ""
+            if n_no_bid:
+                no_bid_text = f"{n_no_bid} supplier{'s' if n_no_bid != 1 else ''} declined to quote. "
+            if n_need_info:
+                no_bid_text += f"{n_need_info} supplier{'s' if n_need_info != 1 else ''} indicated more information was needed. "
+            if not no_bid_text:
+                no_bid_text = "No qualified responses were received. "
+            primary = PRIMARY_REASON_TEMPLATES["NO_BID"].format(
+                n_no_bid_text=no_bid_text,
+                recommendation_text=rec_text,
+            )
+    else:
+        # Award branch — pick template by decision_basis
+        # Calculate competitive context
+        priced_alternatives = [
+            (s, b.get("price")) for s, b in bids.items()
+            if s != awarded_supplier and b.get("price") is not None and b.get("status") in ("PRICED", "UOM_DISC", "SUBSTITUTE")
+        ]
+        n_competing = len(priced_alternatives)
+        if n_competing == 0:
+            n_competing_text = "This was the only qualified quote received for this item. "
+        elif n_competing == 1:
+            other_sup, other_price = priced_alternatives[0]
+            pct_higher = ((other_price - awarded_price) / awarded_price) if awarded_price else 0
+            n_competing_text = (
+                f"One other qualified bid was received "
+                f"({other_sup} at {_format_money(other_price)} per {item_uom}, "
+                f"{_format_pct(pct_higher)} higher). "
+            )
+        else:
+            other_min = min(p for _, p in priced_alternatives)
+            other_max = max(p for _, p in priced_alternatives)
+            n_competing_text = (
+                f"{n_competing} other qualified bids were received, ranging from "
+                f"{_format_money(other_min)} to {_format_money(other_max)} per {item_uom}, "
+                f"all higher than the awarded price. "
+            )
+
+        # Savings text
+        if hist_price and hist_price > 0:
+            sv_pct = (hist_price - awarded_price) / hist_price
+            if sv_pct > 0:
+                savings_text = (
+                    f"savings of {_format_pct(sv_pct)} on this item "
+                    f"(approximately {_format_money(savings_value)} per year on the estimated annual qty of {qty:,.0f})"
+                )
+            elif sv_pct < 0:
+                savings_text = (
+                    f"price increase of {_format_pct(abs(sv_pct))} versus the prior price "
+                    f"(approximately {_format_money(abs(savings_value))} per year on the estimated annual qty of {qty:,.0f})"
+                )
+            else:
+                savings_text = "essentially flat versus the prior price"
+            savings_text_vs_history = "Versus the historical paid price of " + _format_money(hist_price) + " per " + item_uom + ", this represents a " + savings_text + "."
+        else:
+            savings_text = "no historical baseline available"
+            savings_text_vs_history = "No prior paid price was on file for this item, so this award establishes the baseline."
+
+        # Pick the right template
+        if decision_basis.startswith("MANUAL"):
+            manual_reason = decision_basis.split(":", 1)[1].strip() if ":" in decision_basis else "no rationale captured"
+            primary = PRIMARY_REASON_TEMPLATES["MANUAL"].format(
+                supplier=awarded_supplier,
+                manual_reason=manual_reason,
+            )
+        elif decision_basis.startswith("INCUMBENT_KEPT"):
+            comp = next(((s, p) for s, p in priced_alternatives), (None, None))
+            comp_supplier = comp[0] or "competitor"
+            comp_price = comp[1] or 0
+            comp_savings_pct = ((awarded_price - comp_price) / awarded_price) if (awarded_price and comp_price) else 0
+            primary = PRIMARY_REASON_TEMPLATES["INCUMBENT_KEPT"].format(
+                supplier=awarded_supplier,
+                price=_format_money(awarded_price),
+                uom=item_uom,
+                comp_supplier=comp_supplier,
+                comp_price=_format_money(comp_price),
+                comp_savings_pct=_format_pct(comp_savings_pct),
+                switch_threshold_pct=_format_pct(th["min_savings_pct_to_switch"]),
+            )
+        elif decision_basis.startswith("CONSOLIDATE_TO"):
+            primary = PRIMARY_REASON_TEMPLATES["CONSOLIDATE_TO"].format(
+                supplier=awarded_supplier,
+                price=_format_money(awarded_price),
+                uom=item_uom,
+                carve_threshold_pct=_format_pct(th["carve_out_min_savings_pct"]),
+                savings_text_vs_history=savings_text_vs_history,
+            )
+        elif decision_basis.startswith("CARVE"):
+            # Decision basis like "CARVE: MSC saves 30% vs Grainger"
+            consol_supplier = (scenario.get("parameters") or {}).get("supplier") if scenario else "the consolidation winner"
+            consol_bid = _bid_for(consol_supplier)
+            consol_price = consol_bid.get("price") or 0
+            carve_savings_pct = ((consol_price - awarded_price) / consol_price) if (consol_price and consol_price > 0) else 0
+            carve_savings_total = (consol_price - awarded_price) * qty if (consol_price and qty) else 0
+            primary = PRIMARY_REASON_TEMPLATES["CARVE"].format(
+                supplier=awarded_supplier,
+                consol_supplier=consol_supplier or "the consolidation winner",
+                price=_format_money(awarded_price),
+                consol_price=_format_money(consol_price),
+                uom=item_uom,
+                qty=f"{qty:,.0f}",
+                carve_savings_pct=_format_pct(carve_savings_pct),
+                carve_savings_total=_format_money(carve_savings_total),
+                carve_threshold_pct=_format_pct(th["carve_out_min_savings_pct"]),
+                savings_text_vs_history=savings_text_vs_history,
+            )
+        elif decision_basis.startswith("WINNER_NOBID"):
+            consol_supplier = (scenario.get("parameters") or {}).get("supplier") if scenario else "the consolidation winner"
+            primary = PRIMARY_REASON_TEMPLATES["WINNER_NOBID"].format(
+                supplier=awarded_supplier,
+                consol_supplier=consol_supplier or "the consolidation winner",
+                price=_format_money(awarded_price),
+                uom=item_uom,
+                n_responding=n_competing + 1,
+                savings_text_vs_history=savings_text_vs_history,
+            )
+        else:
+            # Default: lowest-priced award
+            tmpl_key = "lowest" if hist_price > 0 else "lowest_no_history"
+            primary = PRIMARY_REASON_TEMPLATES[tmpl_key].format(
+                supplier=awarded_supplier,
+                price=_format_money(awarded_price),
+                uom=item_uom,
+                n_competing_text=n_competing_text,
+                annual_value=_format_money(annual_value),
+                savings_text=savings_text,
+                hist_price=_format_money(hist_price),
+            )
+
+    # ---------- ALTERNATIVES CONSIDERED ----------
+    alt_lines = []
+    for sup, b in bids.items():
+        if sup == awarded_supplier:
+            continue
+        status = b.get("status")
+        price = b.get("price")
+        notes = b.get("notes") or ""
+        notes_excerpt = _excerpt_notes(notes, 120)
+        raw = b.get("raw") or {}
+        if status == "MISSING":
+            alt_lines.append(ALT_REASON_TEMPLATES["DID_NOT_RESPOND"].format(supplier=sup))
+        elif status == "NO_BID":
+            note_text = f' (\"{notes_excerpt}\")' if notes_excerpt else ""
+            alt_lines.append(ALT_REASON_TEMPLATES["NO_BID"].format(
+                supplier=sup,
+                notes_excerpt_text=note_text,
+            ))
+        elif status == "NEED_INFO":
+            alt_lines.append(ALT_REASON_TEMPLATES["NEED_INFO"].format(
+                supplier=sup,
+                notes_excerpt=notes_excerpt or "no detail provided",
+            ))
+        elif status == "UOM_DISC":
+            alt_lines.append(ALT_REASON_TEMPLATES["UOM_DISCREPANCY"].format(
+                supplier=sup,
+                price=_format_money(price),
+                uom=item_uom,
+                notes_excerpt=notes_excerpt or "UOM mismatch noted",
+            ))
+        elif status == "SUBSTITUTE":
+            alt_part = raw.get("sub_part") or "alternate part"
+            alt_desc = raw.get("sub_desc") or ""
+            alt_part_text = f"{alt_part}" + (f" — {alt_desc}" if alt_desc else "")
+            alt_lines.append(ALT_REASON_TEMPLATES["SUBSTITUTE_OFFERED"].format(
+                supplier=sup,
+                price=_format_money(price),
+                uom=item_uom,
+                alt_part_text=alt_part_text,
+            ))
+        elif price is not None and awarded_price is not None and price > 0 and awarded_price > 0:
+            # Outlier check
+            other_priced = [b2.get("price") for b2 in bids.values()
+                            if b2.get("price") is not None and b2.get("price") > 0]
+            if len(other_priced) >= 2:
+                med = _median(other_priced)
+                if med and price >= med * th["outlier_factor"]:
+                    alt_lines.append(ALT_REASON_TEMPLATES["OUTLIER_HIGH"].format(
+                        supplier=sup,
+                        price=_format_money(price),
+                        uom=item_uom,
+                        factor=price / med,
+                    ))
+                    continue
+                elif med and price <= med / th["outlier_factor"]:
+                    alt_lines.append(ALT_REASON_TEMPLATES["OUTLIER_LOW"].format(
+                        supplier=sup,
+                        price=_format_money(price),
+                        uom=item_uom,
+                        factor=price / med,
+                    ))
+                    continue
+            pct_higher = ((price - awarded_price) / awarded_price) if awarded_price else 0
+            alt_lines.append(ALT_REASON_TEMPLATES["PRICE_HIGHER"].format(
+                supplier=sup,
+                price=_format_money(price),
+                uom=item_uom,
+                pct_higher=_format_pct(pct_higher),
+            ))
+        else:
+            alt_lines.append(ALT_REASON_TEMPLATES["DID_NOT_RESPOND"].format(supplier=sup))
+
+    # ---------- EXPECTED OUTCOME ----------
+    if not awarded_supplier:
+        outcome = ""
+    elif qty == 0:
+        outcome = OUTCOME_TEMPLATES["ZERO_QTY"].format(
+            price=_format_money(awarded_price), uom=item_uom,
+        )
+    elif hist_price and hist_price > 0:
+        if awarded_price <= hist_price:
+            outcome = OUTCOME_TEMPLATES["WITH_SAVINGS"].format(
+                qty=f"{qty:,.0f}",
+                price=_format_money(awarded_price),
+                uom=item_uom,
+                annual_value=_format_money(annual_value),
+                hist_price=_format_money(hist_price),
+                savings_amount=_format_money(savings_value),
+                savings_pct=_format_pct(savings_value / historical_value if historical_value else 0),
+            )
+        else:
+            increase_pct = (awarded_price - hist_price) / hist_price if hist_price else 0
+            increase_amount = (awarded_price - hist_price) * qty
+            outcome = OUTCOME_TEMPLATES["WITH_INCREASE"].format(
+                qty=f"{qty:,.0f}",
+                price=_format_money(awarded_price),
+                uom=item_uom,
+                annual_value=_format_money(annual_value),
+                hist_price=_format_money(hist_price),
+                increase_pct=_format_pct(increase_pct),
+                increase_amount=_format_money(increase_amount),
+            )
+    else:
+        outcome = OUTCOME_TEMPLATES["NO_HISTORY"].format(
+            qty=f"{qty:,.0f}",
+            price=_format_money(awarded_price),
+            uom=item_uom,
+            annual_value=_format_money(annual_value),
+        )
+
+    # ---------- RISK FACTORS ----------
+    risks = []
+    if awarded_supplier:
+        # Single-source check
+        n_priced = sum(1 for b in bids.values() if b.get("price") is not None and b.get("price") > 0)
+        if n_priced == 1:
+            risks.append(RISK_TEMPLATES["SINGLE_SOURCE_AWARD"].format(supplier=awarded_supplier))
+        # UOM verification
+        awarded_bid = _bid_for(awarded_supplier)
+        if awarded_bid.get("status") == "UOM_DISC":
+            risks.append(RISK_TEMPLATES["UOM_VERIFICATION_REQUIRED"])
+        # Substitute pending
+        if awarded_bid.get("status") == "SUBSTITUTE":
+            raw = awarded_bid.get("raw") or {}
+            alt_part = raw.get("sub_part") or "an alternate part"
+            alt_desc = raw.get("sub_desc") or ""
+            alt_part_text = alt_part + (f" — {alt_desc}" if alt_desc else "")
+            risks.append(RISK_TEMPLATES["SUBSTITUTE_PENDING_VALIDATION"].format(alt_part_text=alt_part_text))
+    # Item-level risk flags (from comparison_row)
+    if comparison_row:
+        # Demand flags
+        # We don't have demand flags in comparison_row directly — they're on the
+        # underlying item record. Fetch from _STATE.items for completeness.
+        item_record = next(
+            (it for it in _STATE.get("items", []) if it["item_num"] == comparison_row.get("item_num")),
+            None,
+        )
+        if item_record:
+            dflags = item_record.get("demand_flags") or []
+            if "DORMANT_12MO" in dflags:
+                risks.append(RISK_TEMPLATES["DORMANT_ITEM"])
+            elif "SINGLE_ORDER" in dflags:
+                risks.append(RISK_TEMPLATES["ONE_TIME_BUY_HISTORY"])
+            elif "DEMAND_DROP_50" in dflags:
+                risks.append(RISK_TEMPLATES["DEMAND_VOLATILITY"].format(
+                    demand_change_text="a drop of more than 50% versus the prior 12 months"
+                ))
+            elif "DEMAND_SURGE_50" in dflags:
+                risks.append(RISK_TEMPLATES["DEMAND_VOLATILITY"].format(
+                    demand_change_text="a surge of more than 50% versus the prior 12 months"
+                ))
+            # Generic description
+            desc_flags = item_record.get("desc_flags") or []
+            if "generic" in desc_flags:
+                risks.append(RISK_TEMPLATES["GENERIC_DESCRIPTION"])
+
+    # ---------- METHODOLOGY NOTE ----------
+    strategy = (scenario or {}).get("strategy", "?")
+    parameters = (scenario or {}).get("parameters", {})
+    th = get_thresholds()
+    methodology = (
+        f"This award was generated under the \"{(scenario or {}).get('name', '?')}\" scenario "
+        f"using the {strategy} strategy"
+    )
+    if strategy == "consolidate_to" and parameters.get("supplier"):
+        methodology += f" with consolidation supplier set to {parameters['supplier']}"
+    methodology += (
+        f". Carve-out threshold at the time of decision: {_format_pct(th['carve_out_min_savings_pct'])}; "
+        f"minimum savings to switch from incumbent: {_format_pct(th['min_savings_pct_to_switch'])}; "
+        f"price-pushback threshold: {_format_pct(th['pushback_threshold_pct'])}; "
+        f"outlier factor: {th['outlier_factor']}×; "
+        f"UOM-suspect ratio: {th['uom_suspect_ratio']}×. "
+        f"All historical pricing reflects the trailing 24 months of order data; "
+        f"\"last paid price\" is the unit price of the most recent priced order line."
+    )
+
+    # ---------- COMPOSE FULL TEXT ----------
+    sections = []
+    if primary:
+        sections.append("PRIMARY REASON:\n" + primary)
+    if alt_lines:
+        sections.append("ALTERNATIVES CONSIDERED:\n" + "\n".join(f"• {l}" for l in alt_lines))
+    if outcome:
+        sections.append("EXPECTED OUTCOME:\n" + outcome)
+    if risks:
+        sections.append("RISK FACTORS / FOLLOW-UP ACTIONS:\n" + "\n".join(f"• {r}" for r in risks))
+    if methodology:
+        sections.append("METHODOLOGY:\n" + methodology)
+    full_text = "\n\n".join(sections)
+
+    return {
+        "primary_reason": primary,
+        "alternatives_considered": alt_lines,
+        "expected_outcome": outcome,
+        "risk_factors": risks,
+        "methodology_note": methodology,
+        "full_text": full_text,
+    }
+
+
+def gen_decision_log_xlsx(scenario_name: str, rfq_id: str = "",
+                          decided_by: str = "",
+                          retention_years: int = 7) -> bytes:
+    if not decided_by:
+        profile = get_user_profile()
+        decided_by = profile.get("name") or "(operator name not set)"
+    """Build the immutable, legal-hold decision log for one award scenario.
+
+    Captures every awarded item's full rationale + the methodology snapshot +
+    the audit log of all engine actions. Designed for retention for several
+    years; embeds data verbatim rather than re-deriving on reopen.
+    """
+    if not scenario_name:
+        raise ValueError("scenario_name required")
+    sc = _get_scenarios().get(scenario_name)
+    if not sc:
+        raise ValueError(f"No scenario named {scenario_name!r}")
+
+    evaluated = evaluate_award_scenario(scenario_name)
+    matrix = compute_comparison_matrix(included_keys=sc.get("included_keys"))
+    rows_by_key = {r["rfq_key"]: r for r in matrix["rows"]}
+
+    if not rfq_id:
+        rfq_id = f"RFQ-{datetime.now().strftime('%Y-%m')}-001"
+
+    th_snapshot = get_thresholds()
+    generated_at = datetime.now()
+    retention_until = datetime(generated_at.year + retention_years, generated_at.month, generated_at.day)
+
+    wb = Workbook()
+    HEADER_FILL = PatternFill("solid", fgColor="0a0e1a")
+    BANNER_FILL = PatternFill("solid", fgColor="1c2540")
+    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+    BANNER_FONT = Font(bold=True, color="ffb733", size=18)
+    LABEL_FONT = Font(bold=True, color="000000", size=11)
+    SECTION_FONT = Font(bold=True, color="000000", size=12)
+    NOTE_FONT = Font(italic=True, color="666666", size=10)
+
+    # ---- TAB 1: Cover + Provenance ----
+    ws = wb.active
+    ws.title = "Cover"
+    ws.append([f"DECISION LOG — {rfq_id}"])
+    ws["A1"].font = BANNER_FONT
+    ws.append([])
+    ws.append(["This is the official record of award decisions for the above RFQ."])
+    ws.append(["It is intended for retention as a defensible audit record of how each supplier was selected."])
+    ws.append([])
+    ws.append(["IMMUTABILITY NOTICE"])
+    ws[f"A{ws.max_row}"].font = SECTION_FONT
+    ws.append(["This document embeds the bid data, recommendation reasoning, threshold values, and audit trail"])
+    ws.append(["that were in effect at the time the awards were made. It is not regenerated from current state"])
+    ws.append(["and should not be modified after creation. If the underlying data, thresholds, or scenario"])
+    ws.append(["change, generate a new decision log dated to that change rather than editing this one."])
+    ws.append([])
+    ws.append(["RFQ Provenance"])
+    ws[f"A{ws.max_row}"].font = SECTION_FONT
+    rows_meta = [
+        ("RFQ ID", rfq_id),
+        ("Scenario name", scenario_name),
+        ("Award strategy", sc.get("strategy")),
+        ("Strategy parameters", json.dumps(sc.get("parameters") or {}, default=str) or "{}"),
+        ("Items in scenario", evaluated.get("n_items")),
+        ("Items awarded", evaluated.get("n_awarded")),
+        ("Items not awarded", evaluated.get("n_no_award")),
+        ("Manual overrides", evaluated.get("n_manual_overrides")),
+        ("Carve-outs (consolidation)", evaluated.get("n_carved", 0)),
+        ("Total awarded value (annualized)", evaluated.get("award_total")),
+        ("Historical baseline (annualized)", evaluated.get("historical_total")),
+        ("Estimated annual savings", evaluated.get("savings_total")),
+        ("Estimated savings %", f"{evaluated.get('savings_pct', 0):.1f}%"),
+        ("", ""),
+        ("Decided by", decided_by),
+        ("Decision date", generated_at.strftime("%Y-%m-%d %H:%M")),
+        ("Retain until at least", retention_until.strftime("%Y-%m-%d") + f"  ({retention_years}-year retention)"),
+        ("Tool version", "auto-rfq-banana"),
+    ]
+    for label, value in rows_meta:
+        ws.append([label, value])
+    # Format $ rows
+    for r_idx, (label, _) in enumerate(rows_meta, start=ws.max_row - len(rows_meta) + 1):
+        if "value" in label.lower() or "baseline" in label.lower() or "savings" in label.lower():
+            try:
+                cell = ws.cell(row=r_idx, column=2)
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = "$#,##0.00"
+            except Exception:
+                pass
+    ws.column_dimensions["A"].width = 40
+    ws.column_dimensions["B"].width = 80
+
+    # ---- TAB 2: Threshold Snapshot ----
+    ws_th = wb.create_sheet("Thresholds At Decision Time")
+    ws_th.append([f"Threshold Snapshot — {generated_at.strftime('%Y-%m-%d %H:%M')}"])
+    ws_th["A1"].font = SECTION_FONT
+    ws_th.append([])
+    ws_th.append(["These are the engine threshold values that were in effect when the awards were made."])
+    ws_th.append(["If thresholds are changed later, this record reflects the values used at decision time, not current values."])
+    ws_th.append([])
+    ws_th.append(["Threshold key", "Value at decision time"])
+    for c in ws_th[ws_th.max_row]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    for k, v in th_snapshot.items():
+        ws_th.append([k, v])
+    ws_th.column_dimensions["A"].width = 40
+    ws_th.column_dimensions["B"].width = 25
+
+    # ---- TAB 3: Award-by-Item Rationale ----
+    ws3 = wb.create_sheet("Award Rationale")
+    ws3.append([
+        "Item #", "Description", "MFG", "MFG PN", "Annual Qty", "UOM",
+        "Awarded Supplier", "Awarded Price", "Annual Award Value",
+        "Historical Price", "Annual Savings",
+        "Decision Basis (engine)",
+        "Primary Reason",
+        "Alternatives Considered",
+        "Expected Outcome",
+        "Risk Factors",
+        "Methodology Note",
+    ])
+    for c in ws3[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for award in sorted(evaluated.get("awards", []),
+                        key=lambda a: a.get("awarded_value") or 0, reverse=True):
+        comp_row = rows_by_key.get(award.get("rfq_key"), {})
+        rationale = generate_award_rationale(award, comp_row, sc)
+        item_record = next((it for it in _STATE.get("items", []) if it["item_num"] == award.get("item_num")), {})
+        ws3.append([
+            award.get("item_num"),
+            award.get("description"),
+            item_record.get("mfg_name", ""),
+            item_record.get("mfg_pn", ""),
+            award.get("qty_24mo"),
+            item_record.get("uom", ""),
+            award.get("awarded_supplier") or "(no award)",
+            award.get("awarded_price"),
+            award.get("awarded_value") or 0,
+            award.get("historical_price") or 0,
+            award.get("savings_value") or 0,
+            award.get("decision_basis") or "",
+            rationale["primary_reason"],
+            "\n".join(f"• {l}" for l in rationale["alternatives_considered"]),
+            rationale["expected_outcome"],
+            "\n".join(f"• {r}" for r in rationale["risk_factors"]),
+            rationale["methodology_note"],
+        ])
+    # Number formats
+    for r in ws3.iter_rows(min_row=2, min_col=5, max_col=5):
+        for c in r: c.number_format = "#,##0"
+    for r in ws3.iter_rows(min_row=2, min_col=8, max_col=11):
+        for c in r: c.number_format = "$#,##0.00"
+    # Wrap rationale columns
+    for r in ws3.iter_rows(min_row=2, min_col=13, max_col=17):
+        for c in r:
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+    # Column widths
+    ws3.column_dimensions["A"].width = 16
+    ws3.column_dimensions["B"].width = 40
+    ws3.column_dimensions["C"].width = 18
+    ws3.column_dimensions["D"].width = 18
+    ws3.column_dimensions["E"].width = 11
+    ws3.column_dimensions["F"].width = 8
+    ws3.column_dimensions["G"].width = 18
+    ws3.column_dimensions["H"].width = 14
+    ws3.column_dimensions["I"].width = 16
+    ws3.column_dimensions["J"].width = 14
+    ws3.column_dimensions["K"].width = 14
+    ws3.column_dimensions["L"].width = 32
+    ws3.column_dimensions["M"].width = 90
+    ws3.column_dimensions["N"].width = 70
+    ws3.column_dimensions["O"].width = 70
+    ws3.column_dimensions["P"].width = 60
+    ws3.column_dimensions["Q"].width = 80
+    ws3.freeze_panes = "A2"
+
+    # ---- TAB 4: Bid Data Preserved (immutable record of bids received) ----
+    ws4 = wb.create_sheet("Bid Data")
+    ws4.append([
+        "Item #", "Supplier", "Status", "Quoted Price", "Verified Price",
+        "Effective Price", "Quoted UOM", "Notes",
+        "Their Part #", "Alternate Part Offered", "Alternate Description",
+    ])
+    for c in ws4[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+    for sup, parsed in bids_by_supplier.items():
+        for b in parsed.get("bids", []):
+            # Only include bids for items in this scenario
+            if sc.get("included_keys") is not None:
+                # Match by item_num to scenario's included_keys
+                pass
+            ws4.append([
+                b.get("item_num", "") or b.get("part_number", ""),
+                sup,
+                b.get("status", ""),
+                b.get("quoted_price"),
+                b.get("verified_price"),
+                b.get("effective_price"),
+                b.get("uom", ""),
+                _excerpt_notes(b.get("notes", ""), 200),
+                b.get("exact_part") or b.get("part_number", ""),
+                b.get("sub_part", ""),
+                b.get("sub_desc", ""),
+            ])
+    for r in ws4.iter_rows(min_row=2, min_col=4, max_col=6):
+        for c in r: c.number_format = "$#,##0.00"
+    autosize(ws4, max_w=50)
+    ws4.freeze_panes = "A2"
+
+    # ---- TAB 5: Audit Trail ----
+    ws5 = wb.create_sheet("Audit Trail")
+    ws5.append(["Timestamp", "Action", "Detail", "Related"])
+    for c in ws5[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    for entry in list_audit_log():
+        ws5.append([
+            entry.get("timestamp", ""),
+            entry.get("action_type", ""),
+            entry.get("action_detail", ""),
+            entry.get("related", ""),
+        ])
+    autosize(ws5, max_w=80)
+    ws5.freeze_panes = "A2"
+
+    # ---- TAB 6: Methodology Notes ----
+    ws6 = wb.create_sheet("Methodology")
+    ws6.append(["How the engine made these decisions"])
+    ws6["A1"].font = SECTION_FONT
+    ws6.append([])
+    methodology_paragraphs = [
+        "Item identity: Items are identified by an internal key derived from the Andersen Item Number, falling back to EAM Part Number, then to the supplier's catalog Part Number. For most Andersen suppliers EAM is the primary identifier; cXML / PunchOut suppliers (e.g. McMaster) frequently leave Item # and EAM blank, in which case the supplier's own catalog SKU is used as the join key.",
+        "Window aggregations: Quantities and spend are aggregated across rolling 12-month, 24-month, and 36-month windows anchored to the most recent order date in the source data. The annualized quantity used for award value calculations is the trailing 24-month quantity divided by 2.",
+        "Last paid price: The unit price of the most recent priced order line. No medians, smoothing, or rolling averages are used in displayed RFQ pricing — to-the-penny precision is preserved throughout. Where this may obscure a price spike, a separate analytical reference (90-day median) is shown on the per-item drill-down chart but is not used in award math.",
+        "Recommendation engine: Each item with bids receives a deterministic recommendation in one of five categories: ACCEPT, PUSH_BACK, ASK_CLARIFICATION, EXCLUDE, or MANUAL_REVIEW. The decision rules are evaluated in priority order: no-bid → EXCLUDE; all-need-info → ASK_CLARIFICATION; UOM discrepancy on lowest bid → ASK_CLARIFICATION; substitute on lowest bid → ASK_CLARIFICATION; lowest bid above the historical baseline by more than the pushback threshold → PUSH_BACK; statistical outlier → MANUAL_REVIEW; savings exceed the switch threshold → ACCEPT; otherwise MANUAL_REVIEW.",
+        "Award scenarios: The actual awards in this decision log were generated under a named scenario with one of five strategies — lowest_price, lowest_qualified, consolidate_to (with a named consolidation supplier), incumbent_preferred, or manual. Manual overrides at the per-item level take precedence over scenario logic.",
+        "Consolidation with carve-outs: The default award strategy at Andersen for this category is to consolidate the bulk of items to a single supplier and to carve out individual items where another supplier saves significantly more. The carve-out threshold (the per-item savings vs the consolidation winner that triggers a carve-out) is recorded in the Threshold Snapshot tab.",
+        "UOM-discrepancy guard: Carve-outs where the alternative supplier flagged a unit-of-measure mismatch (or where the price ratio versus the consolidation winner is extreme) are flagged separately and excluded from counted savings until the supplier confirms the UOM. This prevents false-positive savings from per-each vs per-package pricing mismatches.",
+        "Cross-supplier isolation: Every supplier-bound output (RFQ files, award letters, follow-up packets) is filtered at write time to a single supplier's data. A defensive cell-level scan refuses the export if any other supplier's name appears in the workbook. The verify_isolation.py sibling script provides a third-party cross-check on a folder of outputs.",
+    ]
+    for p in methodology_paragraphs:
+        ws6.append([p])
+        cell = ws6.cell(row=ws6.max_row, column=1)
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws6.row_dimensions[ws6.max_row].height = 75
+    ws6.column_dimensions["A"].width = 130
+
+    log_event("gen_decision_log", f"scenario={scenario_name} / awards={evaluated.get('n_awarded')}", related=rfq_id)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def gen_decision_log_markdown(scenario_name: str, rfq_id: str = "",
+                              decided_by: str = "",
+                              retention_years: int = 7) -> str:
+    """Markdown version of the decision log. Designed to be pasted into
+    Microsoft 365 Copilot (which is IT-approved at Andersen) to ask
+    follow-up questions, generate executive summaries, draft email replies
+    to suppliers, etc. — without ever putting the data through a
+    third-party AI from inside this app."""
+    if not decided_by:
+        decided_by = (get_user_profile().get("name") or "(operator name not set)")
+    sc = _get_scenarios().get(scenario_name)
+    if not sc:
+        raise ValueError(f"No scenario named {scenario_name!r}")
+    evaluated = evaluate_award_scenario(scenario_name)
+    matrix = compute_comparison_matrix(included_keys=sc.get("included_keys"))
+    rows_by_key = {r["rfq_key"]: r for r in matrix["rows"]}
+    th = get_thresholds()
+    if not rfq_id:
+        rfq_id = f"RFQ-{datetime.now().strftime('%Y-%m')}-001"
+    generated = datetime.now()
+    retention_until = datetime(generated.year + retention_years, generated.month, generated.day)
+
+    out = []
+    out.append(f"# Decision Log — {rfq_id}")
+    out.append("")
+    out.append("> **How to use this file with Copilot**")
+    out.append(">")
+    out.append("> This markdown file mirrors the contents of the decision log xlsx. ")
+    out.append("> M365 Copilot is approved at Andersen, so you can paste the relevant section ")
+    out.append("> into Copilot Chat to ask follow-up questions, draft an email summary for a ")
+    out.append("> supplier, generate an executive briefing, or stress-test the rationale. ")
+    out.append("> Examples of useful Copilot prompts:")
+    out.append("> - *\"Summarize this decision log into a 5-bullet executive briefing.\"*")
+    out.append("> - *\"Draft a polite reply to {supplier} explaining why they were not awarded.\"*")
+    out.append("> - *\"List any items where the rationale relies on a single bid — these need follow-up.\"*")
+    out.append("> - *\"Extract every push-back recommendation as a checklist for next round.\"*")
+    out.append("")
+    out.append("## Provenance")
+    out.append("")
+    out.append(f"- **RFQ ID:** {rfq_id}")
+    out.append(f"- **Scenario:** {scenario_name} ({sc.get('strategy')})")
+    out.append(f"- **Decided by:** {decided_by}")
+    out.append(f"- **Decision date:** {generated.strftime('%Y-%m-%d %H:%M')}")
+    out.append(f"- **Retain until at least:** {retention_until.strftime('%Y-%m-%d')}  ({retention_years}-year retention)")
+    out.append("")
+    out.append("## Headline numbers")
+    out.append("")
+    out.append(f"- Items in scenario: **{evaluated.get('n_items'):,}**")
+    out.append(f"- Items awarded: **{evaluated.get('n_awarded'):,}**")
+    out.append(f"- Items not awarded: {evaluated.get('n_no_award'):,}")
+    out.append(f"- Manual overrides: {evaluated.get('n_manual_overrides'):,}")
+    out.append(f"- Carve-outs: {evaluated.get('n_carved', 0):,}")
+    out.append(f"- Total awarded value (annualized): **${evaluated.get('award_total'):,.2f}**")
+    out.append(f"- Historical baseline (annualized): ${evaluated.get('historical_total'):,.2f}")
+    out.append(f"- Estimated annual savings: **${evaluated.get('savings_total'):,.2f}** (~{evaluated.get('savings_pct',0):.1f}%)")
+    out.append("")
+    out.append("## Thresholds at decision time")
+    out.append("")
+    out.append("| Threshold | Value |")
+    out.append("| --- | --- |")
+    for k, v in th.items():
+        out.append(f"| {k} | {v} |")
+    out.append("")
+    out.append("## Per-item award rationale")
+    out.append("")
+    awards_sorted = sorted(evaluated.get("awards", []),
+                           key=lambda a: a.get("awarded_value") or 0, reverse=True)
+    for a in awards_sorted:
+        comp_row = rows_by_key.get(a.get("rfq_key"), {})
+        rationale = generate_award_rationale(a, comp_row, sc)
+        item = a.get("item_num", "?")
+        sup = a.get("awarded_supplier") or "(no award)"
+        price = a.get("awarded_price")
+        price_str = f"${price:.2f}" if price is not None else "—"
+        annual = a.get("awarded_value") or 0
+        out.append(f"### {item} — awarded to **{sup}** at {price_str}")
+        out.append("")
+        out.append(f"*Annual award value: ${annual:,.2f}  ·  Decision basis: `{a.get('decision_basis') or ''}`*")
+        out.append("")
+        out.append("**Primary reason:**  ")
+        out.append(rationale["primary_reason"])
+        out.append("")
+        if rationale["alternatives_considered"]:
+            out.append("**Alternatives considered:**")
+            for alt in rationale["alternatives_considered"]:
+                out.append(f"- {alt}")
+            out.append("")
+        if rationale["expected_outcome"]:
+            out.append("**Expected outcome:**  ")
+            out.append(rationale["expected_outcome"])
+            out.append("")
+        if rationale["risk_factors"]:
+            out.append("**Risk factors / follow-up actions:**")
+            for r in rationale["risk_factors"]:
+                out.append(f"- {r}")
+            out.append("")
+        out.append("---")
+        out.append("")
+    out.append("")
+    out.append("## Methodology")
+    out.append("")
+    methodology_paragraphs = [
+        "Item identity: Items are identified by an internal key derived from the Andersen Item Number, falling back to EAM Part Number, then to the supplier's catalog Part Number.",
+        "Window aggregations: Quantities and spend are aggregated across rolling 12-month, 24-month, and 36-month windows anchored to the most recent order date in the source data.",
+        "Last paid price: The unit price of the most recent priced order line. No medians or smoothing in displayed RFQ pricing.",
+        "Recommendation engine: Each item with bids gets a deterministic 5-tier recommendation (ACCEPT / PUSH_BACK / ASK_CLARIFICATION / EXCLUDE / MANUAL_REVIEW) with a concrete reason string.",
+        "Award scenarios: Awards generated under one of five strategies — lowest_price, lowest_qualified, consolidate_to (with a named consolidation supplier), incumbent_preferred, or manual.",
+        "UOM-discrepancy guard: Carve-outs flagged with a UOM warning are excluded from counted savings until the supplier confirms.",
+        "Cross-supplier isolation: Every supplier-bound output filters to a single supplier's data; defensive cell-level scan refuses export if any other supplier's name appears.",
+    ]
+    for p in methodology_paragraphs:
+        out.append(f"- {p}")
+    log_event("gen_decision_log_md", f"scenario={scenario_name}", related=rfq_id)
+    return "\n".join(out)
 
 
 def gen_internal_award_summary_xlsx(scenario_name: str, rfq_id: str = "") -> bytes:
