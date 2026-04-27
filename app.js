@@ -803,7 +803,20 @@ function _renderItemHistory(h) {
   const t = h.trend || {};
   const trendLbl = `slope $${t.slope_per_day != null ? (t.slope_per_day * 365).toFixed(2) : '—'}/yr · R² ${t.r2 != null ? t.r2.toFixed(2) : '—'} · ${t.confidence || ''}`;
   document.getElementById('im-trend-label').textContent = trendLbl;
+
+  // Build callout — lead with spike if there is one (most actionable)
   let callout = '';
+  const calloutEl = document.getElementById('im-trend-callout');
+  calloutEl.style.borderColor = '';
+  calloutEl.style.background = 'var(--bg-2)';
+  if (t.spike && t.spike.is_spike) {
+    const direction = t.spike.pct_diff > 0 ? 'above' : 'below';
+    callout = `<strong style="color:var(--red);">⚠ PRICE SPIKE</strong> &nbsp; Latest line $${t.latest_unit_price.toFixed(2)} is <strong style="color:var(--red);">${Math.abs(t.spike.pct_diff).toFixed(0)}% ${direction}</strong> the ${t.median_window_label} ($${t.median_90d.toFixed(2)}). Worth confirming this isn't a one-off price hike before the RFQ goes out.`;
+    calloutEl.style.borderColor = 'var(--red)';
+    calloutEl.style.background = 'rgba(255,77,109,0.08)';
+  } else if (t.spike) {
+    callout = t.spike.message + '.';
+  }
   if (t.expected_today != null) {
     const expected = '$' + t.expected_today.toFixed(2);
     const last = s.last_unit_price != null ? '$' + s.last_unit_price.toFixed(2) : '—';
@@ -812,11 +825,12 @@ function _renderItemHistory(h) {
           ? `${t.days_since_last_order} days ago`
           : `${(t.days_since_last_order / 30).toFixed(1)} months ago`)
       : '—';
-    callout = `Last actual order: ${last} · ${ago}. Expected price today (linear extrapolation): <strong style="color:var(--accent);">${expected}</strong>. Confidence: ${t.confidence} (${t.confidence_reason}).`;
-  } else if (t.confidence_reason) {
+    const trendLine = `<br><br>Last actual order: ${last} · ${ago}. Trend extrapolation to today: <strong style="color:var(--accent);">${expected}</strong>. Confidence: ${t.confidence} (${t.confidence_reason}).`;
+    callout += trendLine;
+  } else if (!callout && t.confidence_reason) {
     callout = `Trend: ${t.confidence_reason}.`;
   }
-  document.getElementById('im-trend-callout').innerHTML = callout;
+  calloutEl.innerHTML = callout;
 
   // Order lines table
   const tbody = document.getElementById('im-lines-body');
@@ -904,13 +918,38 @@ function _drawItemHistoryChart(h) {
     }
   }
 
-  // Order points (size scaled by qty for a hint of order volume)
+  // 90-day median reference line — analytical baseline for spike detection
+  if (t.median_90d != null) {
+    const yMed = yScale(t.median_90d);
+    s += `<line x1="${padL}" y1="${yMed}" x2="${padL + innerW}" y2="${yMed}" stroke="var(--ink-2)" stroke-dasharray="6,4" opacity="0.45"/>`;
+    s += `<text x="${padL + 6}" y="${yMed - 4}" fill="var(--ink-2)" font-family="var(--mono)" font-size="9" letter-spacing="0.08em">90-DAY MEDIAN $${t.median_90d.toFixed(2)}</text>`;
+  }
+
+  // Order points (size scaled by qty). Most-recent point is rendered LAST
+  // and styled red+larger so price spikes pop visually.
   const maxQty = Math.max(1, ...points.map(p => p.qty || 1));
-  for (const p of points) {
+  const lastPoint = points[points.length - 1];
+  const isSpike = t.spike && t.spike.is_spike;
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
     const x = xScale(p.date);
     const y = yScale(p.price);
+    const isLast = (i === points.length - 1);
+    if (isLast) continue; // draw last separately
     const r = Math.max(2.5, Math.min(6, 2.5 + (p.qty / maxQty) * 4));
-    s += `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--accent)" opacity="0.85"/>`;
+    s += `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--accent)" opacity="0.78"/>`;
+  }
+  // Last point — bigger, red if spike, with a price label
+  if (lastPoint) {
+    const x = xScale(lastPoint.date);
+    const y = yScale(lastPoint.price);
+    const fill = isSpike ? 'var(--red)' : 'var(--accent)';
+    s += `<circle cx="${x}" cy="${y}" r="8" fill="${fill}" opacity="0.25"/>`;
+    s += `<circle cx="${x}" cy="${y}" r="5" fill="${fill}"/>`;
+    const labelOffsetX = (x > padL + innerW * 0.7) ? -10 : 12;
+    const labelAnchor = (x > padL + innerW * 0.7) ? 'end' : 'start';
+    s += `<text x="${x + labelOffsetX}" y="${y - 8}" text-anchor="${labelAnchor}" fill="${fill}" font-family="var(--mono)" font-size="11" font-weight="700">$${lastPoint.price.toFixed(2)}</text>`;
+    s += `<text x="${x + labelOffsetX}" y="${y + 14}" text-anchor="${labelAnchor}" fill="var(--ink-2)" font-family="var(--mono)" font-size="9" letter-spacing="0.08em">LATEST</text>`;
   }
 
   // Expected-today marker

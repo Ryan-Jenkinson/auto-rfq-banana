@@ -787,6 +787,14 @@ def _linear_fit(xs, ys):
     return (slope, intercept, r2)
 
 
+def _median(values):
+    if not values:
+        return None
+    s = sorted(values)
+    mid = len(s) // 2
+    return (s[mid] + s[~mid]) / 2.0
+
+
 def get_item_history(item_num: str) -> dict:
     """Return the per-item drill-down payload for the modal.
 
@@ -867,6 +875,61 @@ def get_item_history(item_num: str) -> dict:
         confidence = "high"
         confidence_reason = f"R² {r2:.2f}"
 
+    # 90-day median price (analytical reference — separate from the to-the-penny
+    # last_unit_price). Used as the "is the latest line a price spike" baseline
+    # on the chart. Falls back to median of last 10 lines if <3 within 90 days.
+    median_90d = None
+    median_window_label = None
+    if first_dt and ys:
+        try:
+            recent_dt = datetime.fromisoformat(line_dicts[-1]["date"])
+            cutoff_90 = recent_dt - timedelta(days=90)
+            recent_prices = [
+                ln["unit_price"] for ln in line_dicts
+                if ln["date"] and ln["unit_price"] is not None
+                and datetime.fromisoformat(ln["date"]) >= cutoff_90
+            ]
+            if len(recent_prices) >= 3:
+                median_90d = _median(recent_prices)
+                median_window_label = f"90-day median ({len(recent_prices)} lines)"
+            else:
+                fallback = sorted(line_dicts, key=lambda x: x["date"], reverse=True)[:10]
+                fp = [ln["unit_price"] for ln in fallback if ln["unit_price"] is not None]
+                if fp:
+                    median_90d = _median(fp)
+                    median_window_label = f"median of last {len(fp)} lines"
+        except (ValueError, TypeError):
+            pass
+
+    # Spike detection — compare latest unit price to median_90d.
+    # Use the SAME selection rule as the table's LAST $/ea: max by (date, po)
+    # so ties on the most recent date pick the highest PO # (later transaction).
+    priced_only = [(l[0], l[4], l[2]) for l in po_lines if l[2] is not None]
+    if priced_only:
+        latest_tuple = max(priced_only, key=lambda x: (x[0] or "", x[1] or ""))
+        latest_unit_price = latest_tuple[2]
+    else:
+        latest_unit_price = None
+    spike = None
+    if latest_unit_price is not None and median_90d and median_90d > 0:
+        ratio = latest_unit_price / median_90d
+        pct_diff = (ratio - 1.0) * 100.0
+        if ratio >= 1.5 or ratio <= 0.5:
+            direction = "above" if ratio > 1 else "below"
+            spike = {
+                "is_spike": True,
+                "ratio": ratio,
+                "pct_diff": pct_diff,
+                "message": f"Latest price ${latest_unit_price:,.2f} is {abs(pct_diff):.0f}% {direction} {median_window_label} (${median_90d:,.2f})",
+            }
+        else:
+            spike = {
+                "is_spike": False,
+                "ratio": ratio,
+                "pct_diff": pct_diff,
+                "message": f"Latest ${latest_unit_price:,.2f} vs {median_window_label} ${median_90d:,.2f} ({pct_diff:+.0f}%)",
+            }
+
     return {
         "item_num": item_num,
         "description": item["description"] if item else "",
@@ -898,6 +961,10 @@ def get_item_history(item_num: str) -> dict:
             "expected_today": expected_today,
             "days_since_last_order": days_since_last,
             "anchor_date": anchor,
+            "latest_unit_price": latest_unit_price,
+            "median_90d": median_90d,
+            "median_window_label": median_window_label,
+            "spike": spike,
         },
     }
 
