@@ -1201,7 +1201,11 @@ function _renderScenariosBlock(scenarios, consol) {
       <td style="padding:12px 14px;text-align:right;color:var(--green);font-weight:600;">${fmt$(t.savings_total)} <span style="color:var(--ink-2);">(${fmtPct(t.savings_pct)})</span></td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${(t.items_switched||0).toLocaleString()}</td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-2);font-size:11px;">${(s.saved_at||'').slice(0,16).replace('T',' ')}</td>
-      <td style="padding:12px 14px;text-align:right;"><button class="btn ghost" data-scen-delete="${_escapeHtml(s.name)}" style="padding:4px 10px;font-size:11px;">×</button></td>
+      <td style="padding:12px 14px;text-align:right;white-space:nowrap;">
+        <button class="btn ghost" data-scen-letters="${_escapeHtml(s.name)}" title="Generate one award letter xlsx per awarded supplier" style="padding:4px 10px;font-size:11px;">📨 Letters</button>
+        <button class="btn ghost" data-scen-summary="${_escapeHtml(s.name)}" title="Generate the internal-audience full-detail summary xlsx" style="padding:4px 10px;font-size:11px;">📊 Internal</button>
+        <button class="btn ghost" data-scen-delete="${_escapeHtml(s.name)}" style="padding:4px 10px;font-size:11px;">×</button>
+      </td>
     </tr>`;
   }
   html += '</tbody></table></div>';
@@ -1237,6 +1241,83 @@ delete_award_scenario(_scen_name)
   });
   if ($('scen-compare-btn')) {
     $('scen-compare-btn').addEventListener('click', _runScenarioCompare);
+  }
+  document.querySelectorAll('[data-scen-letters]').forEach(btn => {
+    btn.addEventListener('click', () => _generateAwardLetters(btn.getAttribute('data-scen-letters'), btn));
+  });
+  document.querySelectorAll('[data-scen-summary]').forEach(btn => {
+    btn.addEventListener('click', () => _generateInternalSummary(btn.getAttribute('data-scen-summary'), btn));
+  });
+}
+
+async function _generateAwardLetters(scenarioName, btn) {
+  const today = new Date();
+  const rfqId = prompt('RFQ ID for the award letters:', `RFQ-${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-001`);
+  if (!rfqId) return;
+  if (btn) { btn.disabled = true; var orig = btn.textContent; btn.textContent = 'Generating…'; }
+  try {
+    _py.globals.set('_letters_scenario', scenarioName);
+    _py.globals.set('_letters_rfq_id', rfqId);
+    const out = await _py.runPythonAsync(`
+import base64, json
+from app_engine import gen_award_letters_for_scenario
+_letters = gen_award_letters_for_scenario(_letters_scenario, rfq_id=_letters_rfq_id)
+# Encode to base64 dict for JS
+_encoded = {k: (base64.b64encode(v).decode('ascii') if v is not None else None) for k, v in _letters.items()}
+json.dumps(_encoded)
+`);
+    const letters = JSON.parse(out);
+    let dl = 0, skip = 0;
+    for (const [supplier, b64] of Object.entries(letters)) {
+      if (b64 === null) { skip++; continue; }
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const safeSup = supplier.replace(/[^a-zA-Z0-9_-]/g, '_');
+      a.href = url;
+      a.download = `AwardLetter_${safeSup}_${rfqId}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      dl++;
+      await new Promise(r => setTimeout(r, 300));
+    }
+    alert(`Generated ${dl} award letter${dl === 1 ? '' : 's'}.${skip ? ` (${skip} skipped — no awards or isolation issue)` : ''}\n\nReminder: each file contains ONLY its intended supplier's awards. Run verify_isolation.py against the download folder before sending if you want a third-party cross-check.`);
+  } catch (err) {
+    console.error('[award letters]', err);
+    alert('Award letter generation failed: ' + (err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
+  }
+}
+
+async function _generateInternalSummary(scenarioName, btn) {
+  if (btn) { btn.disabled = true; var orig = btn.textContent; btn.textContent = 'Generating…'; }
+  try {
+    const today = new Date();
+    const rfqId = `RFQ-${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-001`;
+    _py.globals.set('_summary_scenario', scenarioName);
+    _py.globals.set('_summary_rfq_id', rfqId);
+    const xlsxB64 = await _py.runPythonAsync(`
+import base64
+from app_engine import gen_internal_award_summary_xlsx
+_b = gen_internal_award_summary_xlsx(_summary_scenario, rfq_id=_summary_rfq_id)
+base64.b64encode(_b).decode('ascii')
+`);
+    const bytes = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
+    const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const safeName = scenarioName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    a.href = url;
+    a.download = `INTERNAL_${safeName}_${rfqId}.xlsx`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  } catch (err) {
+    console.error('[internal summary]', err);
+    alert('Internal summary generation failed: ' + (err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
   }
 }
 

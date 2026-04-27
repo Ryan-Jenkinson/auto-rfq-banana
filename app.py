@@ -3311,6 +3311,307 @@ def compare_award_scenarios(name_a: str, name_b: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Award letter xlsx generator — per-supplier, with strict isolation guard.
+#
+# Generates one xlsx per awarded supplier from a saved scenario. Hard rule:
+# every row in the output filters to a single awarded_supplier; defensive
+# double-check at write refuses the export if any row carries another
+# supplier's id. No other supplier's bids, no internal target / cost /
+# margin in the file.
+# ---------------------------------------------------------------------------
+
+class IsolationViolation(Exception):
+    """Raised if an award letter would contain rows for a supplier other than
+    the named one. Blocks the export rather than silently leaking data."""
+
+
+def gen_award_letter_xlsx(scenario_name: str, supplier_name: str,
+                          rfq_id: str = "",
+                          contact_name: str = "Ryan Jenkinson",
+                          contact_email: str = "ryan.jenkinson@andersencorp.com") -> bytes:
+    """Build the award-letter xlsx for one awarded supplier from a saved
+    scenario. Strict isolation enforced both during row collection and
+    via a defensive re-scan before write."""
+    if not scenario_name:
+        raise ValueError("scenario_name required")
+    if not supplier_name:
+        raise ValueError("supplier_name required")
+
+    evaluated = evaluate_award_scenario(scenario_name)
+    all_awards = evaluated.get("awards", [])
+    # Strict filter: only this supplier's awards
+    rows = [a for a in all_awards if a.get("awarded_supplier") == supplier_name]
+    if not rows:
+        raise ValueError(
+            f"No items awarded to {supplier_name!r} in scenario {scenario_name!r}. "
+            f"Nothing to send."
+        )
+
+    # Defensive: scan again to be absolutely sure
+    for r in rows:
+        actual = r.get("awarded_supplier")
+        if actual != supplier_name:
+            raise IsolationViolation(
+                f"Row {r.get('item_num')!r} has awarded_supplier={actual!r}, "
+                f"expected {supplier_name!r}. Refusing to export."
+            )
+
+    if not rfq_id:
+        rfq_id = f"RFQ-{datetime.now().strftime('%Y-%m')}-001"
+
+    award_total = sum((r.get("awarded_value") or 0) for r in rows)
+    n_items = len(rows)
+
+    wb = Workbook()
+    HEADER_FILL = PatternFill("solid", fgColor="0a0e1a")
+    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+    BANNER_FONT = Font(bold=True, color="ffb733", size=16)
+    LABEL_FONT = Font(bold=True, color="000000", size=11)
+    THIN = Side(border_style="thin", color="999999")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+    # ---- TAB 1: Cover ----
+    ws = wb.active
+    ws.title = "Award Letter"
+    ws.append([f"AWARD NOTIFICATION — {rfq_id}"])
+    ws["A1"].font = BANNER_FONT
+    ws.append([])
+    ws.append([f"Awarded to: {supplier_name}"])
+    ws["A3"].font = LABEL_FONT
+    ws.append([f"Award date: {datetime.now().strftime('%Y-%m-%d')}"])
+    ws.append([f"Items awarded: {n_items:,}"])
+    ws.append([f"Estimated annual value (at quoted prices): ${award_total:,.2f}"])
+    ws.append([f"Contact: {contact_name} — {contact_email}"])
+    ws.append([])
+    ws.append(["Notification of award"])
+    ws[f"A{ws.max_row}"].font = LABEL_FONT
+    body = [
+        f"This letter confirms that {supplier_name} has been awarded the items listed in the 'Awarded Items' tab,",
+        "based on your response to our recent Request for Quotation. Awards are issued at the unit prices you",
+        "quoted; estimated annual quantities are based on our prior 24 months of consumption and may vary.",
+        "",
+        "Purchase orders will be issued on a per-need basis. Pricing is firm through the validity period you",
+        "indicated in your quote, or 90 days from this notification, whichever is later, unless otherwise agreed.",
+        "",
+        "If you cannot fulfill any awarded item at the quoted price, please notify us within 5 business days.",
+        "",
+        "Please confirm receipt of this award by replying to the contact above.",
+    ]
+    for line in body:
+        ws.append([line])
+    ws.column_dimensions["A"].width = 110
+    for r_idx in range(1, ws.max_row + 1):
+        ws.cell(row=r_idx, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+
+    # ---- TAB 2: Awarded Items ----
+    ws2 = wb.create_sheet("Awarded Items")
+    headers = [
+        "Line #", "Andersen Item #", "Description",
+        "Estimated Annual Qty", "Awarded Unit Price", "Estimated Annual Value",
+        "Decision basis",
+    ]
+    ws2.append(headers)
+    for c in ws2[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        c.border = BORDER
+    # Sort by value desc so the biggest awards are at the top
+    sorted_rows = sorted(rows, key=lambda r: r.get("awarded_value") or 0, reverse=True)
+    for i, r in enumerate(sorted_rows, start=1):
+        ws2.append([
+            i,
+            r.get("item_num") or "",
+            r.get("description") or "",
+            r.get("qty_24mo") or 0,
+            r.get("awarded_price"),
+            r.get("awarded_value") or 0,
+            r.get("decision_basis") or "",
+        ])
+    # Number formats
+    for r in ws2.iter_rows(min_row=2, min_col=4, max_col=4):
+        for c in r: c.number_format = "#,##0"
+    for r in ws2.iter_rows(min_row=2, min_col=5, max_col=6):
+        for c in r: c.number_format = "$#,##0.00"
+    # Total row
+    ws2.append([])
+    ws2.append(["", "", "", "TOTAL ESTIMATED ANNUAL VALUE", "", award_total, ""])
+    ws2[ws2.max_row][3].font = LABEL_FONT
+    ws2[ws2.max_row][5].font = Font(bold=True, size=12)
+    ws2[ws2.max_row][5].number_format = "$#,##0.00"
+    autosize(ws2)
+    ws2.freeze_panes = "A2"
+
+    # ---- TAB 3: Terms and Conditions ----
+    ws3 = wb.create_sheet("Terms and Conditions")
+    ws3.append(["Award Terms and Conditions"])
+    ws3["A1"].font = BANNER_FONT
+    ws3.append([])
+    terms = [
+        ("Award basis", "Net unit prices as quoted. Estimated annual quantities are forecasts only, not guaranteed minimums."),
+        ("Pricing validity", "Firm through the validity period you stated, or 90 days from this notification, whichever is later."),
+        ("Order issuance", "Individual purchase orders will be issued as needs arise. This award does not constitute a purchase order."),
+        ("Lead time", "Quoted lead times apply. Notify us in advance if lead times will change."),
+        ("Tariff and freight", "As noted on your quote. Notify us before any change."),
+        ("Substitutes", "If you offered an alternate part on a quoted line, the alternate is awarded. Form/fit/function equivalence applies."),
+        ("Quality", "All items must meet the specifications described in our RFQ documentation."),
+        ("Payment terms", "Per the Andersen master supplier agreement currently in effect with your company."),
+        ("Confidentiality", "Pricing in this award is confidential between Andersen and your company."),
+    ]
+    ws3.append(["Topic", "Detail"])
+    for c in ws3[3]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    for topic, detail in terms:
+        ws3.append([topic, detail])
+    ws3.column_dimensions["A"].width = 22
+    ws3.column_dimensions["B"].width = 100
+    for row in ws3.iter_rows(min_row=4):
+        for c in row:
+            c.alignment = Alignment(vertical="top", wrap_text=True)
+
+    # FINAL DEFENSIVE PASS — if anything in the awarded-items sheet has a
+    # supplier name in a cell, refuse the export. (We don't write supplier
+    # names in cells but this is belt-and-suspenders.)
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+    other_supplier_names = [s for s in bids_by_supplier.keys() if s != supplier_name]
+    for r in ws2.iter_rows(values_only=True):
+        for v in r:
+            if v is None: continue
+            sv = str(v)
+            for other in other_supplier_names:
+                if other and other in sv:
+                    raise IsolationViolation(
+                        f"Award letter for {supplier_name!r} would contain "
+                        f"the string {other!r}. Refusing to export."
+                    )
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def gen_award_letters_for_scenario(scenario_name: str, rfq_id: str = "") -> dict:
+    """Generate one award letter per awarded supplier in a scenario.
+    Returns: {supplier_name: xlsx_bytes, ...}. Skips suppliers with 0 awards."""
+    evaluated = evaluate_award_scenario(scenario_name)
+    awards = evaluated.get("awards", [])
+    awarded_suppliers = sorted(set(
+        a.get("awarded_supplier") for a in awards if a.get("awarded_supplier")
+    ))
+    out = {}
+    for sup in awarded_suppliers:
+        try:
+            out[sup] = gen_award_letter_xlsx(scenario_name, sup, rfq_id=rfq_id)
+        except (ValueError, IsolationViolation) as e:
+            # Skip suppliers with no awards or isolation issues — surface in result
+            out[sup] = None
+    return out
+
+
+def gen_internal_award_summary_xlsx(scenario_name: str, rfq_id: str = "") -> bytes:
+    """Internal-audience summary of the full award scenario. Includes the
+    cross-supplier comparison + per-supplier totals + every award decision.
+
+    Banner: 'INTERNAL — NEVER FORWARD'. Contains pricing across all suppliers
+    side-by-side; explicitly NOT supplier-bound.
+    """
+    evaluated = evaluate_award_scenario(scenario_name)
+    sc = _get_scenarios().get(scenario_name) or {}
+
+    if not rfq_id:
+        rfq_id = f"RFQ-{datetime.now().strftime('%Y-%m')}-001"
+
+    wb = Workbook()
+    HEADER_FILL = PatternFill("solid", fgColor="0a0e1a")
+    BANNER_FILL = PatternFill("solid", fgColor="ff4d6d")
+    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+    BANNER_FONT = Font(bold=True, color="FFFFFF", size=16)
+    LABEL_FONT = Font(bold=True, color="000000", size=11)
+
+    # ---- TAB 1: Internal Summary ----
+    ws = wb.active
+    ws.title = "INTERNAL Summary"
+    ws.append(["INTERNAL — NEVER FORWARD TO ANY SUPPLIER"])
+    ws["A1"].font = BANNER_FONT
+    ws["A1"].fill = BANNER_FILL
+    ws.append([f"Scenario: {scenario_name} · {sc.get('strategy', '')}"])
+    ws.append([f"RFQ ID: {rfq_id}"])
+    ws.append([f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"])
+    ws.append([])
+    ws.append(["Headline"])
+    ws[f"A{ws.max_row}"].font = LABEL_FONT
+    ws.append(["Items in scenario", evaluated["n_items"]])
+    ws.append(["Items awarded", evaluated["n_awarded"]])
+    ws.append(["Items with no award", evaluated["n_no_award"]])
+    ws.append(["Items switched (vs incumbent)", evaluated["items_switched"]])
+    ws.append(["Items kept with incumbent", evaluated["incumbent_retained"]])
+    ws.append(["Manual overrides", evaluated["n_manual_overrides"]])
+    ws.append(["Carve-outs (consolidate strategy only)", evaluated.get("n_carved", 0)])
+    ws.append([])
+    ws.append(["Award total (annualized)", evaluated["award_total"]])
+    ws.append(["Historical baseline (annualized)", evaluated["historical_total"]])
+    ws.append(["Estimated annual savings", evaluated["savings_total"]])
+    ws.append(["Savings %", f"{evaluated['savings_pct']:.1f}%"])
+    for r in (8, 9, 10, 11, 12, 13, 14):
+        c = ws.cell(row=r, column=2)
+        c.number_format = "#,##0"
+    for r in (16, 17, 18):
+        c = ws.cell(row=r, column=2)
+        c.number_format = "$#,##0.00"
+    autosize(ws)
+
+    # ---- TAB 2: Award by Supplier ----
+    ws2 = wb.create_sheet("Award by Supplier")
+    ws2.append(["Supplier", "Items awarded", "Total annual value"])
+    for c in ws2[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    by_sup = evaluated.get("award_by_supplier", {})
+    counts = {}
+    for a in evaluated.get("awards", []):
+        s = a.get("awarded_supplier")
+        if s:
+            counts[s] = counts.get(s, 0) + 1
+    for sup in sorted(by_sup.keys(), key=lambda s: -by_sup[s]):
+        ws2.append([sup, counts.get(sup, 0), by_sup[sup]])
+    for r in ws2.iter_rows(min_row=2, min_col=3, max_col=3):
+        for c in r: c.number_format = "$#,##0.00"
+    autosize(ws2)
+
+    # ---- TAB 3: All Awards (full detail, all suppliers visible) ----
+    ws3 = wb.create_sheet("All Awards")
+    ws3.append([
+        "Item #", "Description", "Annual Qty", "Awarded Supplier",
+        "Awarded Unit Price", "Awarded Annual Value",
+        "Historical Unit Price", "Historical Annual Value",
+        "Annual Savings", "Decision basis",
+    ])
+    for c in ws3[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    for a in sorted(evaluated.get("awards", []), key=lambda x: x.get("awarded_value") or 0, reverse=True):
+        ws3.append([
+            a.get("item_num"), a.get("description"), a.get("qty_24mo"),
+            a.get("awarded_supplier") or "(no award)",
+            a.get("awarded_price"), a.get("awarded_value") or 0,
+            a.get("historical_price") or 0, a.get("historical_value") or 0,
+            a.get("savings_value") or 0,
+            a.get("decision_basis"),
+        ])
+    for r in ws3.iter_rows(min_row=2, min_col=3, max_col=3):
+        for c in r: c.number_format = "#,##0"
+    for r in ws3.iter_rows(min_row=2, min_col=5, max_col=9):
+        for c in r: c.number_format = "$#,##0.00"
+    autosize(ws3)
+    ws3.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Register module so app.js can `from app_engine import ...`
 # ---------------------------------------------------------------------------
 sys.modules["app_engine"] = sys.modules[__name__]
