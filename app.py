@@ -1393,10 +1393,7 @@ def remove_supplier_bid(supplier_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _outlier_factor():
-    """Tunable: a quote is an outlier if it's >= this multiple of the median
-    OR <= 1/this multiple. Default 3.0 — picks up the "supplier C bid $784
-    for a $40 part" scenario without flagging normal price spread."""
-    return 3.0
+    return get_thresholds()["outlier_factor"]
 
 
 def compute_comparison_matrix(included_keys=None) -> dict:
@@ -1529,7 +1526,7 @@ def compute_comparison_matrix(included_keys=None) -> dict:
         if hist_price and qty_24:
             total_historical += hist_price * qty_24
 
-        rows.append({
+        row_record = {
             "rfq_key": rfq_key,
             "item_num": it["item_num"],
             "part_number": it.get("part_number") or "",
@@ -1547,9 +1544,20 @@ def compute_comparison_matrix(included_keys=None) -> dict:
             "lowest_price": lowest_price,
             "spread_pct": spread_pct,
             "flags": flags,
-        })
+        }
+        rec = recommend_for_item(row_record)
+        row_record["recommendation"] = rec["recommendation"]
+        row_record["recommendation_target"] = rec["target_supplier"]
+        row_record["recommendation_reason"] = rec["reason"]
+        row_record["secondary_actions"] = rec["secondary_actions"]
+        rows.append(row_record)
 
     est_savings = total_historical - total_lowest
+
+    # Rec-distribution summary
+    rec_counts = {}
+    for r in rows:
+        rec_counts[r["recommendation"]] = rec_counts.get(r["recommendation"], 0) + 1
 
     return {
         "suppliers": suppliers,
@@ -1564,7 +1572,186 @@ def compute_comparison_matrix(included_keys=None) -> dict:
             "total_lowest_value": total_lowest,
             "total_historical_value": total_historical,
             "estimated_savings": est_savings,
+            "recommendation_counts": rec_counts,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Recommendation engine — 5-tier per-item recommendations with mandatory reasons.
+#
+# Categories (deterministic, no AI):
+#   ACCEPT             — clear winner, no exceptions, savings exceed threshold
+#   PUSH_BACK          — quote is high vs baseline OR vs lowest competitor
+#   ASK_CLARIFICATION  — UOM mismatch, missing data, alternate offered, etc.
+#   EXCLUDE            — no bid, invalid price, item identity changed
+#   MANUAL_REVIEW      — data conflict, low usage, outlier, ties
+#
+# Every recommendation carries a `reason` string with concrete numbers.
+# ---------------------------------------------------------------------------
+RECOMMENDATION_ACCEPT      = "ACCEPT"
+RECOMMENDATION_PUSH_BACK   = "PUSH_BACK"
+RECOMMENDATION_CLARIFY     = "ASK_CLARIFICATION"
+RECOMMENDATION_EXCLUDE     = "EXCLUDE"
+RECOMMENDATION_MANUAL      = "MANUAL_REVIEW"
+
+
+def _fmt_pct(x):
+    return f"{x*100:.0f}%" if x is not None else "—"
+
+
+def _fmt_money(x):
+    return f"${x:,.2f}" if x is not None else "—"
+
+
+def recommend_for_item(matrix_row: dict) -> dict:
+    """Given one row of the comparison matrix, return:
+        {
+          "recommendation": ACCEPT | PUSH_BACK | ASK_CLARIFICATION | EXCLUDE | MANUAL_REVIEW,
+          "target_supplier": str | None,
+          "reason": str,
+          "secondary_actions": [str, ...],   # additional follow-ups (e.g. push back AND ask MOQ)
+        }
+
+    Decision rules (in priority order — first match wins):
+      1. n_quoted == 0 → EXCLUDE (no bid from anyone)
+      2. ALL bids have status NEED_INFO → ASK_CLARIFICATION
+      3. Any UOM_DISC on the lowest bid → ASK_CLARIFICATION (verify UOM first)
+      4. Any SUBSTITUTE on the lowest bid → ASK_CLARIFICATION (validate alt part)
+      5. Lowest bid >> baseline (>pushback_threshold AND no cheaper alt) → PUSH_BACK
+      6. Lowest bid is an outlier among bids OR vs history → MANUAL_REVIEW
+      7. Lowest bid available, savings >= min_savings_pct_to_switch → ACCEPT
+      8. Otherwise → MANUAL_REVIEW (low savings; not worth switching cost)
+    """
+    th = get_thresholds()
+    pushback_pct = th["pushback_threshold_pct"]
+    min_switch_pct = th["min_savings_pct_to_switch"]
+
+    n_quoted = matrix_row.get("n_quoted", 0)
+    bids = matrix_row.get("bids") or {}
+    flags = matrix_row.get("flags") or []
+    lowest_supplier = matrix_row.get("lowest_supplier")
+    lowest_price = matrix_row.get("lowest_price")
+    historical = matrix_row.get("last_unit_price") or 0
+    qty = matrix_row.get("qty_24mo") or 0
+
+    secondary = []
+
+    # Rule 1: nobody bid
+    if n_quoted == 0:
+        return {
+            "recommendation": RECOMMENDATION_EXCLUDE,
+            "target_supplier": None,
+            "reason": "No supplier quoted this item. Either follow up with all suppliers or drop the item from the RFQ.",
+            "secondary_actions": [],
+        }
+
+    # Rule 2: all bids need info
+    statuses = [b.get("status") for b in bids.values() if b.get("status") not in (None, "MISSING")]
+    if statuses and all(s == BID_STATUS_NEED_INFO for s in statuses):
+        return {
+            "recommendation": RECOMMENDATION_CLARIFY,
+            "target_supplier": None,
+            "reason": "All responding suppliers asked for more information. Provide additional spec or sample before re-quoting.",
+            "secondary_actions": [],
+        }
+
+    if not lowest_supplier or lowest_price is None:
+        return {
+            "recommendation": RECOMMENDATION_MANUAL,
+            "target_supplier": None,
+            "reason": "No usable bid (all responses are no-bid / need-info / invalid). Manual review.",
+            "secondary_actions": [],
+        }
+
+    lowest_bid = bids.get(lowest_supplier) or {}
+    lowest_status = lowest_bid.get("status")
+    lowest_raw = lowest_bid.get("raw") or {}
+
+    # Rule 3: UOM discrepancy on the lowest bid
+    if lowest_status == BID_STATUS_UOM_DISC:
+        return {
+            "recommendation": RECOMMENDATION_CLARIFY,
+            "target_supplier": lowest_supplier,
+            "reason": f"Lowest bid is from {lowest_supplier} at {_fmt_money(lowest_price)} but they flagged a UOM discrepancy. Confirm UOM before treating as real savings.",
+            "secondary_actions": ["UOM_VERIFY"],
+        }
+
+    # Rule 4: substitute offered on the lowest bid
+    if lowest_status == BID_STATUS_SUBSTITUTE:
+        sub_part = lowest_raw.get("sub_part") or "(unspecified)"
+        return {
+            "recommendation": RECOMMENDATION_CLARIFY,
+            "target_supplier": lowest_supplier,
+            "reason": f"Lowest bid from {lowest_supplier} is for an alternate part ({sub_part}). Validate that the substitute meets spec before awarding.",
+            "secondary_actions": ["SPEC_VERIFY"],
+        }
+
+    # Rule 5: all bids high vs history (push back)
+    if historical > 0:
+        gap_vs_hist = (lowest_price - historical) / historical
+        if gap_vs_hist >= pushback_pct:
+            return {
+                "recommendation": RECOMMENDATION_PUSH_BACK,
+                "target_supplier": lowest_supplier,
+                "reason": f"Lowest bid ({_fmt_money(lowest_price)} from {lowest_supplier}) is {_fmt_pct(gap_vs_hist)} above the historical paid price ({_fmt_money(historical)}). Push back before accepting.",
+                "secondary_actions": [],
+            }
+
+    # Rule 6: outlier flags
+    if flags:
+        # Detect specific flag types
+        outlier_flag = any("OUTLIER" in f for f in flags)
+        all_high_flag = any("ALL_BIDS_HIGH" in f for f in flags)
+        big_savings_flag = any("BIG_SAVINGS" in f for f in flags)
+        if all_high_flag:
+            return {
+                "recommendation": RECOMMENDATION_PUSH_BACK,
+                "target_supplier": lowest_supplier,
+                "reason": f"All bids are well above historical paid price. Lowest is {_fmt_money(lowest_price)} from {lowest_supplier} — push back across the board or drop the item.",
+                "secondary_actions": [],
+            }
+        if big_savings_flag:
+            return {
+                "recommendation": RECOMMENDATION_MANUAL,
+                "target_supplier": lowest_supplier,
+                "reason": f"Lowest bid ({_fmt_money(lowest_price)} from {lowest_supplier}) is dramatically below historical paid ({_fmt_money(historical)}). Verify it's the same item / spec / UOM before accepting.",
+                "secondary_actions": ["SPEC_VERIFY", "UOM_VERIFY"],
+            }
+        if outlier_flag:
+            return {
+                "recommendation": RECOMMENDATION_MANUAL,
+                "target_supplier": lowest_supplier,
+                "reason": f"Lowest bid ({_fmt_money(lowest_price)} from {lowest_supplier}) is statistically an outlier vs the other bids. Verify before awarding.",
+                "secondary_actions": [],
+            }
+
+    # Rule 7: clear acceptance
+    if historical > 0:
+        savings_pct = (historical - lowest_price) / historical
+        savings_total = (historical - lowest_price) * qty
+        if savings_pct >= min_switch_pct:
+            return {
+                "recommendation": RECOMMENDATION_ACCEPT,
+                "target_supplier": lowest_supplier,
+                "reason": f"Award to {lowest_supplier} at {_fmt_money(lowest_price)}. Saves {_fmt_pct(savings_pct)} vs historical ({_fmt_money(historical)}) — about {_fmt_money(savings_total)} on 24-mo qty.",
+                "secondary_actions": [],
+            }
+        else:
+            # Savings below the switch threshold — recommend manual review
+            return {
+                "recommendation": RECOMMENDATION_MANUAL,
+                "target_supplier": lowest_supplier,
+                "reason": f"Lowest bid {_fmt_money(lowest_price)} from {lowest_supplier} only saves {_fmt_pct(savings_pct)} vs historical. Below the {_fmt_pct(min_switch_pct)} switching threshold — may not be worth a supplier change.",
+                "secondary_actions": [],
+            }
+
+    # No historical baseline — accept the lowest bid but note it
+    return {
+        "recommendation": RECOMMENDATION_ACCEPT,
+        "target_supplier": lowest_supplier,
+        "reason": f"Award to {lowest_supplier} at {_fmt_money(lowest_price)} (no historical baseline to compare against).",
+        "secondary_actions": [],
     }
 
 
@@ -1577,12 +1764,55 @@ def compute_comparison_matrix(included_keys=None) -> dict:
 # single item to justify splitting the award.
 # ---------------------------------------------------------------------------
 
-# Tunable: an item is a carve-out candidate if another supplier saves at least
-# this fraction of the consolidation winner's price on it. Default 30%.
+# ---------------------------------------------------------------------------
+# Configurable project thresholds
+#
+# All tunable knobs live in one dict so the UI can read/write them and they
+# get persisted in the save state. Defaults are sensible for MRO RFQs but
+# every project / supplier mix should be allowed to override.
+# ---------------------------------------------------------------------------
+DEFAULT_THRESHOLDS = {
+    "carve_out_min_savings_pct": 0.30,       # carve-out candidate if other supplier saves >= 30% of winner price
+    "outlier_factor": 3.0,                   # bid is outlier if >= Nx median or <= 1/N of median
+    "spike_factor": 1.5,                     # latest price is "spike" if >= 1.5x 90-day median
+    "uom_suspect_ratio": 20.0,               # carve-out price ratio >= this → mark UOM-verify
+    "min_savings_pct_to_switch": 0.05,       # below 5% savings, prefer incumbent (avoid switching cost)
+    "pushback_threshold_pct": 0.10,          # quote >10% above baseline → push back
+    "max_acceptable_lead_time_days": 60,     # bids with lead time > this are flagged
+    "max_acceptable_moq_vs_annual": 1.0,     # bids with MOQ > annual qty are flagged
+    "min_quote_validity_days": 30,           # quotes valid <30 days are flagged
+    "min_spend_for_review": 100.0,           # below this 24mo spend, item not worth manual review
+    "high_spend_no_bid_threshold": 1000.0,   # no-bid items with >$X 24mo spend get follow-up flag
+}
+
+
+def get_thresholds() -> dict:
+    """Return current thresholds (defaults merged with any saved overrides)."""
+    overrides = _STATE.get("thresholds", {})
+    out = dict(DEFAULT_THRESHOLDS)
+    out.update(overrides)
+    return out
+
+
+def set_thresholds(updates: dict) -> dict:
+    """Update one or more thresholds. Returns the new merged state."""
+    current = _STATE.get("thresholds", {}) or {}
+    current.update({k: v for k, v in (updates or {}).items() if k in DEFAULT_THRESHOLDS})
+    _STATE["thresholds"] = current
+    return get_thresholds()
+
+
+def reset_thresholds() -> dict:
+    _STATE["thresholds"] = {}
+    return get_thresholds()
+
+
+# Legacy alias (kept for back-compat with existing call sites; use thresholds)
 DEFAULT_CARVE_OUT_THRESHOLD = 0.30
 
 
-def compute_consolidation_analysis(included_keys=None, carve_threshold: float = None) -> dict:
+def compute_consolidation_analysis(included_keys=None, carve_threshold: float = None,
+                                   uom_suspect_ratio: float = None) -> dict:
     """Rank suppliers as candidate consolidation winners and quantify the
     impact of carving out exceptions where someone else is meaningfully
     cheaper on individual items.
@@ -1630,8 +1860,11 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
         }
       }
     """
+    th = get_thresholds()
     if carve_threshold is None:
-        carve_threshold = DEFAULT_CARVE_OUT_THRESHOLD
+        carve_threshold = th["carve_out_min_savings_pct"]
+    if uom_suspect_ratio is None:
+        uom_suspect_ratio = th["uom_suspect_ratio"]
 
     items = _STATE.get("items", [])
     bids_by_supplier = _STATE.get("bids", {}) or {}
@@ -1728,7 +1961,7 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
                         verify_uom = (
                             carve_status == BID_STATUS_UOM_DISC or
                             winner_status == BID_STATUS_UOM_DISC or
-                            (cheapest_other_price > 0 and w_price / cheapest_other_price >= 20.0)
+                            (cheapest_other_price > 0 and w_price / cheapest_other_price >= uom_suspect_ratio)
                         )
                         carve_outs.append({
                             "rfq_key": it["key"],
@@ -1812,6 +2045,703 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
             "carve_out_threshold_pct": carve_threshold * 100.0,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Supplier follow-up xlsx generator — multi-tab pushback / clarification packet
+#
+# Per the brief's recommended structure:
+#   1. Summary
+#   2. Items Needing Price Review  (PUSH_BACK recommendations)
+#   3. Missing Information         (NEED_INFO bids)
+#   4. UOM or MOQ Exceptions       (UOM_DISC, MOQ flags)
+#   5. Alternate Parts             (SUBSTITUTE bids)
+#   6. No-Bids                     (NO_BID lines, ask why + pricing window)
+#   7. Full Quote Detail           (every line this supplier responded to)
+#
+# Template-based prose only — no AI. Per the cross-supplier isolation rule,
+# this xlsx contains ONLY the named supplier's own data — never another
+# supplier's bid prices or our internal target/cost/margin.
+# ---------------------------------------------------------------------------
+
+PUSHBACK_TEMPLATES = {
+    "price_too_high_vs_history": (
+        "Your quoted price for {item_desc} is {gap_pct} above our historical "
+        "paid price of {hist_price} per {uom}. Annualized volume is "
+        "approximately {qty} units. Please review whether you have room to "
+        "improve pricing on this item."
+    ),
+    "price_too_high_vs_competition": (
+        "Your quoted price for {item_desc} is {gap_pct} above the lowest "
+        "qualified quote we received. We would like to consolidate with you "
+        "if possible — please confirm whether you can revisit pricing."
+    ),
+    "missing_info_request": (
+        "We were unable to evaluate your quote for {item_desc} because "
+        "additional information was needed. Please provide unit price, UOM, "
+        "and confirmation that the part offered matches our specification."
+    ),
+    "uom_clarification": (
+        "Your quote for {item_desc} indicates a UOM mismatch with our "
+        "purchasing UOM ({our_uom}). Please confirm your quoted UOM and "
+        "whether the price needs to be normalized to our UOM."
+    ),
+    "moq_concern": (
+        "The minimum order quantity on your quote for {item_desc} ({moq}) "
+        "exceeds our typical annual consumption ({qty}). Please confirm "
+        "whether a smaller MOQ is available."
+    ),
+    "alternate_part_review": (
+        "You quoted an alternate part ({alt_part}) for our requested item "
+        "{item_desc}. Please confirm form/fit/function equivalence and "
+        "whether your alternate is in stock and current."
+    ),
+    "no_bid_clarification": (
+        "You did not bid on {item_desc} (note: \"{notes}\"). If this item "
+        "is something you can supply with additional information or a longer "
+        "lead time, please let us know."
+    ),
+}
+
+
+def gen_supplier_followup_xlsx(supplier_name: str, included_keys=None) -> bytes:
+    """Build the follow-up packet xlsx for one supplier.
+
+    Strict isolation: only this supplier's own bid data appears.
+    No other supplier's prices, no internal target/cost/margin.
+    """
+    if not supplier_name:
+        raise ValueError("supplier_name required")
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+    parsed = bids_by_supplier.get(supplier_name)
+    if not parsed:
+        raise ValueError(f"No loaded bids for supplier {supplier_name!r}")
+
+    # Match each bid back to RFQ items so we can include item context
+    items = _STATE.get("items", [])
+    if included_keys is not None:
+        keep = set(included_keys)
+        items = [it for it in items if it["item_num"] in keep]
+    item_by_key = {it["key"]: it for it in items}
+
+    matrix = compute_comparison_matrix(included_keys=included_keys)
+    rows_by_key = {r["rfq_key"]: r for r in matrix["rows"]}
+
+    th = get_thresholds()
+    pushback_pct = th["pushback_threshold_pct"]
+
+    # Categorize this supplier's bids by recommendation tab
+    bids_for_review = []     # PUSH_BACK
+    bids_missing_info = []   # NEED_INFO
+    bids_uom_or_moq = []     # UOM_DISC or MOQ flagged
+    bids_alternates = []     # SUBSTITUTE
+    bids_no_bid = []         # NO_BID
+    bids_all = []            # everything (Full Quote Detail tab)
+
+    for b in parsed.get("bids", []):
+        rfq_key = b["rfq_key"]
+        item = item_by_key.get(rfq_key)
+        row = rows_by_key.get(rfq_key)
+        rec_target_is_them = (row and row.get("recommendation_target") == supplier_name)
+        rec = row.get("recommendation") if row else None
+
+        ctx = {
+            "rfq_key": rfq_key,
+            "item_num": (item["item_num"] if item else b.get("item_num", "")),
+            "part_number": (item.get("part_number") if item else b.get("part_number", "")),
+            "description": (item["description"] if item else b.get("description", "")),
+            "mfg_name": (item["mfg_name"] if item else b.get("mfg_name", "")),
+            "our_uom": (item["uom"] if item else b.get("uom", "")),
+            "qty_24mo": (item.get("qty_24mo") if item else (b.get("qty") or 0)),
+            "historical_price": (item.get("last_unit_price") if item else None),
+            "your_price": b.get("effective_price"),
+            "your_quoted_uom": b.get("uom", ""),
+            "your_notes": b.get("notes", ""),
+            "your_part": b.get("exact_part") or b.get("part_number", ""),
+            "your_alt_part": b.get("sub_part") or "",
+            "your_alt_desc": b.get("sub_desc") or "",
+            "status": b["status"],
+        }
+        bids_all.append(ctx)
+
+        # NO_BID
+        if b["status"] == BID_STATUS_NO_BID:
+            bids_no_bid.append(ctx)
+            continue
+        # NEED_INFO
+        if b["status"] == BID_STATUS_NEED_INFO:
+            bids_missing_info.append(ctx)
+            continue
+        # UOM discrepancy
+        if b["status"] == BID_STATUS_UOM_DISC:
+            bids_uom_or_moq.append(ctx)
+            continue
+        # SUBSTITUTE
+        if b["status"] == BID_STATUS_SUBSTITUTE:
+            bids_alternates.append(ctx)
+            continue
+        # PRICED — check if pushback applies (vs history OR vs competition)
+        their_price = b["effective_price"] or 0
+        hist = ctx["historical_price"] or 0
+        # Vs history
+        push_reason = None
+        if hist > 0 and their_price > 0:
+            gap = (their_price - hist) / hist
+            if gap >= pushback_pct:
+                push_reason = ("vs_history", gap)
+        # Vs competition (do not name the cheaper supplier — isolation rule)
+        if row and not push_reason:
+            lowest_price = row.get("lowest_price")
+            lowest_supplier = row.get("lowest_supplier")
+            if (lowest_price and lowest_supplier and lowest_supplier != supplier_name
+                    and lowest_price > 0 and their_price > lowest_price * (1 + pushback_pct)):
+                comp_gap = (their_price - lowest_price) / lowest_price
+                push_reason = ("vs_competition", comp_gap)
+        if push_reason:
+            ctx["pushback_kind"] = push_reason[0]
+            ctx["pushback_gap_pct"] = push_reason[1]
+            bids_for_review.append(ctx)
+
+    # ---- Build the workbook ----
+    wb = Workbook()
+    HEADER_FILL = PatternFill("solid", fgColor="0a0e1a")
+    BAND_FILL = PatternFill("solid", fgColor="2a3658")
+    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+    LABEL_FONT = Font(bold=True, color="b4c0d4", size=10)
+    BANNER_FONT = Font(bold=True, color="ffb733", size=14)
+
+    # ---- TAB 1: Summary ----
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append([f"RFQ Follow-Up — {supplier_name}"])
+    ws["A1"].font = BANNER_FONT
+    ws.append([f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"])
+    ws.append([])
+    ws.append(["This packet contains items from your prior bid response that we'd like you to revisit."])
+    ws.append(["Each tab covers a different category. Please review and respond at your convenience."])
+    ws.append([])
+    ws.append(["Section", "Item count", "Notes"])
+    for c in ws[7]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.append(["Items Needing Price Review", len(bids_for_review), "Quoted but priced high vs our baseline or vs the qualified market"])
+    ws.append(["Missing Information", len(bids_missing_info), "Items where you indicated 'need more information'"])
+    ws.append(["UOM / MOQ Exceptions", len(bids_uom_or_moq), "UOM mismatch or MOQ exceeds typical usage"])
+    ws.append(["Alternate Parts", len(bids_alternates), "Where you offered a substitute part"])
+    ws.append(["No-Bids", len(bids_no_bid), "Items you declined to quote — please confirm category & reason"])
+    ws.append(["Full Quote Detail", len(bids_all), "Every line you responded to (reference)"])
+    autosize(ws)
+
+    # ---- TAB 2: Items Needing Price Review ----
+    ws2 = wb.create_sheet("Items Needing Price Review")
+    headers = ["Item #", "Description", "Manufacturer", "Our UOM", "Annual Qty",
+               "Your Price", "Your UOM", "Reason for review", "Pushback message",
+               "Your revised price", "Your notes"]
+    ws2.append(headers)
+    for c in ws2[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    yellow = PatternFill("solid", fgColor="FFF59D")
+    for ctx in bids_for_review:
+        kind = ctx.get("pushback_kind", "")
+        gap = ctx.get("pushback_gap_pct", 0)
+        if kind == "vs_history":
+            reason_short = f"{gap*100:.0f}% above our prior paid price"
+            tmpl = PUSHBACK_TEMPLATES["price_too_high_vs_history"].format(
+                item_desc=(ctx["description"] or ctx["item_num"])[:80],
+                gap_pct=f"{gap*100:.0f}%",
+                hist_price=_fmt_money(ctx["historical_price"]),
+                uom=ctx["our_uom"] or "unit",
+                qty=f"{(ctx['qty_24mo'] or 0):,.0f}",
+            )
+        else:
+            reason_short = f"{gap*100:.0f}% above the lowest qualified quote"
+            tmpl = PUSHBACK_TEMPLATES["price_too_high_vs_competition"].format(
+                item_desc=(ctx["description"] or ctx["item_num"])[:80],
+                gap_pct=f"{gap*100:.0f}%",
+            )
+        ws2.append([
+            ctx["item_num"], ctx["description"], ctx["mfg_name"], ctx["our_uom"],
+            ctx["qty_24mo"], ctx["your_price"], ctx["your_quoted_uom"],
+            reason_short, tmpl, "", "",
+        ])
+    # Yellow-fill the response columns (J=10, K=11) so they stand out
+    for r in ws2.iter_rows(min_row=2, min_col=10, max_col=11):
+        for c in r:
+            c.fill = yellow
+    for r in ws2.iter_rows(min_row=2, min_col=6, max_col=6):
+        for c in r:
+            c.number_format = "$#,##0.00"
+    for r in ws2.iter_rows(min_row=2, min_col=10, max_col=10):
+        for c in r:
+            c.number_format = "$#,##0.00"
+    autosize(ws2)
+    ws2.freeze_panes = "A2"
+
+    # ---- TAB 3: Missing Information ----
+    ws3 = wb.create_sheet("Missing Information")
+    ws3.append(["Item #", "Description", "Manufacturer", "Our UOM", "Annual Qty",
+                "Your note", "What we need", "Your follow-up price", "Your follow-up UOM", "Your notes"])
+    for c in ws3[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for ctx in bids_missing_info:
+        ws3.append([
+            ctx["item_num"], ctx["description"], ctx["mfg_name"], ctx["our_uom"], ctx["qty_24mo"],
+            ctx["your_notes"],
+            PUSHBACK_TEMPLATES["missing_info_request"].format(item_desc=(ctx["description"] or ctx["item_num"])[:80]),
+            "", "", "",
+        ])
+    for r in ws3.iter_rows(min_row=2, min_col=8, max_col=10):
+        for c in r:
+            c.fill = yellow
+    for r in ws3.iter_rows(min_row=2, min_col=8, max_col=8):
+        for c in r:
+            c.number_format = "$#,##0.00"
+    autosize(ws3)
+    ws3.freeze_panes = "A2"
+
+    # ---- TAB 4: UOM / MOQ Exceptions ----
+    ws4 = wb.create_sheet("UOM and MOQ Exceptions")
+    ws4.append(["Item #", "Description", "Our UOM", "Your quoted UOM", "Your price",
+                "Your notes", "What we're asking", "Your confirmed UOM", "Your normalized price", "Your notes"])
+    for c in ws4[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for ctx in bids_uom_or_moq:
+        ws4.append([
+            ctx["item_num"], ctx["description"], ctx["our_uom"], ctx["your_quoted_uom"],
+            ctx["your_price"], ctx["your_notes"],
+            PUSHBACK_TEMPLATES["uom_clarification"].format(
+                item_desc=(ctx["description"] or ctx["item_num"])[:80],
+                our_uom=ctx["our_uom"] or "(unknown)",
+            ),
+            "", "", "",
+        ])
+    for r in ws4.iter_rows(min_row=2, min_col=8, max_col=10):
+        for c in r:
+            c.fill = yellow
+    for r in ws4.iter_rows(min_row=2, min_col=5, max_col=5):
+        for c in r:
+            c.number_format = "$#,##0.00"
+    for r in ws4.iter_rows(min_row=2, min_col=9, max_col=9):
+        for c in r:
+            c.number_format = "$#,##0.00"
+    autosize(ws4)
+    ws4.freeze_panes = "A2"
+
+    # ---- TAB 5: Alternate Parts ----
+    ws5 = wb.create_sheet("Alternate Parts")
+    ws5.append(["Item #", "Description (ours)", "Manufacturer (ours)", "Annual Qty",
+                "Your alternate part", "Your alternate description", "Your price",
+                "Form/fit/function confirmed?", "Your notes"])
+    for c in ws5[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for ctx in bids_alternates:
+        ws5.append([
+            ctx["item_num"], ctx["description"], ctx["mfg_name"], ctx["qty_24mo"],
+            ctx["your_alt_part"], ctx["your_alt_desc"], ctx["your_price"],
+            "", "",
+        ])
+    for r in ws5.iter_rows(min_row=2, min_col=8, max_col=9):
+        for c in r:
+            c.fill = yellow
+    for r in ws5.iter_rows(min_row=2, min_col=7, max_col=7):
+        for c in r:
+            c.number_format = "$#,##0.00"
+    autosize(ws5)
+    ws5.freeze_panes = "A2"
+
+    # ---- TAB 6: No-Bids ----
+    ws6 = wb.create_sheet("No-Bids")
+    ws6.append(["Item #", "Description", "Manufacturer", "Our UOM", "Annual Qty",
+                "Your no-bid note", "Reason category", "Could you bid with more info?", "Your notes"])
+    for c in ws6[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for ctx in bids_no_bid:
+        ws6.append([
+            ctx["item_num"], ctx["description"], ctx["mfg_name"], ctx["our_uom"], ctx["qty_24mo"],
+            ctx["your_notes"],
+            "", "", "",
+        ])
+    for r in ws6.iter_rows(min_row=2, min_col=7, max_col=9):
+        for c in r:
+            c.fill = yellow
+    autosize(ws6)
+    ws6.freeze_panes = "A2"
+
+    # ---- TAB 7: Full Quote Detail ----
+    ws7 = wb.create_sheet("Full Quote Detail")
+    ws7.append(["Item #", "Description", "Manufacturer", "Our UOM", "Annual Qty",
+                "Status", "Your price", "Your UOM", "Your part #", "Your alt part",
+                "Your notes"])
+    for c in ws7[1]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    for ctx in bids_all:
+        ws7.append([
+            ctx["item_num"], ctx["description"], ctx["mfg_name"], ctx["our_uom"], ctx["qty_24mo"],
+            ctx["status"], ctx["your_price"], ctx["your_quoted_uom"],
+            ctx["your_part"], ctx["your_alt_part"], ctx["your_notes"],
+        ])
+    for r in ws7.iter_rows(min_row=2, min_col=7, max_col=7):
+        for c in r:
+            c.number_format = "$#,##0.00"
+    autosize(ws7)
+    ws7.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Outbound RFQ generator — multi-tab Andersen-branded supplier xlsx.
+#
+# Per the brief's recommended structure:
+#   1. Instructions
+#   2. RFQ Lines  (with hidden item_key + rfq_line_id columns for round-trip)
+#   3. Terms and Assumptions
+#   4. Data Dictionary
+#   5. Supplier Response Template
+#
+# Strict isolation: no historical paid price, no Andersen target / cost /
+# margin. Each supplier file contains ONLY this supplier's identification
+# and the items being asked. McMaster-style anchor: Part Number column is
+# the unique join key for round-trip ingest.
+# ---------------------------------------------------------------------------
+
+def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
+                          response_due_date: str = "",
+                          contact_name: str = "Ryan Jenkinson",
+                          contact_email: str = "ryan.jenkinson@andersencorp.com",
+                          included_keys=None) -> bytes:
+    """Generate one supplier's outbound RFQ workbook.
+
+    Strict isolation rules baked in:
+      - No historical paid price column
+      - No internal target / cost / margin
+      - Hidden item_key and rfq_line_id columns for round-trip matching
+      - Locked sheet, only response cells editable
+      - Dropdown validation on Yes/No / UOM / No Bid Reason
+    """
+    if not supplier_name:
+        raise ValueError("supplier_name required")
+
+    items = _STATE.get("items", [])
+    if included_keys is not None:
+        keep = set(str(k) for k in included_keys)
+        items = [it for it in items if it["item_num"] in keep]
+    else:
+        items = [it for it in items if it.get("included")]
+
+    if not rfq_id:
+        rfq_id = f"RFQ-{datetime.now().strftime('%Y-%m')}-001"
+    if not response_due_date:
+        # Default: 14 days from now
+        from datetime import timedelta as _td
+        response_due_date = (datetime.now() + _td(days=14)).strftime("%Y-%m-%d")
+
+    wb = Workbook()
+    HEADER_FILL = PatternFill("solid", fgColor="0a0e1a")
+    BAND_FILL = PatternFill("solid", fgColor="2a3658")
+    YELLOW_FILL = PatternFill("solid", fgColor="FFF59D")
+    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+    BANNER_FONT = Font(bold=True, color="ffb733", size=16)
+    LABEL_FONT = Font(bold=True, color="000000", size=11)
+    BODY_FONT = Font(size=11)
+    THIN = Side(border_style="thin", color="999999")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+    # ---- TAB 1: Instructions ----
+    ws = wb.active
+    ws.title = "Instructions"
+    ws.append([f"REQUEST FOR QUOTATION — {rfq_id}"])
+    ws["A1"].font = BANNER_FONT
+    ws.append([f"Issued to: {supplier_name}"])
+    ws.append([f"Issue date: {datetime.now().strftime('%Y-%m-%d')}"])
+    ws.append([f"Response due: {response_due_date}"])
+    ws.append([f"Contact: {contact_name} — {contact_email}"])
+    ws.append([])
+    ws.append(["Instructions"])
+    ws["A7"].font = LABEL_FONT
+    instructions = [
+        "1. Please complete the 'Supplier Response Template' tab. Yellow cells are for your responses.",
+        "2. Do not change the order of rows or columns. Hidden columns are used for round-trip matching.",
+        "3. Quote each item in the UOM specified. If you must quote in a different UOM, use the 'Quote UOM' field and add a note.",
+        "4. If you cannot bid on an item, mark 'No Bid' = Yes and select a reason from the dropdown.",
+        "5. If you offer an alternate part, fill in 'Alternate Part Offered' = Yes and complete the alternate part columns.",
+        "6. Lead time should be in calendar days from PO receipt.",
+        "7. Quote validity: please indicate how long your prices are firm.",
+        "8. All prices should be net (excluding freight unless otherwise noted in 'Freight Included').",
+        "9. Please return the completed workbook to the contact above by the due date.",
+        "10. Any item you do not respond to will be treated as a no-bid.",
+    ]
+    for line in instructions:
+        ws.append([line])
+    ws.append([])
+    ws.append(["Tabs in this workbook:"])
+    ws[f"A{ws.max_row}"].font = LABEL_FONT
+    for tab_line in [
+        "  • Instructions (this tab)",
+        "  • RFQ Lines — read-only summary of items being requested",
+        "  • Terms and Assumptions — ground rules for this RFQ",
+        "  • Data Dictionary — definition of each column",
+        "  • Supplier Response Template — fill in your responses here",
+    ]:
+        ws.append([tab_line])
+    ws.column_dimensions["A"].width = 110
+
+    # ---- TAB 2: RFQ Lines (read-only summary) ----
+    ws2 = wb.create_sheet("RFQ Lines")
+    ws2.append([f"RFQ Lines — {len(items):,} items requested"])
+    ws2["A1"].font = BANNER_FONT
+    ws2.append([])
+    headers = ["Line #", "Andersen Item #", "EAM Part #", "Manufacturer Part #",
+               "Manufacturer", "Description", "Commodity", "Annual Qty", "UOM"]
+    ws2.append(headers)
+    for c in ws2[3]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    sorted_items = sorted(items, key=lambda x: (x.get("qty_24mo") or 0) * (x.get("last_unit_price") or 0), reverse=True)
+    for i, it in enumerate(sorted_items, start=1):
+        ws2.append([
+            i,
+            it["item_num"],
+            it.get("eam_pn") or "",
+            it.get("mfg_pn") or "",
+            it.get("mfg_name") or "",
+            it.get("description") or "",
+            it.get("commodity") or "",
+            it.get("qty_24mo") or 0,
+            it.get("uom") or "",
+        ])
+    autosize(ws2)
+    ws2.freeze_panes = "A4"
+
+    # ---- TAB 3: Terms and Assumptions ----
+    ws3 = wb.create_sheet("Terms and Assumptions")
+    ws3.append(["Terms and Assumptions"])
+    ws3["A1"].font = BANNER_FONT
+    ws3.append([])
+    terms = [
+        ("Quote currency", "USD unless otherwise stated."),
+        ("Quote basis", "Net unit prices, excluding freight unless 'Freight Included' = Yes."),
+        ("Quantity basis", "Annual quantities are estimates based on 24-month order history. Actual orders may vary."),
+        ("Award terms", "This RFQ is not a commitment to purchase. Awards will be issued by separate purchase order."),
+        ("Substitutes", "Alternate parts will be evaluated for form/fit/function equivalence. Quote the OEM part as primary; alternates are secondary."),
+        ("Pricing audit", "Andersen reserves the right to request manufacturer cost documentation for items priced significantly above market."),
+        ("Confidentiality", "Pricing in this RFQ and your responses are confidential between Andersen and your company."),
+        ("Validity", "Quotes should remain firm for at least 90 days unless otherwise noted in the 'Valid Through' field."),
+        ("Tariffs", "If tariffs apply, indicate whether they're included in your quoted price ('Tariff Included' field)."),
+        ("Round-trip data", "Hidden columns in the response template (item_key, rfq_line_id) are used for matching your response back to our items. Do not delete or modify these columns."),
+    ]
+    ws3.append(["Topic", "Detail"])
+    for c in ws3[3]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    for topic, detail in terms:
+        ws3.append([topic, detail])
+    ws3.column_dimensions["A"].width = 24
+    ws3.column_dimensions["B"].width = 100
+    for row in ws3.iter_rows(min_row=4):
+        for c in row:
+            c.alignment = Alignment(vertical="top", wrap_text=True)
+
+    # ---- TAB 4: Data Dictionary ----
+    ws4 = wb.create_sheet("Data Dictionary")
+    ws4.append(["Data Dictionary — every column defined"])
+    ws4["A1"].font = BANNER_FONT
+    ws4.append([])
+    ws4.append(["Column", "Required?", "Definition"])
+    for c in ws4[3]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    dictionary = [
+        ("Andersen Item #", "Reference", "Our internal item identifier."),
+        ("EAM Part #", "Reference", "Our EAM/maintenance system part number (primary key for most suppliers)."),
+        ("Manufacturer Part #", "Reference", "OEM manufacturer part number, when known."),
+        ("Annual Qty", "Reference", "Estimated annual consumption based on 24-month history."),
+        ("UOM", "Reference", "Our purchasing unit of measure."),
+        ("Quote Price", "Required", "Your net unit price in the Quote UOM. To-the-penny precision."),
+        ("Quote UOM", "Required", "The unit of measure your price is quoted in (EA, BX, PK, etc.). Use the dropdown."),
+        ("Your Part #", "Required", "Your catalog SKU for this item."),
+        ("Minimum Order Quantity", "Required if applicable", "Minimum order qty in your Quote UOM. Leave blank if no minimum."),
+        ("Lead Time Days", "Required", "Calendar days from PO receipt to ship."),
+        ("Country of Origin", "Recommended", "Two-letter ISO code (US, CN, MX, etc.)."),
+        ("Manufacturer", "Recommended", "OEM manufacturer name."),
+        ("Manufacturer Part Number", "Recommended", "OEM part number you're quoting."),
+        ("Alternate Part Offered", "Optional", "Yes/No. Use the dropdown."),
+        ("Alternate Item Number", "If alternate", "Your alternate part number, if you're proposing a substitute."),
+        ("Alternate Description", "If alternate", "Description of the alternate part."),
+        ("Tariff Included", "Required", "Yes/No. Whether your price includes any applicable tariffs."),
+        ("Freight Included", "Required", "Yes/No. Whether your price includes freight to our facility."),
+        ("No Bid", "Optional", "Yes/No. Mark Yes if you cannot bid on this item; select a reason."),
+        ("No Bid Reason", "If no-bid", "Reason from the dropdown (Discontinued, Not Available, Need More Info, etc.)."),
+        ("Supplier Notes", "Optional", "Any free-text comments — alternate proposals, UOM concerns, etc."),
+        ("Valid Through Date", "Required", "Date your quote remains firm. YYYY-MM-DD format preferred."),
+        ("item_key", "DO NOT EDIT", "Hidden internal matching key. Do not modify or delete."),
+        ("rfq_line_id", "DO NOT EDIT", "Hidden internal line identifier. Do not modify or delete."),
+    ]
+    for col, req, defn in dictionary:
+        ws4.append([col, req, defn])
+    ws4.column_dimensions["A"].width = 30
+    ws4.column_dimensions["B"].width = 18
+    ws4.column_dimensions["C"].width = 80
+    for row in ws4.iter_rows(min_row=4):
+        for c in row:
+            c.alignment = Alignment(vertical="top", wrap_text=True)
+
+    # ---- TAB 5: Supplier Response Template ----
+    ws5 = wb.create_sheet("Supplier Response Template")
+    ws5.append([f"Supplier Response Template — {supplier_name} — {rfq_id}"])
+    ws5["A1"].font = BANNER_FONT
+    ws5.append(["Yellow cells are for your responses. Do not modify other columns."])
+    ws5["A2"].font = Font(italic=True, color="666666")
+    ws5.append([])
+    template_headers = [
+        # Reference (read-only) cols
+        "Andersen Item #",   # A
+        "EAM Part #",        # B
+        "Manufacturer Part #",  # C
+        "Manufacturer",      # D
+        "Description",       # E
+        "Annual Qty",        # F
+        "UOM",               # G
+        # Response cols (yellow)
+        "Quote Price",       # H *
+        "Quote UOM",         # I *
+        "Your Part #",       # J *
+        "Minimum Order Quantity",  # K
+        "Lead Time Days",    # L *
+        "Country of Origin", # M
+        "Manufacturer (your)",  # N
+        "Manufacturer Part Number (your)",  # O
+        "Alternate Part Offered",  # P
+        "Alternate Item Number",   # Q
+        "Alternate Description",   # R
+        "Tariff Included",   # S *
+        "Freight Included",  # T *
+        "No Bid",            # U
+        "No Bid Reason",     # V
+        "Supplier Notes",    # W
+        "Valid Through Date",  # X *
+        # Hidden round-trip columns
+        "item_key",          # Y (hidden)
+        "rfq_line_id",       # Z (hidden)
+    ]
+    ws5.append(template_headers)
+    for c in ws5[4]:
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        c.border = BORDER
+
+    # Row data
+    for i, it in enumerate(sorted_items, start=1):
+        rfq_line_id = f"{rfq_id}-{i:05d}"
+        ws5.append([
+            it["item_num"],            # A
+            it.get("eam_pn") or "",    # B
+            it.get("mfg_pn") or "",    # C
+            it.get("mfg_name") or "",  # D
+            it.get("description") or "",   # E
+            it.get("qty_24mo") or 0,   # F
+            it.get("uom") or "",       # G
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,  # H..X (yellow)
+            it["key"],                 # Y item_key
+            rfq_line_id,               # Z rfq_line_id
+        ])
+
+    # Yellow-fill response cells (cols H..X = 8..24) for all data rows
+    n_data_rows = len(sorted_items)
+    for r_idx in range(5, 5 + n_data_rows):
+        for col_idx in range(8, 25):  # H through X inclusive
+            c = ws5.cell(row=r_idx, column=col_idx)
+            c.fill = YELLOW_FILL
+            c.border = BORDER
+        # Reference columns (A..G) — light fill so it's clear they're not editable
+        for col_idx in range(1, 8):
+            c = ws5.cell(row=r_idx, column=col_idx)
+            c.border = BORDER
+
+    # Number formats
+    for r in ws5.iter_rows(min_row=5, min_col=6, max_col=6):  # F = Annual Qty
+        for c in r:
+            c.number_format = "#,##0"
+    for r in ws5.iter_rows(min_row=5, min_col=8, max_col=8):  # H = Quote Price
+        for c in r:
+            c.number_format = "$#,##0.00"
+
+    # Hide the item_key + rfq_line_id columns (Y, Z = 25, 26)
+    ws5.column_dimensions[get_column_letter(25)].hidden = True
+    ws5.column_dimensions[get_column_letter(26)].hidden = True
+
+    # Dropdown validation on key fields
+    try:
+        from openpyxl.worksheet.datavalidation import DataValidation
+        # Yes/No on cols P, S, T, U
+        yn = DataValidation(type="list", formula1='"Yes,No"', allow_blank=True)
+        ws5.add_data_validation(yn)
+        for col_letter in ("P", "S", "T", "U"):
+            yn.add(f"{col_letter}5:{col_letter}{4 + n_data_rows}")
+        # No Bid Reason dropdown on V
+        nobid = DataValidation(
+            type="list",
+            formula1='"Discontinued,Not Available,Not Stocked,Need More Information,Outside Capability,Pricing Not Competitive,Obsolete,Other"',
+            allow_blank=True,
+        )
+        ws5.add_data_validation(nobid)
+        nobid.add(f"V5:V{4 + n_data_rows}")
+        # UOM dropdown on I
+        uom = DataValidation(
+            type="list",
+            formula1='"EA,BX,PK,FT,IN,LB,KG,GAL,QT,PT,OZ,RL,CS,DZ,M,CM,MM,SET,KIT,Other"',
+            allow_blank=True,
+        )
+        ws5.add_data_validation(uom)
+        uom.add(f"I5:I{4 + n_data_rows}")
+    except Exception as e:
+        # Validation is nice-to-have; if openpyxl barfs, the file still works
+        pass
+
+    # Sheet protection — lock everything except yellow response cells
+    try:
+        # Mark response cells as unlocked first
+        from openpyxl.styles import Protection
+        for r_idx in range(5, 5 + n_data_rows):
+            for col_idx in range(8, 25):  # H..X = response cols
+                c = ws5.cell(row=r_idx, column=col_idx)
+                c.protection = Protection(locked=False)
+        ws5.protection.sheet = True
+        ws5.protection.password = "rfq"  # weak by design — deters accidents, not malice
+        ws5.protection.formatCells = False
+        ws5.protection.formatColumns = False
+        ws5.protection.formatRows = False
+    except Exception:
+        pass
+
+    autosize(ws5, max_w=40)
+    ws5.freeze_panes = "A5"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def list_loaded_supplier_names() -> list:
+    """Convenience for the JS to know which suppliers have loaded bids."""
+    return list((_STATE.get("bids", {}) or {}).keys())
 
 
 # ---------------------------------------------------------------------------

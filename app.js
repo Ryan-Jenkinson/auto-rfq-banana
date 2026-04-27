@@ -636,6 +636,68 @@ function _drawAnnualBars() {
 // ==========================================================================
 // Export candidate RFQ list (xlsx)
 // ==========================================================================
+$('gen-outbound-rfq').addEventListener('click', async () => {
+  if (!_rfqResult) return;
+  const includedKeys = _rfqResult.items.filter(it => it.included).map(it => it.item_num);
+  if (!includedKeys.length) { alert('No items marked included. Tick at least one row.'); return; }
+
+  const supplierBlock = prompt(
+    `Generate outbound RFQ xlsx files for ${includedKeys.length.toLocaleString()} included items.\n\n` +
+    `Enter supplier names (one per line):`,
+    'Grainger\nFastenal\nMSC'
+  );
+  if (!supplierBlock) return;
+  const suppliers = supplierBlock.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  if (!suppliers.length) return;
+
+  const today = new Date();
+  const rfqId = prompt('RFQ ID:', `RFQ-${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-001`);
+  if (!rfqId) return;
+
+  const dueDefault = new Date(Date.now() + 14 * 86400000).toISOString().slice(0, 10);
+  const dueDate = prompt('Response due date (YYYY-MM-DD):', dueDefault);
+  if (!dueDate) return;
+
+  const btn = $('gen-outbound-rfq');
+  btn.disabled = true;
+  const orig = btn.textContent;
+  try {
+    for (const sup of suppliers) {
+      btn.textContent = `Building ${sup}…`;
+      _py.globals.set('_outbound_supplier', sup);
+      _py.globals.set('_outbound_rfq_id', rfqId);
+      _py.globals.set('_outbound_due', dueDate);
+      _py.globals.set('_outbound_keys', includedKeys);
+      const xlsxB64 = await _py.runPythonAsync(`
+import base64
+from app_engine import gen_outbound_rfq_xlsx
+_b = gen_outbound_rfq_xlsx(_outbound_supplier, rfq_id=_outbound_rfq_id,
+                            response_due_date=_outbound_due,
+                            included_keys=_outbound_keys.to_py())
+base64.b64encode(_b).decode('ascii')
+`);
+      const bytes = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const safeSup = sup.replace(/[^a-zA-Z0-9_-]/g, '_');
+      a.href = url;
+      a.download = `${rfqId}_${safeSup}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      // Stagger downloads slightly so the browser doesn't choke
+      await new Promise(r => setTimeout(r, 300));
+    }
+    btn.textContent = `✓ Sent ${suppliers.length} files`;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2500);
+  } catch (err) {
+    console.error('[outbound RFQ]', err);
+    alert('Outbound RFQ generation failed: ' + (err.message || err));
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+});
+
 $('export-rfq-list').addEventListener('click', async () => {
   if (!_rfqResult) return;
   const btn = $('export-rfq-list');
@@ -768,6 +830,9 @@ function _renderBidIntakeRow() {
           <span style="color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Quoted value</span><br>
           <strong style="color:var(--accent);font-size:18px;">$${(s.total_quoted_value||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</strong>
         </div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn ghost" data-followup-supplier="${_escapeHtml(sup)}" style="padding:6px 12px;font-size:11px;">⬇ Follow-up xlsx</button>
+        </div>
       </div>
     `;
   }
@@ -783,6 +848,40 @@ remove_supplier_bid(${JSON.stringify(sup)})
 `);
       _saveMgr.markDirty();
       await _refreshBidViews();
+    });
+  });
+  wrap.querySelectorAll('[data-followup-supplier]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const sup = btn.getAttribute('data-followup-supplier');
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = 'Building…';
+      try {
+        _py.globals.set('_followup_supplier', sup);
+        const xlsxB64 = await _py.runPythonAsync(`
+import base64
+from app_engine import gen_supplier_followup_xlsx
+_b = gen_supplier_followup_xlsx(_followup_supplier)
+base64.b64encode(_b).decode('ascii')
+`);
+        const bytes = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
+        const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const safeSup = sup.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const ts = new Date().toISOString().slice(0, 10);
+        a.href = url;
+        a.download = `Followup_${safeSup}_${ts}.xlsx`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      } catch (err) {
+        console.error('[followup xlsx]', err);
+        alert('Follow-up xlsx generation failed: ' + (err.message || err));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
     });
   });
 }
@@ -966,10 +1065,37 @@ function _renderComparisonMatrix(matrix) {
   const rows = matrix.rows || [];
   if (!suppliers.length) { el.innerHTML = ''; return; }
 
+  // Recommendation distribution callout
+  const recCounts = (matrix.summary && matrix.summary.recommendation_counts) || {};
+  const recColors = {
+    ACCEPT:           'var(--green)',
+    PUSH_BACK:        'var(--accent)',
+    ASK_CLARIFICATION:'var(--cyan)',
+    MANUAL_REVIEW:    'var(--ink-1)',
+    EXCLUDE:          'var(--red)',
+  };
+  const recLabels = {
+    ACCEPT:           'Accept',
+    PUSH_BACK:        'Push back',
+    ASK_CLARIFICATION:'Ask clarification',
+    MANUAL_REVIEW:    'Manual review',
+    EXCLUDE:          'Exclude',
+  };
+  let recDistHtml = '<div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:18px;font-family:var(--mono);font-size:12px;">';
+  for (const k of ['ACCEPT','PUSH_BACK','ASK_CLARIFICATION','MANUAL_REVIEW','EXCLUDE']) {
+    const n = recCounts[k] || 0;
+    recDistHtml += `<div style="padding:10px 14px;background:var(--bg-1);border:1px solid var(--line);border-left:3px solid ${recColors[k]};border-radius:4px;">
+      <div style="color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">${recLabels[k]}</div>
+      <div style="color:${recColors[k]};font-size:18px;font-weight:600;margin-top:2px;">${n.toLocaleString()}</div>
+    </div>`;
+  }
+  recDistHtml += '</div>';
+
   // Filter to only items with at least one bid by default — cleaner view
   const rowsWithBids = rows.filter(r => r.n_quoted > 0);
 
   let html = `<h2 style="margin-top:0;">Comparison matrix · ${rowsWithBids.length.toLocaleString()} items with at least one bid <span style="color:var(--ink-2);font-size:14px;font-weight:400;">(${rows.length - rowsWithBids.length} no-bid items hidden)</span></h2>`;
+  html += recDistHtml;
   html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:70vh;">';
   html += '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
   html += `<thead style="background:var(--bg-2);position:sticky;top:0;z-index:1;"><tr>
@@ -981,7 +1107,7 @@ function _renderComparisonMatrix(matrix) {
     html += `<th style="padding:10px;text-align:right;color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;border-left:1px solid var(--line);">${_escapeHtml(sup)}</th>`;
   }
   html += `<th style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Cov</th>
-    <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Flags</th>
+    <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Recommendation</th>
   </tr></thead><tbody>`;
 
   // Sort by 24-mo qty × hist price desc (highest-value items first)
@@ -1014,7 +1140,10 @@ function _renderComparisonMatrix(matrix) {
       cells += `<td style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);color:${cellColor};font-weight:${isLow ? '700' : '400'};">${cellContent}</td>`;
     }
     const covColor = r.coverage === 'FULL' ? 'var(--green)' : r.coverage === 'PARTIAL' ? 'var(--accent)' : r.coverage === 'SINGLE' ? 'var(--cyan)' : 'var(--red)';
-    const flagsTxt = (r.flags || []).slice(0, 2).map(f => f.split(':')[0]).join(', ');
+    const rec = r.recommendation || 'MANUAL_REVIEW';
+    const recColor = recColors[rec] || 'var(--ink-1)';
+    const recLbl = recLabels[rec] || rec;
+    const recReason = r.recommendation_reason || '';
     html += `<tr style="border-bottom:1px solid rgba(122,109,115,0.25);" data-comp-item="${_escapeHtml(r.item_num)}">
       <td style="padding:8px 10px;color:var(--ink-0);">${_escapeHtml(r.item_num)}</td>
       <td style="padding:8px 10px;color:var(--ink-1);max-width:240px;">${_escapeHtml(_truncate(r.description, 50))}</td>
@@ -1022,7 +1151,7 @@ function _renderComparisonMatrix(matrix) {
       <td style="padding:8px 10px;text-align:right;color:var(--ink-1);">$${(r.last_unit_price||0).toFixed(2)}</td>
       ${cells}
       <td style="padding:8px 10px;text-align:center;color:${covColor};font-weight:600;font-size:10px;">${r.coverage}</td>
-      <td style="padding:8px 10px;color:var(--red);font-size:10px;">${_escapeHtml(flagsTxt)}</td>
+      <td style="padding:8px 10px;color:${recColor};font-size:11px;font-weight:600;" title="${_escapeHtml(recReason)}">${recLbl}</td>
     </tr>`;
   }
   if (rowsWithBids.length > cap) {
