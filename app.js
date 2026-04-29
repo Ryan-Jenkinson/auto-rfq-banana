@@ -320,9 +320,9 @@ $('to-bids').addEventListener('click', async () => {
 // Step 2: column mapping (auto-detect via aliases + manual override)
 // ==========================================================================
 const RFQ_FIELDS = [
-  { key: 'item_num',    label: 'Item #',                hint: 'Andersen Item Number — usually populated; blank for cXML/PunchOut suppliers like McMaster' },
+  { key: 'item_num',    label: 'Item #',                hint: 'Andersen Item Number — usually populated; blank for some cXML / PunchOut supplier exports (where the supplier\'s own SKU lives in the Part Number column instead)' },
   { key: 'eam_pn',      label: 'EAM Part Number',       hint: 'Andersen-side fallback if Item # missing' },
-  { key: 'part_number', label: 'Supplier Part Number',  hint: 'Supplier\'s own catalog SKU (e.g. McMaster\'s 5709A45). Used as fallback dedup key when Item # / EAM are blank' },
+  { key: 'part_number', label: 'Supplier Part Number',  hint: 'Supplier\'s own catalog SKU (e.g. Red Team\'s "RT-5709A45"). Used as fallback dedup key when Item # / EAM are blank' },
   { key: 'description', label: 'Description',           hint: 'Item / part description', required: true },
   { key: 'mfg_name',    label: 'Manufacturer',          hint: 'Manufacturer name (often blank or "N/A" for distributor-branded items — that\'s OK)' },
   { key: 'mfg_pn',      label: 'Manufacturer Part #',   hint: 'OEM part number' },
@@ -426,7 +426,7 @@ async function _saveCurrentMappingAsTemplate() {
     alert('Map at least one column before saving as a template.');
     return;
   }
-  const name = prompt('Name this mapping template (e.g. "Coupa-McMaster-export"):');
+  const name = prompt('Name this mapping template (e.g. "Coupa-RedTeam-export"):');
   if (!name) return;
   const t = _listMappingTemplates();
   t[name] = {
@@ -764,11 +764,11 @@ function _renderRfqTable() {
   // procurement person reads first time they look at the table.
   let head = `<tr>
     <th class="cell-include" title="Untick to drop an item from the RFQ. Default tick = had qty in the last 24 months. The 'Smart trim' button bulk-unticks WEAK/SKIP rows + risky description patterns.">RFQ</th>
-    <th title="Andersen item number (or McMaster Part Number when EAM is blank). The dedup key the engine matched on across the multi-year export.">Item #</th>
+    <th title="Andersen item number (or supplier Part Number when EAM is blank — common in cXML / PunchOut supplier exports). The dedup key the engine matched on across the multi-year export.">Item #</th>
     <th title="Engine score 0-100 + tier. STRONG = order frequency + recent activity + clean data. MODERATE = some flags. WEAK = thin/dormant history. SKIP = almost certainly not RFQ-worthy. Hover any tier chip for the per-item reason list.">Tier</th>
     <th title="The description Andersen has on file for this item. Chips next to it: red = service / freight / tariff / obsolete / rental (usually don't belong in an RFQ); amber = custom / repair / misc (caution); UOM mixed / MFG blank flags surface data hygiene issues.">Description</th>
     <th title="Manufacturer name. Often the strongest signal an RFQ has — suppliers price by manufacturer first, item number second. 'MFG blank' chip means the export didn't carry one for this item.">MFG</th>
-    <th title="Manufacturer's part number. The supplier-side anchor key — what the bidder uses to look up their cost. Blank means the export didn't carry one (very common in McMaster data).">MFG PN</th>
+    <th title="Manufacturer's part number. The supplier-side anchor key — what the bidder uses to look up their cost. Blank means the export didn't carry one (common in cXML / PunchOut supplier data).">MFG PN</th>
     <th class="num" title="Quantity ordered in the last 12 months (anchored to the dataset's most recent order date, not today's date — exports are often weeks stale).">12mo qty</th>
     <th class="num" title="12mo $ = qty_12mo × LAST $/ea. Internally consistent: 5 bananas at $5 each = $25. NOT the historical sum of line totals — that's spend_12mo_actual which you'd see in the headline KPI tile above.">12mo $</th>
     <th class="num" title="Quantity ordered in the last 24 months. The default RFQ baseline window — what the outbound RFQ xlsx asks suppliers to bid against.">24mo qty</th>
@@ -798,7 +798,7 @@ function _renderRfqTable() {
         flags.push(`<span class="flag-chip warn" title="Description pattern suggests caution before including in RFQ">${label}</span>`);
       }
       // 'generic' is informational only — not rendered as a chip (would
-      // clutter on McMaster data where 90% of items are generic).
+      // clutter on data sets where most items are generic).
     }
     // Demand-pattern flags (compact)
     const demandLabels = {
@@ -1122,7 +1122,7 @@ $('gen-outbound-rfq').addEventListener('click', async () => {
   const supplierBlock = prompt(
     `Generate outbound RFQ xlsx files for ${includedKeys.length.toLocaleString()} included items.\n\n` +
     `Enter supplier names (one per line):`,
-    'Grainger\nFastenal\nMSC'
+    'Red Team\nBlue Team\nGreen Team'
   );
   if (!supplierBlock) return;
   const suppliers = supplierBlock.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -1784,7 +1784,7 @@ json.dumps(result, default=str)
 
 // Renders the RAW / CLEAN / STRICT savings tiers as a panel below the bid-coverage KPIs.
 // Added on the demo-existing-rfq branch to surface the "real" savings number for the
-// Fastenal/Grainger/MSC RFQ demo where the RAW number is polluted by UOM mismatches.
+// the multi-supplier demo (Red / Blue / Green Team) where the RAW number is polluted by UOM mismatches.
 //
 // Tiers (per supplier + aggregate):
 //   RAW    = current dashboard behavior — every priced bid contributes (UOM-mismatched lines too)
@@ -1887,8 +1887,8 @@ function _renderCleanSavingsPanel(clean) {
 // trigger a re-render of the clean-savings panel so the NORMALIZED total
 // updates live.
 //
-// Built on the demo-existing-rfq branch to support the Fastenal+Grainger+MSC
-// real-bid demo where UOM mismatches dominate the discrepancy bucket. The
+// Built on the demo-existing-rfq branch to support a multi-supplier (Red /
+// Blue / Green Team) real-bid demo where UOM mismatches dominate the discrepancy bucket. The
 // underlying Python helpers (set_uom_annotation, list_items_needing_uom_resolution,
 // _extract_pack_size_from_notes, etc.) work without AI and are safe for the
 // live deployed app — analysts type in factors based on offline catalog
@@ -1985,7 +1985,7 @@ function _renderUomQueueTable(data, panel) {
       <div>
         <div style="font-size:14px;font-weight:600;color:var(--ink-0);">📐 UOM Resolution Queue</div>
         <div style="font-size:11px;color:var(--ink-2);margin-top:4px;">
-          Items where the bid's unit-of-measure differs from your history. Look up the McMaster catalog (or stockroom) to find the conversion factor, type it in below, hit Save. Item moves out of the queue and into the NORMALIZED savings tier. State persists with the save file — your colleague sees your resolutions when they open your shared backup.
+          Items where the bid's unit-of-measure differs from your history. Look up the supplier catalog (or stockroom) to find the conversion factor, type it in below, hit Save. Item moves out of the queue and into the NORMALIZED savings tier. State persists with the save file — your colleague sees your resolutions when they open your shared backup.
         </div>
       </div>
       <button class="btn ghost" id="uom-queue-close-btn" style="padding:6px 12px;font-size:12px;">✕ Close panel</button>
@@ -2692,7 +2692,7 @@ function _clearMatrixFilter(key) {
 
 function _renderComparisonMatrix(matrix) {
   // Cache the latest matrix payload so filter clicks can re-render without
-  // re-fetching from Python (the compute is multi-second on the McMaster
+  // re-fetching from Python (the compute is multi-second on a large
   // dataset).
   _lastMatrixData = matrix;
   const el = $('comparison-section');
