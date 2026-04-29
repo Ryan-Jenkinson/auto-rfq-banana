@@ -358,6 +358,20 @@ _STATE: dict = {
     "supplier_name": "",
     "source_file_stem": "",
     "windows": (12, 24, 36),
+    # Per-item outlier exclusions for the per-item history modal. Maps the
+    # item_num (display key) → list of 0-based indices into the ASCENDING-
+    # date-sorted po_lines for that item. Excluded indices are dropped from
+    # the trend/R²/median/expected-today recompute when the modal opens.
+    # Persisted via serialize_state / restore_state.
+    "item_exclusions": {},
+    # Per-item supplier locks — analyst-confirmed pinning of an item's
+    # award to a specific supplier after visually auditing a bid. Maps
+    # item_num → {"supplier": str, "reason": str, "locked_at": isoformat}.
+    # Locks are evaluated AFTER scenario `overrides` but BEFORE strategy
+    # logic in `_evaluate_scenario`, so the same lock applies across every
+    # scenario the user runs. A lock with no matching priced bid is
+    # remembered but does not force an award (recorded as a warning).
+    "item_locks": {},
 }
 
 
@@ -677,6 +691,15 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
     # Per-item PO lines are kept Python-side (not shipped to JS in the items
     # array) to keep the JS payload small. The modal pulls them on demand.
     _STATE["po_lines_by_key"] = {k: list(rec["po_lines"]) for k, rec in items.items()}
+
+    # If we're reloading a saved session, exclusions were restored ahead of
+    # the extract — replay them now so every aggregate (last_unit_price,
+    # qty_*, spend_*, KPIs) reflects the analyst's prior outlier curation.
+    # Without this, a saved exclusion would change the per-item modal view
+    # but the RFQ-list table, outbound xlsx, and downstream comparison
+    # would all read the stale (uncleaned) numbers.
+    if _STATE.get("item_exclusions"):
+        apply_all_item_exclusions_to_aggregates(rebuild_kpis=True)
 
     log_event(
         "extract_rfq_list",
@@ -1006,11 +1029,48 @@ def _median(values):
 def get_item_history(item_num: str) -> dict:
     """Return the per-item drill-down payload for the modal.
 
-    Includes the raw PO lines, the linear-trend fit (slope/intercept/R²), and
-    an "expected price today" extrapolation against the dataset's anchor date.
-    Used by the per-item modal to show order history + the expected-price
-    overlay ryan asked for: 'we last ordered 11mo ago at $12.40; trend says
-    we'd expect ~$13.10 today; supplier C bid $18.50 → suspicious'.
+    Builds the analytical view that backs the per-item history modal:
+      * Every PO line for this item, ascending by date, each tagged with its
+        canonical 0-based ``line_idx`` and an ``excluded`` flag pulled from
+        ``_STATE["item_exclusions"][item_num]``.
+      * A linear-trend fit (slope / intercept / R²) computed on the
+        NON-EXCLUDED priced lines only, so analysts can untick obvious
+        outliers in the modal table and watch the trend redraw cleanly.
+      * An "expected price today" extrapolation of that cleaned trend at the
+        dataset's anchor date — the "we last ordered 11 months ago at $12.40
+        / trend says ~$13.10 today" reference Ryan asked for.
+      * 90-day-median spike detection (same recency-tiebreak rule as the
+        table's LAST $/ea) — also computed against the cleaned line set.
+      * A per-supplier ``bids`` overlay listing every priced quote we have
+        for this item across all loaded supplier bid files. Each bid is
+        scored for distance from the cleaned trend's expected-today value:
+            - ``ratio`` = bid_price / expected_today  (1.0 = on the line)
+            - ``possible_typo`` = True when the bid is ≥60% below the trend
+              (ratio ≤ 0.4) — the "way below the line" pattern Ryan flagged
+              as the canonical typo signature.
+
+    The shape is JSON-safe (numbers, strings, bools) so the JS renderer can
+    consume it via runPythonAsync + json.dumps.
+
+    Args:
+        item_num: Display item number (the same field shown in the RFQ list
+            table). Internal lookup key is ``norm_pn(item_num)``.
+
+    Returns:
+        dict with: item_num, description, mfg_name, mfg_pn, uom, uom_mixed,
+        po_lines (each augmented with line_idx + excluded), summary, trend,
+        bids (overlay markers), exclusions (the in-effect index list).
+        Or ``{"error": "..."}`` if no history exists.
+
+    Gotchas:
+        * ``line_idx`` is into the ASCENDING-date-sorted list. The JS table
+          renders newest-first but must pass back this canonical index.
+        * If the user excludes EVERY priced line, trend fields fall back to
+          None and the chart shows raw points only (no trend line).
+        * ``latest_unit_price`` here is the cleaned-set's latest priced line.
+          The to-the-penny LAST $/ea used by the RFQ-list table elsewhere is
+          unrelated — Ryan's "no rounding/medians" rule is for that table,
+          not for this analytical modal.
     """
     if not item_num:
         return {"error": "item_num required"}
@@ -1023,24 +1083,34 @@ def get_item_history(item_num: str) -> dict:
     items = _STATE.get("items", [])
     item = next((it for it in items if it["item_num"] == item_num), None)
 
-    # Sort by date ascending
+    # Sort by date ascending — this is the canonical order. line_idx values
+    # in _STATE["item_exclusions"] index into THIS list.
     sorted_lines = sorted(po_lines, key=lambda r: r[0] or "")
+    excluded_set = set(
+        _STATE.get("item_exclusions", {}).get(item_num, []) or []
+    )
     line_dicts = [
         {
+            "line_idx": idx,
             "date": d,
             "qty": q,
             "unit_price": p,
             "line_total": lt,
             "po": po,
             "uom": uom,
+            "excluded": idx in excluded_set,
         }
-        for (d, q, p, lt, po, uom) in sorted_lines
+        for idx, (d, q, p, lt, po, uom) in enumerate(sorted_lines)
     ]
 
-    # Linear regression on (days_since_first_order, unit_price)
+    # Linear regression on (days_since_first_order, unit_price) — CLEANED
+    # set only. first_dt anchors x=0 to the earliest INCLUDED priced line so
+    # the slope+intercept render correctly when the user excludes the very
+    # first orders as outliers.
     first_dt = None
     xs, ys = [], []
-    for ln in line_dicts:
+    cleaned_line_dicts = [ln for ln in line_dicts if not ln["excluded"]]
+    for ln in cleaned_line_dicts:
         if not ln["date"] or ln["unit_price"] is None:
             continue
         try:
@@ -1052,15 +1122,20 @@ def get_item_history(item_num: str) -> dict:
         xs.append((d - first_dt).days)
         ys.append(float(ln["unit_price"]))
 
-    slope, intercept, r2 = _linear_fit(xs, ys)
+    if len(xs) >= 2:
+        slope, intercept, r2 = _linear_fit(xs, ys)
+    else:
+        # No fittable trend — surface None so the chart skips the line and
+        # the callout falls back to the confidence-reason text.
+        slope, intercept, r2 = (None, None, None)
     last_x = xs[-1] if xs else 0
     last_price = ys[-1] if ys else None
 
-    # Expected price at the dataset anchor date
+    # Expected price at the dataset anchor date — uses the cleaned-trend fit.
     expected_today = None
     days_since_last = None
     anchor = _STATE.get("data_anchor_date")
-    if anchor and first_dt:
+    if anchor and first_dt and slope is not None and intercept is not None:
         try:
             anchor_dt = datetime.fromisoformat(anchor)
             anchor_x = (anchor_dt - first_dt).days
@@ -1069,10 +1144,14 @@ def get_item_history(item_num: str) -> dict:
         except ValueError:
             pass
 
-    # Confidence label based on R² + sample size
+    # Confidence label based on R² + sample size of the CLEANED set.
+    excl_suffix = f" (after excluding {len(excluded_set)})" if excluded_set else ""
     if len(xs) < 3:
         confidence = "low"
-        confidence_reason = f"only {len(xs)} priced order line(s)"
+        confidence_reason = f"only {len(xs)} priced order line(s){excl_suffix}"
+    elif r2 is None:
+        confidence = "low"
+        confidence_reason = "trend not fittable on cleaned set"
     elif r2 < 0.2:
         confidence = "low"
         confidence_reason = f"R² {r2:.2f} — prices noisy, trend may not be meaningful"
@@ -1086,14 +1165,15 @@ def get_item_history(item_num: str) -> dict:
     # 90-day median price (analytical reference — separate from the to-the-penny
     # last_unit_price). Used as the "is the latest line a price spike" baseline
     # on the chart. Falls back to median of last 10 lines if <3 within 90 days.
+    # Computed on cleaned lines only so a single bad outlier doesn't dominate.
     median_90d = None
     median_window_label = None
-    if first_dt and ys:
+    if cleaned_line_dicts:
         try:
-            recent_dt = datetime.fromisoformat(line_dicts[-1]["date"])
+            recent_dt = datetime.fromisoformat(cleaned_line_dicts[-1]["date"])
             cutoff_90 = recent_dt - timedelta(days=90)
             recent_prices = [
-                ln["unit_price"] for ln in line_dicts
+                ln["unit_price"] for ln in cleaned_line_dicts
                 if ln["date"] and ln["unit_price"] is not None
                 and datetime.fromisoformat(ln["date"]) >= cutoff_90
             ]
@@ -1101,7 +1181,9 @@ def get_item_history(item_num: str) -> dict:
                 median_90d = _median(recent_prices)
                 median_window_label = f"90-day median ({len(recent_prices)} lines)"
             else:
-                fallback = sorted(line_dicts, key=lambda x: x["date"], reverse=True)[:10]
+                fallback = sorted(
+                    cleaned_line_dicts, key=lambda x: x["date"], reverse=True
+                )[:10]
                 fp = [ln["unit_price"] for ln in fallback if ln["unit_price"] is not None]
                 if fp:
                     median_90d = _median(fp)
@@ -1109,12 +1191,16 @@ def get_item_history(item_num: str) -> dict:
         except (ValueError, TypeError):
             pass
 
-    # Spike detection — compare latest unit price to median_90d.
-    # Use the SAME selection rule as the table's LAST $/ea: max by (date, po)
-    # so ties on the most recent date pick the highest PO # (later transaction).
-    priced_only = [(l[0], l[4], l[2]) for l in po_lines if l[2] is not None]
-    if priced_only:
-        latest_tuple = max(priced_only, key=lambda x: (x[0] or "", x[1] or ""))
+    # Spike detection — compare latest CLEANED unit price to median_90d.
+    # Selection rule mirrors the table's LAST $/ea: max by (date, po) so
+    # ties on the most recent date pick the highest PO # (later transaction).
+    priced_cleaned = [
+        (sorted_lines[idx][0], sorted_lines[idx][4], sorted_lines[idx][2])
+        for idx in range(len(sorted_lines))
+        if idx not in excluded_set and sorted_lines[idx][2] is not None
+    ]
+    if priced_cleaned:
+        latest_tuple = max(priced_cleaned, key=lambda x: (x[0] or "", x[1] or ""))
         latest_unit_price = latest_tuple[2]
     else:
         latest_unit_price = None
@@ -1138,6 +1224,19 @@ def get_item_history(item_num: str) -> dict:
                 "message": f"Latest ${latest_unit_price:,.2f} vs {median_window_label} ${median_90d:,.2f} ({pct_diff:+.0f}%)",
             }
 
+    # ------------------------------------------------------------------
+    # Supplier-bid overlay — every priced quote we have for this rfq_key,
+    # scored against the cleaned trend's expected-today price. Powers the
+    # right-edge horizontal markers on the per-item chart and the
+    # POSSIBLE_TYPO flag for "way below the line" bids.
+    # ------------------------------------------------------------------
+    locks = _STATE.get("item_locks", {}) or {}
+    locked_record = locks.get(item_num)
+    locked_supplier = locked_record.get("supplier") if locked_record else None
+    bids_overlay = _build_item_bid_overlay(
+        key, expected_today, latest_unit_price, locked_supplier
+    )
+
     return {
         "item_num": item_num,
         "description": item["description"] if item else "",
@@ -1146,6 +1245,11 @@ def get_item_history(item_num: str) -> dict:
         "uom": item["uom"] if item else "",
         "uom_mixed": item["uom_mixed"] if item else False,
         "po_lines": line_dicts,
+        "n_total_lines": len(line_dicts),
+        "n_excluded": sum(1 for ln in line_dicts if ln["excluded"]),
+        "n_priced_after_exclusion": len(xs),
+        "exclusions": sorted(excluded_set),
+        "lock": locked_record,
         "summary": {
             "po_count": item["po_count"] if item else 0,
             "qty_12mo": item["qty_12mo"] if item else 0,
@@ -1174,7 +1278,403 @@ def get_item_history(item_num: str) -> dict:
             "median_window_label": median_window_label,
             "spike": spike,
         },
+        "bids": bids_overlay,
     }
+
+
+# Threshold for the POSSIBLE_TYPO flag on the per-item bid overlay. A bid
+# whose ratio against expected_today (or, when no trend, against the latest
+# cleaned price) is ≤ this value is flagged as "way below the line" — the
+# canonical typo signature on supplier bid files.
+ITEM_OVERLAY_TYPO_RATIO_MAX = 0.4
+
+
+def _build_item_bid_overlay(rfq_key: str, expected_today, latest_price,
+                            locked_supplier: str = None) -> list:
+    """Collect every priced supplier bid for one item and tag each with a
+    distance metric vs. the cleaned trend.
+
+    Walks ``_STATE["bids"][supplier]["bids"]`` for every loaded supplier and
+    matches on the canonical ``rfq_key`` (already normalized via norm_pn).
+    Bids with status PRICED, UOM_DISC, and SUBSTITUTE that carry an
+    effective_price > 0 are surfaced. NO_BID and NEED_INFO are skipped.
+    UOM_DISC and SUBSTITUTE carry their own status flags so the UI can
+    distinguish them visually.
+
+    Distance scoring:
+      * If a non-None ``expected_today`` is available, use it as the
+        reference and report ``ratio = price / expected_today`` plus
+        ``pct_diff = (ratio - 1) * 100``.
+      * Otherwise fall back to ``latest_price`` for context (no trend
+        means no extrapolation, so ``ratio`` is informational only).
+      * ``possible_typo`` is True iff a reference exists AND
+        ``ratio <= ITEM_OVERLAY_TYPO_RATIO_MAX`` (≥60% below the line).
+
+    Lock awareness:
+      * Each entry carries an ``is_locked`` flag set when its supplier
+        equals ``locked_supplier``. The UI uses this to render the locked
+        bid distinctly and to disable cross-supplier lock buttons.
+
+    Returns a list sorted ascending by effective_price so the UI can render
+    overlays in price order. The locked bid (if any) keeps its natural
+    sort position — it's a status flag, not a sort key.
+    """
+    out = []
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+    if not rfq_key:
+        return out
+    reference = expected_today if expected_today is not None else latest_price
+    for supplier, parsed in bids_by_supplier.items():
+        if not isinstance(parsed, dict):
+            continue
+        for b in parsed.get("bids", []) or []:
+            if b.get("rfq_key") != rfq_key:
+                continue
+            # Use the engine's pre-computed effective_price (verified takes
+            # precedence over quoted) — same field the comparison matrix
+            # and scenario evaluation use, so what the analyst sees here
+            # matches what the award engine will award against.
+            price = b.get("effective_price")
+            if price is None or price <= 0:
+                continue
+            ratio = (price / reference) if (reference and reference > 0) else None
+            pct_diff = ((ratio - 1.0) * 100.0) if ratio is not None else None
+            possible_typo = (
+                ratio is not None and ratio <= ITEM_OVERLAY_TYPO_RATIO_MAX
+            )
+            out.append({
+                "supplier": supplier,
+                "price": float(price),
+                "qty": b.get("qty"),
+                "uom": b.get("uom") or "",
+                "status": b.get("status") or "",
+                "alt_part": b.get("alt_part") or "",
+                "notes": b.get("notes") or "",
+                "ratio": ratio,
+                "pct_diff": pct_diff,
+                "possible_typo": possible_typo,
+                "reference": ("trend" if expected_today is not None
+                              else ("latest" if latest_price is not None else None)),
+                "is_locked": (locked_supplier is not None
+                              and supplier == locked_supplier),
+            })
+    out.sort(key=lambda r: r["price"])
+    return out
+
+
+def set_item_lock(item_num: str, supplier: str, reason: str = "") -> dict:
+    """Pin one item's award to a specific supplier across every scenario.
+
+    Locks express analyst intent: 'I have visually audited Supplier X's bid
+    for this item and confirmed it. Award it to them regardless of who's
+    cheaper — the cheap one might be a typo I don't trust.'
+
+    Stored as ``_STATE["item_locks"][item_num] = {"supplier", "reason",
+    "locked_at"}``. Evaluated in ``_evaluate_scenario`` AFTER explicit
+    scenario overrides but BEFORE strategy logic, so the same lock applies
+    across every saved scenario for this RFQ event.
+
+    A lock for an item whose locked supplier never bid (or bid NO_BID) is
+    persisted but does NOT force an award — strategy logic falls through.
+    The ``decision_basis`` notes the lock as a warning when this happens.
+
+    Args:
+        item_num: Display item number (the same key the per-item modal opens with).
+        supplier: Exact supplier name (must match a key in _STATE["bids"]
+            for the lock to actually steer scenario evaluation).
+        reason: Free-form analyst note (e.g., "audited 4/29 — Grainger
+            confirmed UOM is each, not box").
+
+    Returns:
+        ``{"item_num", "supplier", "reason", "locked_at"}`` — the canonical
+        record after the write.
+    """
+    if not item_num:
+        return {"error": "item_num required"}
+    if not supplier:
+        return {"error": "supplier required (use clear_item_lock to remove)"}
+    locks = _STATE.setdefault("item_locks", {})
+    record = {
+        "supplier": supplier,
+        "reason": reason or "",
+        "locked_at": datetime.now().isoformat(),
+    }
+    locks[item_num] = record
+    log_event(
+        "item_lock_set",
+        f"{item_num} → {supplier}" + (f" ({reason})" if reason else ""),
+        item_num,
+    )
+    return {"item_num": item_num, **record}
+
+
+def clear_item_lock(item_num: str) -> dict:
+    """Remove a previously-set per-item supplier lock.
+
+    Returns ``{"item_num", "cleared": True/False}`` — False when no lock
+    existed for this item (no-op).
+    """
+    if not item_num:
+        return {"error": "item_num required"}
+    locks = _STATE.setdefault("item_locks", {})
+    had = item_num in locks
+    if had:
+        prev = locks.pop(item_num)
+        log_event(
+            "item_lock_clear",
+            f"{item_num} (was → {prev.get('supplier')})",
+            item_num,
+        )
+    return {"item_num": item_num, "cleared": had}
+
+
+def list_item_locks() -> dict:
+    """Return all in-effect item locks: ``{item_num: lock_record}``."""
+    return dict(_STATE.get("item_locks", {}) or {})
+
+
+def set_item_exclusions(item_num: str, excluded_indices) -> dict:
+    """Persist the user's outlier-line selections for one item — and propagate.
+
+    The exclusion isn't just a per-modal view filter: ``last_unit_price``,
+    every windowed ``qty_*`` / ``spend_*`` / ``spend_*_actual``, ``po_count``,
+    ``first_order``, ``last_order``, and the ``included`` default for this
+    item are re-derived from the cleaned ``po_lines_by_key`` set so the
+    RFQ-list table, outbound RFQ xlsx, and the comparison-stage historical
+    baseline + scenario savings all read the cleaned numbers. File-level
+    KPIs are rebuilt too so the headline tiles stay reconciled.
+
+    This is the load-bearing piece of the "no rounding in RFQ math" rule:
+    the rule was always about not blurring REAL prices (medians, smoothing,
+    averaging across periods); analyst-confirmed outlier removal is the
+    opposite — it's removing data errors so the to-the-penny number is
+    actually meaningful. Each exclusion change writes to the audit log so
+    the decision trail is preserved (Decision Log will pick this up too).
+
+    Stores the cleaned ``excluded_indices`` list under
+    ``_STATE["item_exclusions"][item_num]``. Empty lists clear the entry so
+    a fully-uncrossed item doesn't leave dead state in saves.
+
+    Args:
+        item_num: Display item number (matches the key used by the table).
+        excluded_indices: Iterable of 0-based indices into the
+            ascending-date-sorted po_lines for this item. Non-int entries
+            and duplicates are coerced/dedup'd.
+
+    Returns:
+        ``{"item_num", "n_excluded", "exclusions", "item": <updated record>,
+        "kpis": <rebuilt headline KPIs>}`` — the JS uses ``item`` to patch
+        ``_rfqResult.items`` in place and re-render the RFQ table, and
+        ``kpis`` to refresh the headline tiles.
+    """
+    if not item_num:
+        return {"error": "item_num required"}
+    cleaned = []
+    seen = set()
+    for v in (excluded_indices or []):
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            continue
+        if iv < 0 or iv in seen:
+            continue
+        seen.add(iv)
+        cleaned.append(iv)
+    cleaned.sort()
+    excl_map = _STATE.setdefault("item_exclusions", {})
+    if cleaned:
+        excl_map[item_num] = cleaned
+    else:
+        excl_map.pop(item_num, None)
+
+    # Propagate to the canonical item aggregates + the file-level KPIs.
+    updated_item = _recompute_item_aggregates_for(item_num)
+    rebuilt_kpis = _rebuild_kpis_from_items()
+
+    log_event(
+        "item_exclusions_set",
+        f"{item_num}: {len(cleaned)} line(s) excluded — last_unit_price now ${updated_item.get('last_unit_price') or 0:.2f}"
+        if updated_item else f"{item_num}: {len(cleaned)} line(s)",
+        item_num,
+    )
+    return {
+        "item_num": item_num,
+        "n_excluded": len(cleaned),
+        "exclusions": cleaned,
+        "item": updated_item,
+        "kpis": rebuilt_kpis,
+    }
+
+
+def _recompute_item_aggregates_for(item_num: str) -> dict:
+    """Re-derive one item's aggregates from its cleaned po_lines.
+
+    Walks ``_STATE["po_lines_by_key"][key]`` for the matching item, drops
+    the indices listed in ``_STATE["item_exclusions"][item_num]`` (indices
+    are positions in the ASCENDING-date-sorted line list, same convention
+    as ``get_item_history``), and writes back:
+
+        last_unit_price (current_price)  — most recent priced line in the
+                                            cleaned set, max by (date, po)
+        qty_12mo / qty_24mo / qty_36mo / qty_all
+        spend_12mo / 24mo / 36mo / all          (qty × current_price)
+        spend_12mo_actual / 24mo_actual / etc   (sum of cleaned line totals)
+        po_count                                (distinct PO# count, cleaned)
+        first_order, last_order                 (iso strings, cleaned)
+        included                                (default = qty_24mo > 0)
+
+    Returns the updated item dict (the same object that lives in
+    ``_STATE["items"]`` — JS-safe), or ``{}`` if the item isn't found.
+    """
+    items = _STATE.get("items", [])
+    item = next((it for it in items if it.get("item_num") == item_num), None)
+    if not item:
+        return {}
+    key = item.get("key") or norm_pn(item_num)
+    raw_lines = _STATE.get("po_lines_by_key", {}).get(key, [])
+    if not raw_lines:
+        return item
+    sorted_lines = sorted(raw_lines, key=lambda r: r[0] or "")
+    excluded = set(_STATE.get("item_exclusions", {}).get(item_num, []) or [])
+    cleaned_lines = [ln for idx, ln in enumerate(sorted_lines) if idx not in excluded]
+
+    # Window cutoffs anchored to the data, not the wall clock — same rule
+    # as extract_rfq_list (the dataset's max order date).
+    anchor_iso = _STATE.get("data_anchor_date")
+    anchor_dt = None
+    if anchor_iso:
+        try:
+            anchor_dt = datetime.fromisoformat(anchor_iso)
+        except ValueError:
+            anchor_dt = None
+    if anchor_dt is None:
+        anchor_dt = datetime.now()
+    cutoffs = {w: anchor_dt - timedelta(days=w * 30) for w in (12, 24, 36)}
+
+    qty_12 = qty_24 = qty_36 = qty_all = 0.0
+    spend_12 = spend_24 = spend_36 = spend_all = 0.0
+    first_dt = None
+    last_dt = None
+    last_unit_price = None
+    last_po_for_tiebreak = None
+    pos = set()
+
+    for (date_iso, qty, unit_price, line_total, po, uom) in cleaned_lines:
+        if qty is None or unit_price is None:
+            # Still count toward po_count / first/last but skip aggregates
+            if po: pos.add(po)
+            try:
+                d = datetime.fromisoformat(date_iso) if date_iso else None
+            except ValueError:
+                d = None
+            if d:
+                if first_dt is None or d < first_dt: first_dt = d
+                if last_dt  is None or d > last_dt:  last_dt = d
+            continue
+        try:
+            d = datetime.fromisoformat(date_iso) if date_iso else None
+        except ValueError:
+            d = None
+        ext = float(line_total) if line_total is not None else (qty * unit_price)
+        qty_all += qty
+        spend_all += ext
+        if d:
+            if first_dt is None or d < first_dt: first_dt = d
+            if last_dt is None or d > last_dt or (d == last_dt and (po or "") > (last_po_for_tiebreak or "")):
+                last_dt = d
+                last_unit_price = unit_price
+                last_po_for_tiebreak = po
+            for w in (12, 24, 36):
+                if d >= cutoffs[w]:
+                    if w == 12: qty_12 += qty; spend_12 += ext
+                    if w == 24: qty_24 += qty; spend_24 += ext
+                    if w == 36: qty_36 += qty; spend_36 += ext
+        if po: pos.add(po)
+
+    current_price = last_unit_price if last_unit_price is not None else item.get("last_unit_price")
+
+    item["po_count"] = len(pos)
+    item["qty_12mo"] = qty_12
+    item["qty_24mo"] = qty_24
+    item["qty_36mo"] = qty_36
+    item["qty_all"]  = qty_all
+    # Spend columns: qty × current_price (internally consistent for the table).
+    cp = current_price or 0
+    item["spend_12mo"] = qty_12 * cp
+    item["spend_24mo"] = qty_24 * cp
+    item["spend_36mo"] = qty_36 * cp
+    item["spend_all"]  = qty_all * cp
+    # Historical actuals: sum of line totals on the CLEANED set so file-level
+    # KPIs reconcile to the source minus the analyst's removed errors.
+    item["spend_12mo_actual"] = spend_12
+    item["spend_24mo_actual"] = spend_24
+    item["spend_36mo_actual"] = spend_36
+    item["spend_all_actual"]  = spend_all
+    item["last_unit_price"]   = current_price
+    item["first_order"] = first_dt.date().isoformat() if first_dt else None
+    item["last_order"]  = last_dt.date().isoformat() if last_dt else None
+    # `included` is a soft default; preserve any analyst-set deviation by
+    # only flipping it when it equals what the default WAS at extract time.
+    # Cheapest correct heuristic: leave `included` alone — the user controls
+    # it via the per-row checkbox / smart-trim, and we don't second-guess.
+    return item
+
+
+def _rebuild_kpis_from_items() -> dict:
+    """Recompute file-level headline KPIs from the current ``_STATE["items"]``.
+
+    Used after exclusions change so the top-of-page KPI tiles (Items / 12mo /
+    24mo / 36mo / Total spend) and active-items counts stay reconciled to
+    the cleaned per-item aggregates. ``annual_spend`` stays as the original
+    extract — exclusions are too rare to merit re-rolling the per-year
+    bars; if needed later we can re-derive from po_lines_by_key.
+
+    Returns the new KPI dict (also written to ``_STATE["kpis"]``).
+    """
+    items = _STATE.get("items", []) or []
+    if not items:
+        return _STATE.get("kpis", {})
+    prev = dict(_STATE.get("kpis", {}))
+    items_24mo = sum(1 for it in items if (it.get("qty_24mo") or 0) > 0)
+    items_12mo = sum(1 for it in items if (it.get("qty_12mo") or 0) > 0)
+    items_36mo = sum(1 for it in items if (it.get("qty_36mo") or 0) > 0)
+    total_spend = sum(it.get("spend_all_actual") or 0 for it in items)
+    spend_12mo = sum(it.get("spend_12mo_actual") or 0 for it in items)
+    spend_24mo = sum(it.get("spend_24mo_actual") or 0 for it in items)
+    spend_36mo = sum(it.get("spend_36mo_actual") or 0 for it in items)
+    kpis = {
+        **prev,
+        "item_count":  len(items),
+        "items_12mo":  items_12mo,
+        "items_24mo":  items_24mo,
+        "items_36mo":  items_36mo,
+        "total_spend": total_spend,
+        "spend_12mo":  spend_12mo,
+        "spend_24mo":  spend_24mo,
+        "spend_36mo":  spend_36mo,
+    }
+    _STATE["kpis"] = kpis
+    return kpis
+
+
+def apply_all_item_exclusions_to_aggregates(rebuild_kpis: bool = True) -> dict:
+    """Replay every saved exclusion against the current items list.
+
+    Called at the tail of ``extract_rfq_list`` when a previously-saved
+    session is reloaded — items are rebuilt from scratch, but exclusions
+    were restored ahead of the extract via ``restore_state``, so we need
+    to re-derive aggregates for every affected item.
+
+    Returns ``{"n_items_updated": int, "kpis": <updated>}``.
+    """
+    excl = _STATE.get("item_exclusions", {}) or {}
+    n = 0
+    for item_num in list(excl.keys()):
+        rec = _recompute_item_aggregates_for(item_num)
+        if rec:
+            n += 1
+    new_kpis = _rebuild_kpis_from_items() if rebuild_kpis else _STATE.get("kpis", {})
+    return {"n_items_updated": n, "kpis": new_kpis}
 
 
 # ---------------------------------------------------------------------------
@@ -3798,6 +4298,14 @@ def serialize_state() -> dict:
         # Survives save/load so the analyst's catalog-lookup work isn't lost,
         # AND rides through to a colleague's app when the JSON save is shared.
         "uom_annotations":      _STATE.get("uom_annotations", {}),
+        # Per-item outlier-line exclusions from the per-item history modal.
+        # Maps item_num → [excluded_indices into ascending-sorted po_lines].
+        # Survives save/load so the analyst's outlier curation persists across
+        # reopens of the RFQ event.
+        "item_exclusions":      _STATE.get("item_exclusions", {}),
+        # Per-item supplier locks — analyst-confirmed pins of an item's
+        # award to a specific supplier. Apply across every scenario.
+        "item_locks":           _STATE.get("item_locks", {}),
     }
 
 
@@ -3981,6 +4489,36 @@ def restore_state(payload: dict) -> None:
         _STATE["user_profile"] = payload["user_profile"]
     if "uom_annotations" in payload and isinstance(payload["uom_annotations"], dict):
         _STATE["uom_annotations"] = payload["uom_annotations"]
+    if "item_exclusions" in payload and isinstance(payload["item_exclusions"], dict):
+        # Coerce values to int lists — JSON round-trip preserves them but
+        # belt-and-suspenders against hand-edited save files.
+        cleaned = {}
+        for item_num, idxs in payload["item_exclusions"].items():
+            if not isinstance(idxs, (list, tuple)):
+                continue
+            ints = []
+            for v in idxs:
+                try:
+                    ints.append(int(v))
+                except (TypeError, ValueError):
+                    continue
+            if ints:
+                cleaned[str(item_num)] = sorted(set(ints))
+        _STATE["item_exclusions"] = cleaned
+    if "item_locks" in payload and isinstance(payload["item_locks"], dict):
+        cleaned_locks = {}
+        for item_num, rec in payload["item_locks"].items():
+            if not isinstance(rec, dict):
+                continue
+            sup = rec.get("supplier")
+            if not sup:
+                continue
+            cleaned_locks[str(item_num)] = {
+                "supplier": str(sup),
+                "reason": rec.get("reason") or "",
+                "locked_at": rec.get("locked_at") or "",
+            }
+        _STATE["item_locks"] = cleaned_locks
 
 
 # ---------------------------------------------------------------------------
@@ -4045,7 +4583,15 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
     award decisions + roll-up totals.
 
     overrides: {rfq_key: {"supplier": supplier_name | None, "reason": str}}
-               Manual per-item awards (highest priority, beats strategy).
+               Per-scenario manual awards. Highest priority — beats both
+               item locks and strategy logic.
+
+    Cross-scenario item locks (``_STATE["item_locks"]``) are applied AFTER
+    overrides but BEFORE strategy. A lock on item_num=X with supplier=S
+    forces award to S for every scenario, as long as S has a priced bid
+    for the item. If S did not bid (or bid NO_BID/NEED_INFO), the lock is
+    impotent for THIS evaluation (recorded in decision_basis as a warning)
+    and strategy logic falls through.
     """
     th = get_thresholds()
     items = _STATE.get("items", [])
@@ -4062,6 +4608,8 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
                and b["effective_price"] is not None and b["effective_price"] > 0:
                 bid_lookup[(sup, b["rfq_key"])] = b
 
+    item_locks = _STATE.get("item_locks", {}) or {}
+
     overrides = overrides or {}
     parameters = parameters or {}
     consolidate_supplier = parameters.get("supplier") if strategy == "consolidate_to" else None
@@ -4074,6 +4622,8 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
     n_no_award = 0
     n_manual = 0
     n_carved = 0
+    n_locked = 0          # locks that successfully forced an award this scenario
+    n_locks_unhonored = 0 # locks where the locked supplier didn't bid this item
     award_total = 0.0
     historical_total = 0.0
     items_switched = 0
@@ -4127,6 +4677,44 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
                 n_no_award += 1
                 historical_total += hist_price * qty
                 continue
+
+        # Item lock — analyst-confirmed pin to a specific supplier. Applies
+        # across every scenario. Beats strategy logic; loses to per-scenario
+        # explicit overrides above. If the locked supplier didn't bid this
+        # item, the lock is recorded as an unhonored warning and strategy
+        # logic continues normally below.
+        lock_record = item_locks.get(it["item_num"])
+        lock_warning = None
+        if lock_record:
+            locked_sup = lock_record.get("supplier")
+            locked_bid = bid_lookup.get((locked_sup, rfq_key)) if locked_sup else None
+            if locked_bid is not None:
+                price = locked_bid["effective_price"]
+                reason_txt = lock_record.get("reason") or "audited bid"
+                if incumbent and locked_sup.lower() == (incumbent or "").lower():
+                    incumbent_retained += 1
+                else:
+                    items_switched += 1
+                award_total += price * qty
+                historical_total += hist_price * qty
+                by_supplier[locked_sup] = by_supplier.get(locked_sup, 0) + price * qty
+                awards.append({
+                    "rfq_key": rfq_key, "item_num": it["item_num"], "description": it["description"],
+                    "qty_24mo": qty, "awarded_supplier": locked_sup, "awarded_price": price,
+                    "awarded_value": price * qty, "historical_price": hist_price,
+                    "historical_value": hist_price * qty,
+                    "savings_value": (hist_price - price) * qty if hist_price else 0,
+                    "decision_basis": f"LOCKED → {locked_sup} ({reason_txt})",
+                })
+                n_locked += 1
+                continue
+            else:
+                # Lock present but locked supplier didn't bid — surface as
+                # warning in the eventual decision_basis below.
+                n_locks_unhonored += 1
+                lock_warning = (
+                    f"NOTE: lock to {locked_sup} ignored — no priced bid"
+                )
 
         # Gather eligible bids for this item per the strategy filters
         candidates = []
@@ -4193,12 +4781,15 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
         historical_total += hist_price * qty
         by_supplier[chosen_sup] = by_supplier.get(chosen_sup, 0) + award_value
 
+        decision_with_warning = (
+            f"{decision} — {lock_warning}" if lock_warning else decision
+        )
         awards.append({
             "rfq_key": rfq_key, "item_num": it["item_num"], "description": it["description"],
             "qty_24mo": qty, "awarded_supplier": chosen_sup, "awarded_price": chosen_price,
             "awarded_value": award_value, "historical_price": hist_price,
             "historical_value": hist_price * qty, "savings_value": (hist_price - chosen_price) * qty if hist_price else 0,
-            "decision_basis": decision,
+            "decision_basis": decision_with_warning,
         })
 
     return {
@@ -4209,6 +4800,8 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
         "n_no_award": n_no_award,
         "n_manual_overrides": n_manual,
         "n_carved": n_carved,
+        "n_locked": n_locked,
+        "n_locks_unhonored": n_locks_unhonored,
         "items_switched": items_switched,
         "incumbent_retained": incumbent_retained,
         "award_total": award_total,

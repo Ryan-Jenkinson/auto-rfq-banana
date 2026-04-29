@@ -225,3 +225,17 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
   0%, 49%   { opacity: 1; }
   50%, 100% { opacity: 0.3; }
 }
+
+/* "Last viewed" row trail — after closing the per-item modal we leave a
+   subtle accent stripe on the row that opened it, so the user can tell
+   where they were in the list. Drops back to neutral after ~12s, but stays
+   visible long enough that scrolling-and-scanning doesn't lose the place. */
+tr.last-viewed-row {
+  background: rgba(255,183,51,0.12) !important;
+  box-shadow: inset 3px 0 0 var(--accent);
+  transition: background 8s ease-out 4s, box-shadow 8s ease-out 4s;
+}
+tr.last-viewed-row.fade {
+  background: transparent !important;
+  box-shadow: inset 3px 0 0 transparent;
+}

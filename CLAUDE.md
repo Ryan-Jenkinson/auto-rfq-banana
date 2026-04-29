@@ -46,7 +46,7 @@ Windows distribution: double-click `start.bat`.
 - UOM-canonicalized + uom_mixed flag if multiple distinct UOMs
 - File-level difficulty rating snapshot recorded with timestamp for period-end reporting
 
-UI affordances: tier filter / include-filter / search + min-spend filter, "Smart trim" bulk action (untick WEAK+SKIP + red-flagged desc patterns), bulk include/exclude all visible, manual per-row toggle, click-row → per-item history modal with order chart + 90-day median + spike detection + linear trend extrapolation, "Generate outbound RFQ files" button (multi-supplier).
+UI affordances: tier filter / include-filter / search + min-spend filter, "Smart trim" bulk action (untick WEAK+SKIP + red-flagged desc patterns), bulk include/exclude all visible, manual per-row toggle, click-row → per-item history modal with order chart + 90-day median + spike detection + linear trend extrapolation **+ outlier-line tickbox column (untick a row to drop it from the trend recompute)** + **supplier-bid overlay markers + per-bid lock buttons**, "Generate outbound RFQ files" button (multi-supplier). Closing the per-item modal leaves a fading highlight on the originating row so the user can tell where they were when scrolling resumes.
 
 **Step 4 — Compare bids + scenarios + outputs.** Multi-file dropzone for returned bid xlsx. Each loaded bid → per-supplier intake card (priced/no-bid/need-info/UOM-disc/substitute counts + total quoted value + 📥 follow-up xlsx button). Then:
 - Coverage KPIs (3+/2/1/0 bids breakdown + outliers + lowest-bid total + historical baseline)
@@ -62,7 +62,14 @@ UI affordances: tier filter / include-filter / search + min-spend filter, "Smart
 
 **Two-tier dedup-key fallback.** `item_num → eam_pn → part_number`. EAM is the primary for most Andersen suppliers; McMaster's blank-EAM cXML pattern is the reason for the part_number fallback.
 
-**Module-level state in `app.py`.** `_STATE` holds: items, kpis, annual_spend, supplier_name, difficulty, difficulty_history, po_lines_by_key, data_anchor_date, bids, scenarios, thresholds, audit_log. `serialize_state()` / `restore_state(payload)` round-trip the durable subset across save/reload.
+**Module-level state in `app.py`.** `_STATE` holds: items, kpis, annual_spend, supplier_name, difficulty, difficulty_history, po_lines_by_key, data_anchor_date, bids, scenarios, thresholds, audit_log, **item_exclusions, item_locks**. `serialize_state()` / `restore_state(payload)` round-trip the durable subset across save/reload.
+
+**Per-item outlier exclusions + supplier locks.** Two analyst-facing controls live on the per-item history modal:
+
+* `_STATE["item_exclusions"]` — `{item_num: [excluded_indices]}` into the ascending-date-sorted po_lines for that item. Untick a row in the modal's Order Lines table to drop it; trend / R² / 90-day median / expected-today price all recompute live on the cleaned set.
+* `_STATE["item_locks"]` — `{item_num: {"supplier", "reason", "locked_at"}}`. Click the per-bid lock button below the chart to pin this item's award to a specific supplier across every saved scenario. `_evaluate_scenario` checks locks AFTER explicit per-scenario overrides but BEFORE strategy logic. A lock without a matching priced bid is recorded as `n_locks_unhonored` and falls through to strategy. Use case: visually audit a bid that looks suspiciously cheap, then lock to a supplier you trust so an automated lowest-price scenario doesn't accidentally award a typo.
+
+Both fields persist via `serialize_state` / `restore_state` so the curation work survives a save/reload.
 
 **Splash → legal gate → app sequence.** The legal gate is hidden at page load and only revealed after splash dismissal. Canonical legal-gate copy from `~/.claude/skills/workpackage/references/templates.md` — do not customize per-tool.
 
@@ -89,7 +96,10 @@ UI affordances: tier filter / include-filter / search + min-spend filter, "Smart
 | `save_award_scenario(name, strategy, parameters, overrides, included_keys)` | Persist a what-if; strategies: lowest_price / lowest_qualified / consolidate_to / incumbent_preferred / manual |
 | `evaluate_award_scenario(name)` | Re-run a saved scenario against current state |
 | `compare_award_scenarios(name_a, name_b)` | Totals delta + per-item diffs |
-| `get_item_history(item_num)` | Per-item drill-down: PO lines + linear trend + spike detection + 90-day median reference |
+| `get_item_history(item_num)` | Per-item drill-down: PO lines (each tagged with line_idx + excluded), cleaned-set linear trend + spike detection + 90-day median + expected-today, plus a `bids` overlay listing every priced supplier quote scored against the trend (`possible_typo` flag at ratio ≤ 0.4) and an in-effect `lock` record if any |
+| `set_item_exclusions(item_num, excluded_indices)` | Persist analyst's outlier picks AND propagate to per-item aggregates + headline KPIs. Returns `{item_num, n_excluded, exclusions, item, kpis}` so JS can patch `_rfqResult.items` in place. Empty list clears. Indices are into ascending-date-sorted po_lines. |
+| `_recompute_item_aggregates_for(item_num)` / `apply_all_item_exclusions_to_aggregates()` | Internal helpers. The first re-derives one item's `last_unit_price` / `qty_*` / `spend_*` / `first_order` / `last_order` / `po_count` from cleaned po_lines; the second walks every saved exclusion (used after extract on session reload). |
+| `set_item_lock(item_num, supplier, reason="")` / `clear_item_lock(item_num)` / `list_item_locks()` | Pin one item's award to a supplier across every scenario. Wired into `_evaluate_scenario` after overrides, before strategy. |
 | `gen_candidate_rfq_list_xlsx(included_keys=None)` | Internal-audience candidate list xlsx |
 | `gen_outbound_rfq_xlsx(supplier, rfq_id, due_date, contact, included_keys)` | Per-supplier 5-tab outbound RFQ. Hidden item_key + rfq_line_id for round-trip. Locked cells, dropdown validation. |
 | `gen_supplier_followup_xlsx(supplier, included_keys=None)` | 7-tab pushback packet, template-based prose |
@@ -107,7 +117,7 @@ UI affordances: tier filter / include-filter / search + min-spend filter, "Smart
 4. **No Andersen-internal-only fields in supplier-bound files.** Outbound RFQs do NOT include historical paid prices. Award letters carry the supplier's own bid + qty + delivery only.
 5. **Browser main thread must not block.** Long Python work is split into stages with `await new Promise(r => setTimeout(r, 0))` between calls if needed.
 6. **Aliases must be multi-word or distinctive.** Bare common words (`unit`, `cost`, `id`, `price`) collide. Always use phrases like `"unit price"`.
-7. **RFQ math is to-the-penny.** No rounding in displayed prices, no medians or smoothing. Analytical references (90-day median for spike detection) are clearly labeled and never substitute for the exact LAST $/ea.
+7. **RFQ math is to-the-penny.** No rounding in displayed prices, no medians or smoothing. Analytical references (90-day median for spike detection) are clearly labeled and never substitute for the exact LAST $/ea. **Documented exception (per-item outlier-exclusion feature):** analyst-confirmed outlier removal via the per-item modal's `USE` checkbox column is allowed and propagates through to `last_unit_price`, every windowed `qty_*` / `spend_*` / `spend_*_actual`, `po_count`, `first_order`, `last_order`, file-level KPIs, the outbound RFQ xlsx, the comparison stage's historical baseline, and scenario savings totals. The rule was always about not blurring REAL prices (medians, averages, smoothing) — analyst curation that drops a confirmed data error is the opposite: it makes the to-the-penny number actually meaningful instead of polluted by a typo. Every exclusion is recorded in the audit log with the resulting `last_unit_price` so the decision trail survives into the Decision Log xlsx. Implementation: `set_item_exclusions` calls `_recompute_item_aggregates_for(item_num)` write-through, and `extract_rfq_list` calls `apply_all_item_exclusions_to_aggregates()` at the tail so reloads of saved sessions pick up prior curation.
 
 ## Cache + browser-refresh hygiene
 
@@ -139,7 +149,14 @@ McMaster headline numbers when extracted: 11,169 items / $2,660,088 total / 9,20
 
 ## Roadmap (what's NOT yet built)
 
-Active queue:
+Active queue (priority — surfaced 2026-04-29 as Ryan transitions out of MRO):
+- ~~**Per-item chart: outlier-exclusion + trendline-recalc + save** — on the per-item history modal, let the user untick obvious outlier orders from the lines table; recompute the linear-regression trend live; save the cleaned-orders set per item so reopens preserve the exclusion. Then on the same screen overlay all available supplier-bid quotes as horizontal markers — closest-to-line is the cleanest match; "way below the line" should flag as `POSSIBLE_TYPO`. Persist via `_STATE.item_exclusions = {item_num: [excluded_indices]}`.~~ ✅ **shipped 2026-04-29 on `feature/per-item-outlier-exclusion`** — also includes per-bid lock buttons (`_STATE["item_locks"]`) wired into `_evaluate_scenario` so audited bids can be pinned across all scenarios; bid overlays show every supplier quote on the chart with color-coded distance-from-trend; closing the modal leaves a fading row highlight on the originator.
+- **Click-targets across the dashboard need an audit** — many sections (callout cards with part counts, scorecard rows, comparison-matrix cells, supplier-strip cards) currently don't open per-item detail or filter the working matrix at the bottom. Goal: anywhere there's a clickable-looking element, clicking should drive the working table at the bottom to filter to that subset OR open the per-item modal. Audit existing screens; produce a list of dead-click sites; fix in batches.
+- **ELI5 hover-text everywhere** — every clickable / hoverable element should carry a tooltip explaining what it is in plain language (e.g. "12mo $ = quantity ordered in last 12 months × most-recent unit price. Used as the spend baseline this RFQ is bidding against."). Existing `gloss` / `ca-info` / `data-eli5` patterns work — extend to all interactive surfaces in the dashboard.
+- **Save-dialog on every export** — Pyodide currently triggers a browser-default download (lands in the user's `Downloads` folder, often confusingly). For pywebview-wrapped variants, swap the export path to call `window.pywebview.api.save_file_picker(filename, bytes_b64)` which pops a native Windows save dialog where the user picks the location. Need a small Python `Api` class registered into `webview.create_window(js_api=...)` exposing `save_file_picker`. Same fix applies to all sister apps (supplier-pricing, supplier-recon, tariff-impact, mro-match-toolkit). (~30-60 min per app once the pattern is built.)
+- **Per-item modal close → row highlight (cross-app convention)** — when a per-item / per-row drill-down modal closes, leave the originating row visibly highlighted so the user can tell where in the table they were before drilling in. Auto-rfq-banana ships this in `feature/per-item-outlier-exclusion` (CSS class `.last-viewed-row` + `_markLastViewedRow` helper that picks all `tr[data-item="..."]` and `tr[data-comp-item="..."]` matches and fades the highlight after ~12 s). **Same pattern is queued for every sister app** with a drill-down modal: supplier-pricing, supplier-recon, tariff-impact, mro-match-toolkit, supplier-metrics, and any future workpackage tools. The exact selector + auto-fade timer can vary, but the principle (subtle accent stripe on the originating row, fades after ~10-15 s) is uniform.
+
+Active queue (existing):
 - **Validation severity tiers** + row-level validation table on import (Error / Warning / Info)
 - **Saved column-mapping templates per supplier** (one-click re-apply)
 - **Item conflict detection** (same MFG PN with different item numbers, etc.)
