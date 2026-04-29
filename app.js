@@ -3028,18 +3028,23 @@ function _renderItemHistory(h) {
   }
 
   // Status hint above the table — mention the cleaned-set count and a quick
-  // reset link if any exclusions are active.
+  // reset link if any exclusions are active. The "✓ Saved" affordance below
+  // the status confirms each tick/untick is committed without needing an
+  // explicit Save button (which would be misleading, since the data layer
+  // is auto-saved per change anyway: Python _STATE writes through, the
+  // RFQ table + KPIs reconcile in place, the master data-quality log
+  // logs the event, and the save manager autosave kicks in within 60s).
   const statusEl = document.getElementById('im-exclusion-status');
   if (statusEl) {
     if (h.n_excluded > 0) {
-      statusEl.innerHTML = `<span style="color:var(--amber, var(--accent));">${h.n_excluded} excluded</span> · trend fit on ${h.n_priced_after_exclusion || 0} priced line${(h.n_priced_after_exclusion || 0) === 1 ? '' : 's'} · <a href="#" id="im-exclusion-reset" style="color:var(--accent);text-decoration:underline;">reset all</a>`;
+      statusEl.innerHTML = `<span style="color:var(--amber, var(--accent));">${h.n_excluded} excluded</span> · trend fit on ${h.n_priced_after_exclusion || 0} priced line${(h.n_priced_after_exclusion || 0) === 1 ? '' : 's'} · <a href="#" id="im-exclusion-reset" style="color:var(--accent);text-decoration:underline;">reset all</a> · <span style="color:var(--ink-2);">auto-saved per change</span>`;
       const resetEl = document.getElementById('im-exclusion-reset');
       if (resetEl) resetEl.addEventListener('click', (ev) => {
         ev.preventDefault();
         _resetItemExclusions(itemNum);
       });
     } else {
-      statusEl.textContent = 'Untick a row to drop that order from the trend & spike calc.';
+      statusEl.innerHTML = 'Untick a row to drop that order from the trend &amp; spike calc · <span style="color:var(--ink-2);">auto-saved per change, no Save button needed</span>';
     }
   }
 
@@ -3077,6 +3082,7 @@ async function _persistItemExclusions(itemNum, indicesArr) {
   // The returned payload carries the freshly-recomputed item record + the
   // headline KPIs so the JS can patch _rfqResult.items in place and re-
   // render the RFQ table + KPI tiles without doing a full re-extract.
+  _showItemModalSavePulse('saving…', 'pending');
   try {
     _py.globals.set('_item_num_in', itemNum);
     _py.globals.set('_excluded_in', indicesArr);
@@ -3104,8 +3110,43 @@ json.dumps(set_item_exclusions(_item_num_in, list(_excluded_in)), default=str)
     if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) {
       _saveMgr.markDirty();
     }
+    _showItemModalSavePulse('✓ Saved · RFQ table + log updated', 'ok');
   } catch (err) {
     console.error('[item-exclusions] persist failed', err);
+    _showItemModalSavePulse('✗ Save failed — see console', 'err');
+  }
+}
+
+// Transient toast inside the per-item modal (top-right, above the chart)
+// confirming the auto-save committed. Avoids the "did my click stick?"
+// uncertainty without adding a misleading explicit Save button.
+function _showItemModalSavePulse(text, state) {
+  let el = document.getElementById('im-save-pulse');
+  if (!el) {
+    const card = document.getElementById('item-modal-card');
+    if (!card) return;
+    el = document.createElement('div');
+    el.id = 'im-save-pulse';
+    el.style.cssText = 'position:absolute;top:18px;right:60px;font-family:var(--mono);font-size:11px;letter-spacing:0.04em;padding:4px 10px;border-radius:3px;pointer-events:none;opacity:0;transition:opacity 0.2s;z-index:5;';
+    // The header div inside the card has position relative implicitly —
+    // ensure the card is a positioning context for the absolute pulse.
+    if (getComputedStyle(card).position === 'static') card.style.position = 'relative';
+    card.appendChild(el);
+  }
+  const colors = {
+    ok:      { bg: 'rgba(61,220,132,0.16)',  fg: 'var(--green)',  border: 'var(--green)' },
+    pending: { bg: 'rgba(122,138,168,0.16)', fg: 'var(--ink-2)',  border: 'var(--line)'  },
+    err:     { bg: 'rgba(255,77,109,0.16)',  fg: 'var(--red)',    border: 'var(--red)'   },
+  };
+  const c = colors[state] || colors.ok;
+  el.style.background = c.bg;
+  el.style.color = c.fg;
+  el.style.border = `1px solid ${c.border}`;
+  el.textContent = text;
+  el.style.opacity = '1';
+  if (el._fadeT) clearTimeout(el._fadeT);
+  if (state !== 'pending') {
+    el._fadeT = setTimeout(() => { el.style.opacity = '0'; }, 1800);
   }
 }
 
