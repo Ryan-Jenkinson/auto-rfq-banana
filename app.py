@@ -1739,29 +1739,57 @@ def compute_clean_savings_summary_DEPRECATED_BIDLINE_BASED() -> dict:
 
 def compute_clean_savings_summary() -> dict:
     """Compute "clean" savings metrics that exclude bids polluted by data-quality
-    issues. Operates on the comparison matrix output (item-deduplicated).
+    issues, plus a NORMALIZED tier that re-includes UOM-mismatched items where
+    the analyst has supplied a manual conversion factor (or where one was
+    auto-extracted from the supplier's notes).
 
-    Three savings tiers per supplier, each progressively stricter — same shape
-    as the deprecated version above, but iterates over the comparison matrix
-    rows (one row per item) rather than the raw bid list (which has duplicate
-    lines per item in some files like Fastenal).
+    Four tiers per supplier, each progressively stricter then re-broadened:
 
-    See compute_clean_savings_summary_DEPRECATED_BIDLINE_BASED for the prior
-    implementation that double-counted dup'd bid lines. Kept temporarily for
-    diff visibility; remove once the new function is verified correct.
+    - RAW        — every priced bid (current dashboard behavior; polluted by
+                   UOM mismatches)
+    - CLEAN      — excludes UOM_DISC / NO_BID / NEED_INFO / SUBSTITUTE statuses
+    - STRICT     — CLEAN + bid UOM equals history UOM after normalization
+    - NORMALIZED — STRICT + UOM-mismatched items where a "resolved" annotation
+                   exists in _STATE["uom_annotations"]. Bid price is adjusted
+                   by the annotation's factor before computing savings, so a
+                   per-each Fastenal bid of $0.0123 with factor=50 contributes
+                   $0.615 (the per-package equivalent) for comparison against
+                   a per-package McMaster anchor of e.g. $0.620.
+
+    Returns:
+        {
+          "by_supplier": [
+            {"supplier", "raw_savings", "clean_savings", "strict_savings",
+             "normalized_savings",
+             "n_raw", "n_clean", "n_strict", "n_normalized",
+             "n_excluded_by_status", "n_excluded_by_uom",
+             "n_resolved_by_annotation",   # how many of the n_excluded_by_uom
+                                            # were recovered by an annotation
+            },
+            ...
+          ],
+          "totals": {"raw": float, "clean": float, "strict": float, "normalized": float},
+        }
+
+    NORMALIZED is a SUPERSET of STRICT — it includes everything in STRICT plus
+    the recovered annotated items. Use NORMALIZED for the "after the analyst
+    has done UOM resolution" headline.
     """
     matrix = compute_comparison_matrix()
     rows = matrix.get("rows", [])
     suppliers = matrix.get("suppliers", [])
+    annotations = _STATE.get("uom_annotations") or {}
 
     by_supplier_dict = {sup: {
         "supplier": sup,
-        "raw_savings": 0.0, "clean_savings": 0.0, "strict_savings": 0.0,
-        "n_raw": 0, "n_clean": 0, "n_strict": 0,
+        "raw_savings": 0.0, "clean_savings": 0.0,
+        "strict_savings": 0.0, "normalized_savings": 0.0,
+        "n_raw": 0, "n_clean": 0, "n_strict": 0, "n_normalized": 0,
         "n_excluded_by_status": 0, "n_excluded_by_uom": 0,
+        "n_resolved_by_annotation": 0,
     } for sup in suppliers}
 
-    totals = {"raw": 0.0, "clean": 0.0, "strict": 0.0}
+    totals = {"raw": 0.0, "clean": 0.0, "strict": 0.0, "normalized": 0.0}
 
     for r in rows:
         hist_price = r.get("last_unit_price") or 0
@@ -1782,32 +1810,371 @@ def compute_clean_savings_summary() -> dict:
             agg["n_raw"] += 1
             totals["raw"] += line_savings
 
+            status = b.get("status")
+            bid_uom = _norm_uom((b.get("raw") or {}).get("uom"))
+            uom_match = (not bid_uom or not hist_uom or bid_uom == hist_uom)
+            ann = annotations.get(_annotation_key(r.get("rfq_key"), sup))
+
             # CLEAN — status-filtered
-            if b.get("status") != BID_STATUS_PRICED:
+            if status != BID_STATUS_PRICED:
                 agg["n_excluded_by_status"] += 1
+                # Status-excluded items mostly get NO normalized recovery —
+                # NO_BID/NEED_INFO/SUBSTITUTE means there isn't a clean priced
+                # number to begin with. EXCEPT: UOM_DISC items DO have valid
+                # prices (just flagged for unit warning); analyst-annotated
+                # ones can still flow into NORMALIZED.
+                if status == BID_STATUS_UOM_DISC and ann and ann.get("status") == "resolved":
+                    adjusted_bid, _ = _apply_annotation_to_price(bid_price, hist_price, ann)
+                    if adjusted_bid is not None:
+                        adjusted_savings = (hist_price - adjusted_bid) * qty
+                        agg["normalized_savings"] += adjusted_savings
+                        agg["n_normalized"] += 1
+                        agg["n_resolved_by_annotation"] += 1
+                        totals["normalized"] += adjusted_savings
                 continue
             agg["clean_savings"] += line_savings
             agg["n_clean"] += 1
             totals["clean"] += line_savings
 
             # STRICT — clean + UOM match
-            bid_uom = _norm_uom((b.get("raw") or {}).get("uom"))
-            if bid_uom and hist_uom and bid_uom != hist_uom:
+            if uom_match:
+                agg["strict_savings"] += line_savings
+                agg["n_strict"] += 1
+                totals["strict"] += line_savings
+                # And also counted in NORMALIZED (STRICT + annotation recoveries)
+                agg["normalized_savings"] += line_savings
+                agg["n_normalized"] += 1
+                totals["normalized"] += line_savings
+            else:
+                # Silent UOM mismatch (status=PRICED but units differ) — out of
+                # STRICT. Try to recover via annotation.
                 agg["n_excluded_by_uom"] += 1
-                continue
-            agg["strict_savings"] += line_savings
-            agg["n_strict"] += 1
-            totals["strict"] += line_savings
+                if ann and ann.get("status") == "resolved":
+                    adjusted_bid, _ = _apply_annotation_to_price(bid_price, hist_price, ann)
+                    if adjusted_bid is not None:
+                        adjusted_savings = (hist_price - adjusted_bid) * qty
+                        agg["normalized_savings"] += adjusted_savings
+                        agg["n_normalized"] += 1
+                        agg["n_resolved_by_annotation"] += 1
+                        totals["normalized"] += adjusted_savings
 
     by_supplier = list(by_supplier_dict.values())
-    by_supplier.sort(key=lambda d: -d["strict_savings"])
+    by_supplier.sort(key=lambda d: -d["normalized_savings"])
     for s in by_supplier:
-        s["raw_savings"] = round(s["raw_savings"], 2)
-        s["clean_savings"] = round(s["clean_savings"], 2)
-        s["strict_savings"] = round(s["strict_savings"], 2)
+        for k in ("raw_savings", "clean_savings", "strict_savings", "normalized_savings"):
+            s[k] = round(s[k], 2)
     return {
         "by_supplier": by_supplier,
         "totals": {k: round(v, 2) for k, v in totals.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
+# UOM resolution — manual annotations + auto-fill from supplier notes
+# ---------------------------------------------------------------------------
+#
+# The problem: when a bid's UOM doesn't match the history's UOM (e.g., Fastenal
+# quotes per-each $0.0123, McMaster anchor is per-package $1.23), comparing them
+# directly produces nonsense savings. The STRICT savings tier in
+# compute_clean_savings_summary excludes these from headline math.
+#
+# This module lets analysts ANNOTATE items with the conversion factor so the
+# bid price can be normalized to the history's UOM, moving the item from
+# STRICT-excluded to NORMALIZED-comparable.
+#
+# Two ways an annotation gets set:
+#   1. AUTO — extracted from a parseable supplier note (e.g., "(50' Spool)"
+#      tells us 1 spool = 50 ft, so per-foot bid × 50 = per-spool comparable)
+#   2. MANUAL — analyst looks up McMaster catalog (or stockroom) offline and
+#      types in the conversion factor via the UOM Resolution Queue UI
+#
+# Persists in _STATE["uom_annotations"] keyed by (item_key, supplier). Rides
+# through serialize_state / restore_state so the work survives save/load.
+# ---------------------------------------------------------------------------
+
+import re as _uom_re
+
+# Patterns we can auto-extract from supplier notes. Each tuple:
+#   (regex, capture-group-name, factor-derivation-fn(match) -> int|float|None)
+# Returning None means the pattern matched but we couldn't pin down a factor
+# (e.g., "(Per Inch)" tells us the bid UOM but not how many inches per piece).
+_AUTO_PATTERNS = [
+    # "(50' Spool)" / "(300' Spool)" → factor = the number (length of one spool)
+    (_uom_re.compile(r"\((\d+)\s*['′]?\s*(?:Spool|Roll|Reel)\)", _uom_re.IGNORECASE),
+     "spool_size",
+     lambda m: int(m.group(1))),
+    # "Pack of 10", "Pack of 25" → factor = pack count
+    (_uom_re.compile(r"Pack\s*of\s*(\d+)", _uom_re.IGNORECASE),
+     "pack_of",
+     lambda m: int(m.group(1))),
+    # "(10 Pack)", "(25/Pack)" → same
+    (_uom_re.compile(r"\(\s*(\d+)\s*[/\s]?Pack\s*\)", _uom_re.IGNORECASE),
+     "pack_count",
+     lambda m: int(m.group(1))),
+    # "Bag of 100" / "Box of 50" / "Carton of 12"
+    (_uom_re.compile(r"(?:Bag|Box|Carton|Bundle)\s*of\s*(\d+)", _uom_re.IGNORECASE),
+     "container_of",
+     lambda m: int(m.group(1))),
+    # "(Per Inch)" / "(Per Foot)" — we know the supplier's per-X but not the
+    # piece dimensions. Return None for factor; flag as needs-review.
+    (_uom_re.compile(r"\(?\s*Per\s+(Inch|Foot|Each|Meter|Centimeter|Yard)\s*\)?", _uom_re.IGNORECASE),
+     "per_x",
+     lambda m: None),
+]
+
+
+def _extract_pack_size_from_notes(notes_text: str) -> dict:
+    """Look at a supplier-bid note for parseable UOM-conversion patterns.
+
+    Returns:
+        {"factor": int|float|None,
+         "pattern": str,                  # which pattern matched
+         "raw_match": str,                # the matched substring
+         "confidence": "high" | "low"}    # high = explicit count; low = unit-only
+        OR None if no pattern matched.
+
+    Examples:
+        "UOM Discrepancy (50' Spool)"     -> {factor: 50, pattern: "spool_size", confidence: "high"}
+        "Sold per Pack of 25"             -> {factor: 25, pattern: "pack_of", confidence: "high"}
+        "(Per Inch)"                       -> {factor: None, pattern: "per_x", confidence: "low"}
+        "REVIEWED AND CORRECT!"            -> None
+    """
+    if not notes_text:
+        return None
+    s = str(notes_text)
+    for rx, name, factor_fn in _AUTO_PATTERNS:
+        m = rx.search(s)
+        if m:
+            try:
+                factor = factor_fn(m)
+            except Exception:
+                factor = None
+            return {
+                "factor": factor,
+                "pattern": name,
+                "raw_match": m.group(0),
+                "confidence": "high" if factor is not None else "low",
+            }
+    return None
+
+
+def _annotation_key(item_key: str, supplier: str) -> str:
+    """Composite key — annotations are per-(item, supplier) since the same
+    item can have different UOM mismatches with different suppliers."""
+    return f"{item_key}|{supplier}"
+
+
+def set_uom_annotation(item_key: str, supplier: str, factor, hist_uom: str = "",
+                       bid_uom: str = "", note: str = "", status: str = "resolved",
+                       set_by: str = "", direction: str = "auto_detect") -> dict:
+    """Manually annotate the conversion factor for a (item, supplier) pair.
+
+    Args:
+        item_key:  the item's RFQ key (item.key from extract_rfq_list)
+        supplier:  the supplier name (matches one of _STATE["bids"] keys)
+        factor:    the integer/float relating the two UOMs. Direction matters:
+                   - direction="multiply": adjusted_bid = bid_price × factor
+                                            (use when supplier quoted in smaller units)
+                   - direction="divide": adjusted_bid = bid_price / factor
+                                          (use when supplier quoted in larger units)
+                   - direction="auto_detect": at apply-time, pick whichever
+                                              direction puts adjusted_bid closer
+                                              to hist_price. Useful when the
+                                              user is uncertain; risky for
+                                              cases where both directions are
+                                              far from history.
+                   Pass None to mark needs-review without committing a factor.
+        hist_uom:  the history's UOM string (snapshot, for sanity-check)
+        bid_uom:   the bid's UOM string (snapshot)
+        note:      optional analyst memo (e.g., "McMaster pkg/50 per catalog")
+        status:    "resolved" | "skipped" | "needs_review"
+        set_by:    optional user name for audit trail
+        direction: see factor docstring above
+
+    Returns the stored annotation dict.
+    """
+    if not item_key or not supplier:
+        raise ValueError("item_key and supplier are required")
+    if status not in ("resolved", "skipped", "needs_review"):
+        raise ValueError(f"invalid status: {status!r}")
+    if direction not in ("multiply", "divide", "auto_detect"):
+        raise ValueError(f"invalid direction: {direction!r}")
+
+    if "uom_annotations" not in _STATE:
+        _STATE["uom_annotations"] = {}
+    key = _annotation_key(item_key, supplier)
+    annotation = {
+        "item_key": item_key,
+        "supplier": supplier,
+        "factor": factor,
+        "direction": direction,
+        "hist_uom": hist_uom,
+        "bid_uom": bid_uom,
+        "note": note,
+        "status": status,
+        "set_by": set_by,
+        "set_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _STATE["uom_annotations"][key] = annotation
+    log_event("uom_annotation_set",
+              f"factor={factor} dir={direction} status={status}" + (f" note={note!r}" if note else ""),
+              related=f"{supplier}:{item_key}")
+    return annotation
+
+
+def _apply_annotation_to_price(bid_price: float, hist_price: float, ann: dict):
+    """Apply a UOM annotation to a bid price, respecting the direction.
+
+    Returns (adjusted_bid, direction_used) or (None, None) if the annotation
+    can't be applied (missing factor, invalid type, etc.).
+    """
+    factor = ann.get("factor")
+    if not factor:
+        return None, None
+    try:
+        f = float(factor)
+        if f <= 0:
+            return None, None
+    except (TypeError, ValueError):
+        return None, None
+    direction = ann.get("direction", "auto_detect")
+    if direction == "multiply":
+        return bid_price * f, "multiply"
+    if direction == "divide":
+        return bid_price / f, "divide"
+    # auto_detect — pick the direction that puts adjusted closer to hist_price.
+    # Compute both candidates' relative distance from hist; prefer the smaller.
+    cand_mul = bid_price * f
+    cand_div = bid_price / f
+    dist_mul = abs(cand_mul - hist_price) / hist_price if hist_price > 0 else float("inf")
+    dist_div = abs(cand_div - hist_price) / hist_price if hist_price > 0 else float("inf")
+    if dist_mul <= dist_div:
+        return cand_mul, "multiply (auto)"
+    return cand_div, "divide (auto)"
+
+
+def get_uom_annotation(item_key: str, supplier: str) -> dict:
+    """Return the stored annotation for (item, supplier), or None if not set."""
+    return (_STATE.get("uom_annotations") or {}).get(_annotation_key(item_key, supplier))
+
+
+def clear_uom_annotation(item_key: str, supplier: str) -> bool:
+    """Remove an annotation. Returns True if one was present, False if not."""
+    key = _annotation_key(item_key, supplier)
+    annotations = _STATE.get("uom_annotations") or {}
+    if key in annotations:
+        del annotations[key]
+        log_event("uom_annotation_cleared", "removed", related=f"{supplier}:{item_key}")
+        return True
+    return False
+
+
+def list_items_needing_uom_resolution(spend_threshold: float = 0) -> list:
+    """Build the queue for the UOM Resolution UI.
+
+    Returns a list of {item, supplier, bid, history_qty, history_price,
+    auto_suggestion, annotation, ranked_by_spend_24mo} for every (item,
+    supplier) pair that:
+        - Has a priced bid (effective_price > 0)
+        - Has a usable history anchor (last_unit_price > 0, qty_24mo > 0)
+        - Either:
+              a) bid status is UOM_DISC, OR
+              b) bid_uom != hist_uom after normalization
+          AND has NOT already been resolved/skipped (status != "resolved" / "skipped")
+
+    Items already annotated with status="resolved" or "skipped" are filtered
+    OUT (they're already handled). Items annotated "needs_review" stay in the
+    list because they're still pending analyst input.
+
+    Auto-suggestion field includes any parseable pattern from supplier notes
+    (e.g., "(50' Spool)" → {factor: 50}).
+
+    spend_threshold: optional filter to skip low-value items.
+    """
+    matrix = compute_comparison_matrix()
+    rows = matrix.get("rows", [])
+    annotations = _STATE.get("uom_annotations") or {}
+    out = []
+
+    for r in rows:
+        hist_uom = _norm_uom(r.get("uom"))
+        hist_price = r.get("last_unit_price") or 0
+        qty = r.get("qty_24mo") or 0
+        if hist_price <= 0 or qty <= 0:
+            continue
+        spend_24 = hist_price * qty
+        if spend_24 < spend_threshold:
+            continue
+        item_key = r.get("rfq_key")
+
+        for sup, bid in (r.get("bids") or {}).items():
+            if not isinstance(bid, dict): continue
+            bid_price = bid.get("price") or 0
+            if bid_price <= 0: continue
+
+            bid_raw = bid.get("raw") or {}
+            bid_uom = _norm_uom(bid_raw.get("uom"))
+            status = bid.get("status", "")
+            notes = bid.get("notes", "") or bid_raw.get("notes", "")
+
+            # Two reasons an item needs resolution:
+            #   1) Status was flagged UOM_DISC by the parser
+            #   2) UOMs differ silently (status == PRICED but units don't match)
+            needs_resolution = (status == BID_STATUS_UOM_DISC) or (
+                bid_uom and hist_uom and bid_uom != hist_uom
+            )
+            if not needs_resolution:
+                continue
+
+            # Skip already-handled annotations
+            existing = annotations.get(_annotation_key(item_key, sup))
+            if existing and existing["status"] in ("resolved", "skipped"):
+                continue
+
+            # Auto-suggest from notes if possible
+            auto = _extract_pack_size_from_notes(notes)
+
+            out.append({
+                "item_key": item_key,
+                "item_num": r.get("item_num"),
+                "description": r.get("description"),
+                "supplier": sup,
+                "hist_uom": r.get("uom"),
+                "bid_uom": bid_raw.get("uom"),
+                "hist_price": hist_price,
+                "bid_price": bid_price,
+                "qty_24mo": qty,
+                "spend_24mo": spend_24,
+                "notes": notes,
+                "auto_suggestion": auto,
+                "annotation": existing,   # may be None or a "needs_review" stub
+            })
+
+    # Sort by spend desc — highest-impact items first
+    out.sort(key=lambda x: -x["spend_24mo"])
+    return out
+
+
+def get_uom_resolution_summary() -> dict:
+    """Quick stats for the UOM resolution UI header.
+
+    Returns:
+        {"n_total": ..., "n_resolved": ..., "n_skipped": ...,
+         "n_needs_review": ..., "n_remaining": ..., "n_auto_resolvable": ...}
+    """
+    queue = list_items_needing_uom_resolution()
+    annotations = _STATE.get("uom_annotations") or {}
+    n_resolved = sum(1 for a in annotations.values() if a["status"] == "resolved")
+    n_skipped = sum(1 for a in annotations.values() if a["status"] == "skipped")
+    n_needs_review = sum(1 for a in annotations.values() if a["status"] == "needs_review")
+    n_auto = sum(1 for q in queue if q["auto_suggestion"] and q["auto_suggestion"].get("factor"))
+    return {
+        "n_total": len(queue) + n_resolved + n_skipped,
+        "n_resolved": n_resolved,
+        "n_skipped": n_skipped,
+        "n_needs_review": n_needs_review,
+        "n_remaining": len(queue),
+        "n_auto_resolvable": n_auto,
     }
 
 
@@ -3427,6 +3794,10 @@ def serialize_state() -> dict:
         "data_anchor_date":     _STATE.get("data_anchor_date"),
         "audit_log":            _STATE.get("audit_log", []),
         "user_profile":         _STATE.get("user_profile", {}),
+        # Manual UOM resolution annotations — keyed by "<item_key>|<supplier>".
+        # Survives save/load so the analyst's catalog-lookup work isn't lost,
+        # AND rides through to a colleague's app when the JSON save is shared.
+        "uom_annotations":      _STATE.get("uom_annotations", {}),
     }
 
 
@@ -3608,6 +3979,8 @@ def restore_state(payload: dict) -> None:
         _STATE["audit_log"] = payload["audit_log"]
     if "user_profile" in payload and isinstance(payload["user_profile"], dict):
         _STATE["user_profile"] = payload["user_profile"]
+    if "uom_annotations" in payload and isinstance(payload["uom_annotations"], dict):
+        _STATE["uom_annotations"] = payload["uom_annotations"]
 
 
 # ---------------------------------------------------------------------------
