@@ -2406,11 +2406,24 @@ function _ensureItemModal() {
         <svg id="im-chart" style="width:100%;height:280px;display:block;" preserveAspectRatio="xMidYMid meet"></svg>
         <div id="im-trend-callout" style="margin-top:10px;padding:10px 12px;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;font-size:12px;color:var(--ink-1);font-family:var(--mono);"></div>
       </div>
+      <div id="im-bids-section" style="padding:0 26px;display:none;">
+        <div style="padding:12px 14px;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;">
+          <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:8px;gap:14px;flex-wrap:wrap;">
+            <h3 style="margin:0;font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;font-family:var(--ui);">SUPPLIER BIDS — overlaid as horizontal markers above</h3>
+            <div id="im-bids-count" style="font-size:11px;color:var(--ink-2);font-family:var(--mono);"></div>
+          </div>
+          <div id="im-bids-list" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+        </div>
+      </div>
       <div style="padding:14px 26px 22px;">
-        <h3 style="margin:0 0 10px;font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;font-family:var(--ui);">ORDER LINES</h3>
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;gap:14px;flex-wrap:wrap;">
+          <h3 style="margin:0;font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;font-family:var(--ui);">ORDER LINES</h3>
+          <div id="im-exclusion-status" style="font-size:11px;color:var(--ink-2);font-family:var(--mono);">Untick a row to drop that order from the trend &amp; spike calc.</div>
+        </div>
         <div style="border:1px solid var(--line);border-radius:4px;overflow:auto;max-height:300px;">
           <table id="im-lines" style="width:100%;border-collapse:collapse;font-size:12px;">
             <thead><tr style="background:var(--bg-2);">
+              <th style="padding:8px 10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);width:38px;" title="Tick = include in trend calc. Untick to exclude an outlier order — the trend, R², 90-day median, and expected-today price all recompute live.">USE</th>
               <th style="padding:8px 12px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">Date</th>
               <th style="padding:8px 12px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">Qty</th>
               <th style="padding:8px 12px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;border-bottom:1px solid var(--line);">Unit price</th>
@@ -2432,13 +2445,49 @@ function _ensureItemModal() {
   });
 }
 
+// Tracks the most-recently-opened item so on close we can drop a subtle
+// "you were just looking at this" stripe on the originating row(s) — works
+// across both the RFQ list table (data-item="...") and the comparison
+// matrix table (data-comp-item="..."). The stripe fades out via CSS after
+// ~12 s; an explicit timer also strips the class so it doesn't linger.
+let _lastViewedItemNum = null;
+let _lastViewedFadeTimer = null;
+
+function _markLastViewedRow(itemNum) {
+  if (!itemNum) return;
+  // Strip any prior highlight first so the trail only ever names ONE row.
+  for (const tr of document.querySelectorAll('tr.last-viewed-row')) {
+    tr.classList.remove('last-viewed-row');
+    tr.classList.remove('fade');
+  }
+  const sel = `tr[data-item="${CSS.escape(itemNum)}"], tr[data-comp-item="${CSS.escape(itemNum)}"]`;
+  for (const tr of document.querySelectorAll(sel)) {
+    tr.classList.add('last-viewed-row');
+  }
+  if (_lastViewedFadeTimer) clearTimeout(_lastViewedFadeTimer);
+  _lastViewedFadeTimer = setTimeout(() => {
+    for (const tr of document.querySelectorAll('tr.last-viewed-row')) {
+      tr.classList.add('fade');
+    }
+    _lastViewedFadeTimer = setTimeout(() => {
+      for (const tr of document.querySelectorAll('tr.last-viewed-row')) {
+        tr.classList.remove('last-viewed-row');
+        tr.classList.remove('fade');
+      }
+    }, 9000);
+  }, 4000);
+}
+
 function _closeItemModal() {
   const m = document.getElementById('item-modal');
   if (m) m.style.display = 'none';
+  _currentItemHistory = null;
+  if (_lastViewedItemNum) _markLastViewedRow(_lastViewedItemNum);
 }
 
 async function _openItemHistory(itemNum) {
   _ensureItemModal();
+  _lastViewedItemNum = itemNum;
   const m = document.getElementById('item-modal');
   m.style.display = 'flex';
   document.getElementById('im-title').textContent = itemNum;
@@ -2448,6 +2497,12 @@ async function _openItemHistory(itemNum) {
   document.getElementById('im-lines-body').innerHTML = '';
   document.getElementById('im-trend-callout').textContent = '';
   document.getElementById('im-trend-label').textContent = '';
+  // Reset the bid section between opens — keeps the previous item's bids
+  // from briefly flashing while the next payload loads.
+  const bidsSection = document.getElementById('im-bids-section');
+  if (bidsSection) bidsSection.style.display = 'none';
+  const bidsList = document.getElementById('im-bids-list');
+  if (bidsList) bidsList.innerHTML = '';
 
   try {
     _py.globals.set('_item_num_in', itemNum);
@@ -2533,36 +2588,279 @@ function _renderItemHistory(h) {
   }
   calloutEl.innerHTML = callout;
 
-  // Order lines table
+  // Order lines table — checkbox per row drives the outlier-exclusion set.
   const tbody = document.getElementById('im-lines-body');
   let rows = '';
-  // Sort newest-first for display
+  // Sort newest-first for display; line_idx stays bound to ascending order.
   const lines = [...h.po_lines].reverse();
   for (const ln of lines) {
+    const excluded = !!ln.excluded;
+    const rowOpacity = excluded ? '0.45' : '1';
+    const rowBg = excluded ? 'rgba(122,109,115,0.06)' : 'transparent';
+    const stripeColor = excluded ? 'var(--ink-2)' : 'var(--ink-0)';
+    const priceStyle = excluded ? `text-decoration:line-through;color:${stripeColor};` : `color:${stripeColor};`;
     rows += `
-      <tr style="border-bottom:1px solid rgba(122,109,115,0.25);">
+      <tr style="border-bottom:1px solid rgba(122,109,115,0.25);background:${rowBg};opacity:${rowOpacity};" data-line-idx="${ln.line_idx}">
+        <td style="padding:8px 10px;text-align:center;">
+          <input type="checkbox" class="im-line-toggle" data-line-idx="${ln.line_idx}" ${excluded ? '' : 'checked'} title="${excluded ? 'Excluded — tick to include in trend' : 'Included — untick to exclude this order'}" style="cursor:pointer;accent-color:var(--accent);">
+        </td>
         <td style="padding:8px 12px;color:var(--ink-1);font-family:var(--mono);">${_escapeHtml(ln.date)}</td>
-        <td style="padding:8px 12px;text-align:right;color:var(--ink-0);font-family:var(--mono);">${fmtQ(ln.qty)}</td>
-        <td style="padding:8px 12px;text-align:right;color:var(--ink-0);font-family:var(--mono);">${fmtP(ln.unit_price)}</td>
+        <td style="padding:8px 12px;text-align:right;font-family:var(--mono);${priceStyle}">${fmtQ(ln.qty)}</td>
+        <td style="padding:8px 12px;text-align:right;font-family:var(--mono);${priceStyle}">${fmtP(ln.unit_price)}</td>
         <td style="padding:8px 12px;text-align:right;color:var(--ink-1);font-family:var(--mono);">${fmt$(ln.line_total)}</td>
         <td style="padding:8px 12px;color:var(--ink-1);font-family:var(--mono);">${_escapeHtml(ln.po || '')}</td>
         <td style="padding:8px 12px;color:var(--ink-1);font-family:var(--mono);">${_escapeHtml(ln.uom || '')}</td>
       </tr>
     `;
   }
-  tbody.innerHTML = rows || `<tr><td colspan="6" style="padding:24px;text-align:center;color:var(--ink-2);">no order lines</td></tr>`;
+  tbody.innerHTML = rows || `<tr><td colspan="7" style="padding:24px;text-align:center;color:var(--ink-2);">no order lines</td></tr>`;
+
+  // Wire up the per-line checkbox handlers — toggle the exclusion list and
+  // re-fetch the cleaned trend payload from Python so the chart, callout,
+  // and bid-distance flags all recompute together.
+  const itemNum = h.item_num;
+  for (const cb of tbody.querySelectorAll('.im-line-toggle')) {
+    cb.addEventListener('change', (ev) => {
+      const idx = parseInt(ev.target.getAttribute('data-line-idx'), 10);
+      if (!Number.isFinite(idx)) return;
+      _toggleItemExclusion(itemNum, idx, !ev.target.checked);
+    });
+  }
+
+  // Status hint above the table — mention the cleaned-set count and a quick
+  // reset link if any exclusions are active.
+  const statusEl = document.getElementById('im-exclusion-status');
+  if (statusEl) {
+    if (h.n_excluded > 0) {
+      statusEl.innerHTML = `<span style="color:var(--amber, var(--accent));">${h.n_excluded} excluded</span> · trend fit on ${h.n_priced_after_exclusion || 0} priced line${(h.n_priced_after_exclusion || 0) === 1 ? '' : 's'} · <a href="#" id="im-exclusion-reset" style="color:var(--accent);text-decoration:underline;">reset all</a>`;
+      const resetEl = document.getElementById('im-exclusion-reset');
+      if (resetEl) resetEl.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        _resetItemExclusions(itemNum);
+      });
+    } else {
+      statusEl.textContent = 'Untick a row to drop that order from the trend & spike calc.';
+    }
+  }
+
+  // Render the supplier-bid section (cards below) — populated whether or
+  // not bids exist, because the chart overlay markers also key off h.bids.
+  _renderItemBidsSection(h);
+}
+
+// Currently-rendered modal payload — kept so re-renders after a checkbox
+// toggle can preserve scroll position + animate the chart in place. Set
+// inside _renderItemHistory; cleared on close.
+let _currentItemHistory = null;
+
+async function _toggleItemExclusion(itemNum, lineIdx, shouldExclude) {
+  // Compute the next exclusion list locally first (so we don't have to
+  // round-trip a "current state" read from Python). The payload Python
+  // returned in _renderItemHistory carries the canonical h.exclusions set.
+  const current = (_currentItemHistory && _currentItemHistory.exclusions) || [];
+  const next = new Set(current);
+  if (shouldExclude) next.add(lineIdx);
+  else next.delete(lineIdx);
+  const nextArr = [...next].sort((a, b) => a - b);
+  await _persistItemExclusions(itemNum, nextArr);
+  await _refreshItemHistoryModal(itemNum);
+}
+
+async function _resetItemExclusions(itemNum) {
+  await _persistItemExclusions(itemNum, []);
+  await _refreshItemHistoryModal(itemNum);
+}
+
+async function _persistItemExclusions(itemNum, indicesArr) {
+  try {
+    _py.globals.set('_item_num_in', itemNum);
+    _py.globals.set('_excluded_in', indicesArr);
+    await _py.runPythonAsync(`
+from app_engine import set_item_exclusions
+set_item_exclusions(_item_num_in, list(_excluded_in))
+`);
+    if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) {
+      _saveMgr.markDirty();
+    }
+  } catch (err) {
+    console.error('[item-exclusions] persist failed', err);
+  }
+}
+
+async function _refreshItemHistoryModal(itemNum) {
+  try {
+    _py.globals.set('_item_num_in', itemNum);
+    const out = await _py.runPythonAsync(`
+import json
+from app_engine import get_item_history
+json.dumps(get_item_history(_item_num_in), default=str)
+`);
+    const h = JSON.parse(out);
+    if (h.error) return;
+    _renderItemHistory(h);
+  } catch (err) {
+    console.error('[item-history] refresh failed', err);
+  }
+}
+
+function _renderItemBidsSection(h) {
+  // Plain-language ribbon below the chart that lists every supplier-bid we
+  // have for this item. Each card gets a per-bid lock button so the
+  // analyst can pin the award after visual confirmation. The card colors
+  // match the chart's overlay marker colors so the eye links the two.
+  _currentItemHistory = h;
+  const section = document.getElementById('im-bids-section');
+  const list = document.getElementById('im-bids-list');
+  const countEl = document.getElementById('im-bids-count');
+  if (!section || !list) return;
+  const bids = (h.bids || []);
+  if (!bids.length) {
+    section.style.display = 'none';
+    list.innerHTML = '';
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  section.style.display = '';
+  const lockedSupplier = (h.lock && h.lock.supplier) || null;
+  if (countEl) {
+    countEl.textContent =
+      `${bids.length} bid${bids.length === 1 ? '' : 's'}` +
+      (lockedSupplier ? ` · LOCKED → ${lockedSupplier}` : '');
+  }
+  let html = '';
+  for (const b of bids) {
+    const color = _bidOverlayColor(b);
+    const statusBadge = b.status && b.status !== 'PRICED'
+      ? `<span style="font-size:9px;color:var(--ink-2);font-family:var(--mono);text-transform:uppercase;letter-spacing:0.08em;margin-left:6px;border:1px solid var(--line);padding:1px 5px;border-radius:2px;">${_escapeHtml(b.status)}</span>`
+      : '';
+    const typoBadge = b.possible_typo
+      ? `<span style="font-size:9px;color:var(--red);font-family:var(--mono);text-transform:uppercase;letter-spacing:0.08em;margin-left:6px;border:1px solid var(--red);padding:1px 5px;border-radius:2px;font-weight:700;" title="≥60% below the trend line — looks like a typo. Visually confirm before awarding.">POSSIBLE TYPO</span>`
+      : '';
+    const refLine = (b.pct_diff != null)
+      ? `<span style="color:var(--ink-2);font-size:11px;">${b.pct_diff >= 0 ? '+' : ''}${b.pct_diff.toFixed(0)}% vs ${b.reference === 'trend' ? 'trend' : 'last price'}</span>`
+      : `<span style="color:var(--ink-2);font-size:11px;">no trend ref</span>`;
+    const isLocked = !!b.is_locked;
+    const lockBtnLbl = isLocked ? '🔒 LOCKED — click to unlock' : '🔓 LOCK to this supplier';
+    const lockBtnTitle = isLocked
+      ? 'Unlock — strategy logic resumes for this item'
+      : 'Lock award to this supplier across every scenario. Use after visually auditing this bid.';
+    html += `
+      <div class="im-bid-card" style="
+        border:1px solid ${color};
+        background:${color}14;
+        border-radius:4px;
+        padding:8px 12px;
+        font-family:var(--mono);
+        min-width:240px;
+        flex:1 1 240px;
+        ${isLocked ? 'box-shadow:0 0 0 2px ' + color + '55;' : ''}
+        ">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;">
+          <strong style="color:var(--ink-0);font-size:13px;">${_escapeHtml(b.supplier)}</strong>
+          <span style="color:${color};font-weight:700;font-size:14px;">$${b.price.toFixed(2)}</span>
+        </div>
+        <div style="margin-top:4px;display:flex;align-items:center;flex-wrap:wrap;gap:4px;">
+          ${refLine}
+          ${statusBadge}
+          ${typoBadge}
+        </div>
+        ${b.alt_part ? `<div style="margin-top:4px;color:var(--ink-2);font-size:10px;">alt: ${_escapeHtml(b.alt_part)}</div>` : ''}
+        <button type="button"
+          class="im-bid-lock-btn"
+          data-supplier="${_escapeHtml(b.supplier)}"
+          data-locked="${isLocked ? '1' : '0'}"
+          title="${lockBtnTitle}"
+          style="
+            margin-top:8px;
+            width:100%;
+            background:${isLocked ? color : 'transparent'};
+            color:${isLocked ? '#0a0e1a' : color};
+            border:1px solid ${color};
+            padding:5px 8px;
+            font-family:var(--mono);
+            font-size:10px;
+            text-transform:uppercase;
+            letter-spacing:0.08em;
+            font-weight:600;
+            border-radius:3px;
+            cursor:pointer;
+          ">${lockBtnLbl}</button>
+      </div>
+    `;
+  }
+  list.innerHTML = html;
+  for (const btn of list.querySelectorAll('.im-bid-lock-btn')) {
+    btn.addEventListener('click', (ev) => {
+      const sup = ev.currentTarget.getAttribute('data-supplier');
+      const wasLocked = ev.currentTarget.getAttribute('data-locked') === '1';
+      _toggleItemLock(h.item_num, sup, wasLocked);
+    });
+  }
+}
+
+function _bidOverlayColor(bid) {
+  // Color a bid by distance from the cleaned-trend line (or from the most
+  // recent priced line when no trend is available). Used by the chart
+  // overlay markers AND the bid cards below the chart so the two stay in
+  // visual sync. Locked supplier always renders cyan/accent regardless of
+  // distance — the lock IS the signal the analyst is overriding distance
+  // judgment.
+  if (bid.is_locked) return 'var(--cyan, var(--accent))';
+  if (bid.possible_typo) return 'var(--red, #ff4d6d)';
+  if (bid.ratio == null) return 'var(--ink-1)';
+  const r = bid.ratio;
+  if (r >= 0.85 && r <= 1.15) return 'var(--green, #6bd25b)';   // within ±15%
+  if (r >= 0.7  && r <= 1.3)  return 'var(--amber, #ffb733)';   // ±15-30%
+  return 'var(--red, #ff4d6d)';                                 // >30% off
+}
+
+async function _toggleItemLock(itemNum, supplier, wasLocked) {
+  try {
+    _py.globals.set('_item_num_in', itemNum);
+    _py.globals.set('_supplier_in', supplier);
+    if (wasLocked) {
+      await _py.runPythonAsync(`
+from app_engine import clear_item_lock
+clear_item_lock(_item_num_in)
+`);
+    } else {
+      // Reason auto-fills with a timestamp + "audited" tag. The full audit
+      // trail is on the audit log; richer notes can be added later via a
+      // dedicated lock-reason input if needed.
+      const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
+      _py.globals.set('_reason_in', `audited ${ts}`);
+      await _py.runPythonAsync(`
+from app_engine import set_item_lock
+set_item_lock(_item_num_in, _supplier_in, _reason_in)
+`);
+    }
+    if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) {
+      _saveMgr.markDirty();
+    }
+    await _refreshItemHistoryModal(itemNum);
+  } catch (err) {
+    console.error('[item-lock] toggle failed', err);
+  }
 }
 
 function _drawItemHistoryChart(h) {
   const svg = document.getElementById('im-chart');
   const W = svg.clientWidth || 800, H = 280;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-  const padL = 56, padR = 70, padT = 16, padB = 36;
+  // Right pad widened to ~140 so per-supplier bid labels render beside the
+  // anchor-date column without overlapping the EXPECTED marker callout.
+  const padL = 56, padR = 140, padT = 16, padB = 36;
   const innerW = W - padL - padR, innerH = H - padT - padB;
 
   const points = (h.po_lines || [])
     .filter(p => p.date && p.unit_price != null)
-    .map(p => ({ date: new Date(p.date), price: p.unit_price, qty: p.qty }));
+    .map(p => ({
+      date: new Date(p.date),
+      price: p.unit_price,
+      qty: p.qty,
+      excluded: !!p.excluded,
+      lineIdx: p.line_idx,
+    }));
   if (!points.length) {
     svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--ink-2)" font-family="var(--mono)" font-size="11">no priced order lines</text>`;
     return;
@@ -2572,8 +2870,15 @@ function _drawItemHistoryChart(h) {
   const anchorDate = anchorIso ? new Date(anchorIso) : points[points.length - 1].date;
   const maxDate = anchorDate.getTime();
   const dateRange = Math.max(1, maxDate - minDate);
-  const minPrice = Math.min(...points.map(p => p.price));
-  const maxPrice = Math.max(...points.map(p => p.price), h.trend && h.trend.expected_today != null ? h.trend.expected_today : -Infinity);
+  // Y range — include the bid-overlay prices so heavy outliers don't clip
+  // off the top/bottom of the chart and disappear from view.
+  const bidPrices = (h.bids || []).map(b => b.price).filter(v => v != null);
+  const minPrice = Math.min(...points.map(p => p.price), ...(bidPrices.length ? bidPrices : [Infinity]));
+  const maxPrice = Math.max(
+    ...points.map(p => p.price),
+    h.trend && h.trend.expected_today != null ? h.trend.expected_today : -Infinity,
+    ...(bidPrices.length ? bidPrices : [-Infinity]),
+  );
   const priceRange = Math.max(0.01, maxPrice - minPrice);
   // Pad price scale 8% top + 8% bottom
   const yMin = minPrice - priceRange * 0.08;
@@ -2626,21 +2931,30 @@ function _drawItemHistoryChart(h) {
     s += `<text x="${padL + 6}" y="${yMed - 4}" fill="var(--ink-2)" font-family="var(--mono)" font-size="9" letter-spacing="0.08em">90-DAY MEDIAN $${t.median_90d.toFixed(2)}</text>`;
   }
 
-  // Order points (size scaled by qty). Most-recent point is rendered LAST
-  // and styled red+larger so price spikes pop visually.
+  // Order points — size scales by qty, included points use accent color,
+  // EXCLUDED points render greyed and hollow so the eye still sees them
+  // (the data isn't gone, just dropped from the trend fit). Most-recent
+  // priced+included point is rendered last and styled red if it's a spike.
   const maxQty = Math.max(1, ...points.map(p => p.qty || 1));
-  const lastPoint = points[points.length - 1];
+  const includedPoints = points.filter(p => !p.excluded);
+  const lastPoint = includedPoints.length
+    ? includedPoints[includedPoints.length - 1]
+    : null;
   const isSpike = t.spike && t.spike.is_spike;
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
+    if (lastPoint && p === lastPoint) continue; // draw last separately
     const x = xScale(p.date);
     const y = yScale(p.price);
-    const isLast = (i === points.length - 1);
-    if (isLast) continue; // draw last separately
     const r = Math.max(2.5, Math.min(6, 2.5 + (p.qty / maxQty) * 4));
-    s += `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--accent)" opacity="0.78"/>`;
+    if (p.excluded) {
+      s += `<circle cx="${x}" cy="${y}" r="${r}" fill="none" stroke="var(--ink-2)" stroke-width="1" opacity="0.55"/>`;
+      s += `<line x1="${x - r - 1}" y1="${y - r - 1}" x2="${x + r + 1}" y2="${y + r + 1}" stroke="var(--ink-2)" stroke-width="1" opacity="0.45"/>`;
+    } else {
+      s += `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--accent)" opacity="0.78"/>`;
+    }
   }
-  // Last point — bigger, red if spike, with a price label
+  // Last cleaned-set point — bigger, red if spike, with a price label
   if (lastPoint) {
     const x = xScale(lastPoint.date);
     const y = yScale(lastPoint.price);
@@ -2661,6 +2975,51 @@ function _drawItemHistoryChart(h) {
     s += `<circle cx="${x}" cy="${y}" r="6" fill="none" stroke="var(--green, var(--accent))" stroke-width="2"/>`;
     s += `<text x="${x + 10}" y="${y + 4}" fill="var(--green, var(--ink-0))" font-family="var(--mono)" font-size="11" font-weight="600">$${t.expected_today.toFixed(2)}</text>`;
     s += `<text x="${x + 10}" y="${y - 8}" fill="var(--ink-2)" font-family="var(--mono)" font-size="9" letter-spacing="0.1em">EXPECTED</text>`;
+  }
+
+  // Supplier-bid overlays — every priced bid we have for this item, rendered
+  // as a horizontal dashed line at its quoted unit price, anchored on the
+  // right side of the chart. Color matches the per-bid card below the
+  // chart (closest to trend = green; >30% off = red; possible typo = red+
+  // dashed). Locked supplier renders solid heavy + cyan/accent.
+  const bids = (h.bids || []);
+  if (bids.length) {
+    // Stack bid labels vertically when their y values are within ~14px so
+    // they don't overlap. We render in price-ascending order (server already
+    // sorted) and nudge labels up/down only as needed.
+    const labelMinSpacing = 14;
+    const renderedYs = [];
+    for (const b of bids) {
+      const yRaw = yScale(b.price);
+      const color = _bidOverlayColor(b);
+      const dash = b.is_locked ? '' : (b.possible_typo ? '3,3' : '5,3');
+      const strokeWidth = b.is_locked ? '2' : '1.2';
+      const opacity = b.is_locked ? '1' : '0.85';
+      // Horizontal marker — spans the right ~40% of the plot so the
+      // historical context on the left isn't visually crowded.
+      const xStart = padL + innerW * 0.6;
+      s += `<line x1="${xStart}" y1="${yRaw}" x2="${padL + innerW}" y2="${yRaw}" stroke="${color}" stroke-width="${strokeWidth}" stroke-dasharray="${dash}" opacity="${opacity}"/>`;
+      // Tick marker at the right edge
+      s += `<circle cx="${padL + innerW}" cy="${yRaw}" r="${b.is_locked ? 5 : 3.5}" fill="${color}" opacity="${opacity}"/>`;
+      if (b.is_locked) {
+        s += `<circle cx="${padL + innerW}" cy="${yRaw}" r="9" fill="none" stroke="${color}" stroke-width="1.5" opacity="0.5"/>`;
+      }
+      // Label position: nudge to avoid collisions with already-rendered labels.
+      let yLabel = yRaw + 3;
+      for (const yPrev of renderedYs) {
+        if (Math.abs(yLabel - yPrev) < labelMinSpacing) {
+          yLabel = yPrev + labelMinSpacing;
+        }
+      }
+      renderedYs.push(yLabel);
+      const lockGlyph = b.is_locked ? '🔒 ' : '';
+      const typoGlyph = b.possible_typo ? ' ⚠' : '';
+      const supplierShort = (b.supplier || '').length > 14
+        ? (b.supplier.slice(0, 13) + '…')
+        : b.supplier;
+      s += `<text x="${padL + innerW + 8}" y="${yLabel}" fill="${color}" font-family="var(--mono)" font-size="10" font-weight="${b.is_locked ? '700' : '600'}">${_escapeHtml(lockGlyph + supplierShort)}</text>`;
+      s += `<text x="${padL + innerW + 8}" y="${yLabel + 11}" fill="var(--ink-2)" font-family="var(--mono)" font-size="9">$${b.price.toFixed(2)}${typoGlyph}</text>`;
+    }
   }
 
   svg.innerHTML = s;
