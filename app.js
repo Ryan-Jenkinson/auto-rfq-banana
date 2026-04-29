@@ -2672,13 +2672,34 @@ async function _resetItemExclusions(itemNum) {
 }
 
 async function _persistItemExclusions(itemNum, indicesArr) {
+  // Calls into Python to update _STATE["item_exclusions"] AND propagate to
+  // _STATE["items"] (last_unit_price, qty_*, spend_*, etc.) + _STATE["kpis"].
+  // The returned payload carries the freshly-recomputed item record + the
+  // headline KPIs so the JS can patch _rfqResult.items in place and re-
+  // render the RFQ table + KPI tiles without doing a full re-extract.
   try {
     _py.globals.set('_item_num_in', itemNum);
     _py.globals.set('_excluded_in', indicesArr);
-    await _py.runPythonAsync(`
+    const out = await _py.runPythonAsync(`
+import json
 from app_engine import set_item_exclusions
-set_item_exclusions(_item_num_in, list(_excluded_in))
+json.dumps(set_item_exclusions(_item_num_in, list(_excluded_in)), default=str)
 `);
+    let result = null;
+    try { result = JSON.parse(out); } catch (_) {}
+    if (result && result.item && _rfqResult && Array.isArray(_rfqResult.items)) {
+      const idx = _rfqResult.items.findIndex(it => it.item_num === itemNum);
+      if (idx !== -1) _rfqResult.items[idx] = result.item;
+    }
+    if (result && result.kpis && _rfqResult) {
+      _rfqResult.kpis = result.kpis;
+      // Difficulty isn't re-derived — its inputs (% generic descriptions,
+      // missing MFG, etc.) don't shift on a per-item exclusion. Leave it.
+    }
+    // Re-render the RFQ table + KPI tiles so the cleaned LAST $/ea, qty,
+    // spend, and active-items counts all update in place.
+    if (typeof _renderRfqTable === 'function') _renderRfqTable();
+    if (typeof _renderKpis === 'function') _renderKpis();
     if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) {
       _saveMgr.markDirty();
     }

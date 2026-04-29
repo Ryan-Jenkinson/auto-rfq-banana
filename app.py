@@ -692,6 +692,15 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
     # array) to keep the JS payload small. The modal pulls them on demand.
     _STATE["po_lines_by_key"] = {k: list(rec["po_lines"]) for k, rec in items.items()}
 
+    # If we're reloading a saved session, exclusions were restored ahead of
+    # the extract — replay them now so every aggregate (last_unit_price,
+    # qty_*, spend_*, KPIs) reflects the analyst's prior outlier curation.
+    # Without this, a saved exclusion would change the per-item modal view
+    # but the RFQ-list table, outbound xlsx, and downstream comparison
+    # would all read the stale (uncleaned) numbers.
+    if _STATE.get("item_exclusions"):
+        apply_all_item_exclusions_to_aggregates(rebuild_kpis=True)
+
     log_event(
         "extract_rfq_list",
         f"{kpis['item_count']:,} items / ${kpis['total_spend']:,.0f} total / difficulty {difficulty.get('score','?')}/100 {difficulty.get('level','')}",
@@ -1425,11 +1434,26 @@ def list_item_locks() -> dict:
 
 
 def set_item_exclusions(item_num: str, excluded_indices) -> dict:
-    """Persist the user's outlier-line selections for one item.
+    """Persist the user's outlier-line selections for one item — and propagate.
+
+    The exclusion isn't just a per-modal view filter: ``last_unit_price``,
+    every windowed ``qty_*`` / ``spend_*`` / ``spend_*_actual``, ``po_count``,
+    ``first_order``, ``last_order``, and the ``included`` default for this
+    item are re-derived from the cleaned ``po_lines_by_key`` set so the
+    RFQ-list table, outbound RFQ xlsx, and the comparison-stage historical
+    baseline + scenario savings all read the cleaned numbers. File-level
+    KPIs are rebuilt too so the headline tiles stay reconciled.
+
+    This is the load-bearing piece of the "no rounding in RFQ math" rule:
+    the rule was always about not blurring REAL prices (medians, smoothing,
+    averaging across periods); analyst-confirmed outlier removal is the
+    opposite — it's removing data errors so the to-the-penny number is
+    actually meaningful. Each exclusion change writes to the audit log so
+    the decision trail is preserved (Decision Log will pick this up too).
 
     Stores the cleaned ``excluded_indices`` list under
-    ``_STATE["item_exclusions"][item_num]``. Empty lists clear the entry
-    so a fully-uncrossed item doesn't leave dead state behind in saves.
+    ``_STATE["item_exclusions"][item_num]``. Empty lists clear the entry so
+    a fully-uncrossed item doesn't leave dead state in saves.
 
     Args:
         item_num: Display item number (matches the key used by the table).
@@ -1438,8 +1462,10 @@ def set_item_exclusions(item_num: str, excluded_indices) -> dict:
             and duplicates are coerced/dedup'd.
 
     Returns:
-        ``{"item_num": str, "n_excluded": int, "exclusions": [int...]}``
-        — the canonical state after the write.
+        ``{"item_num", "n_excluded", "exclusions", "item": <updated record>,
+        "kpis": <rebuilt headline KPIs>}`` — the JS uses ``item`` to patch
+        ``_rfqResult.items`` in place and re-render the RFQ table, and
+        ``kpis`` to refresh the headline tiles.
     """
     if not item_num:
         return {"error": "item_num required"}
@@ -1460,12 +1486,195 @@ def set_item_exclusions(item_num: str, excluded_indices) -> dict:
         excl_map[item_num] = cleaned
     else:
         excl_map.pop(item_num, None)
-    log_event("item_exclusions_set", f"{item_num}: {len(cleaned)} line(s)", item_num)
+
+    # Propagate to the canonical item aggregates + the file-level KPIs.
+    updated_item = _recompute_item_aggregates_for(item_num)
+    rebuilt_kpis = _rebuild_kpis_from_items()
+
+    log_event(
+        "item_exclusions_set",
+        f"{item_num}: {len(cleaned)} line(s) excluded — last_unit_price now ${updated_item.get('last_unit_price') or 0:.2f}"
+        if updated_item else f"{item_num}: {len(cleaned)} line(s)",
+        item_num,
+    )
     return {
         "item_num": item_num,
         "n_excluded": len(cleaned),
         "exclusions": cleaned,
+        "item": updated_item,
+        "kpis": rebuilt_kpis,
     }
+
+
+def _recompute_item_aggregates_for(item_num: str) -> dict:
+    """Re-derive one item's aggregates from its cleaned po_lines.
+
+    Walks ``_STATE["po_lines_by_key"][key]`` for the matching item, drops
+    the indices listed in ``_STATE["item_exclusions"][item_num]`` (indices
+    are positions in the ASCENDING-date-sorted line list, same convention
+    as ``get_item_history``), and writes back:
+
+        last_unit_price (current_price)  — most recent priced line in the
+                                            cleaned set, max by (date, po)
+        qty_12mo / qty_24mo / qty_36mo / qty_all
+        spend_12mo / 24mo / 36mo / all          (qty × current_price)
+        spend_12mo_actual / 24mo_actual / etc   (sum of cleaned line totals)
+        po_count                                (distinct PO# count, cleaned)
+        first_order, last_order                 (iso strings, cleaned)
+        included                                (default = qty_24mo > 0)
+
+    Returns the updated item dict (the same object that lives in
+    ``_STATE["items"]`` — JS-safe), or ``{}`` if the item isn't found.
+    """
+    items = _STATE.get("items", [])
+    item = next((it for it in items if it.get("item_num") == item_num), None)
+    if not item:
+        return {}
+    key = item.get("key") or norm_pn(item_num)
+    raw_lines = _STATE.get("po_lines_by_key", {}).get(key, [])
+    if not raw_lines:
+        return item
+    sorted_lines = sorted(raw_lines, key=lambda r: r[0] or "")
+    excluded = set(_STATE.get("item_exclusions", {}).get(item_num, []) or [])
+    cleaned_lines = [ln for idx, ln in enumerate(sorted_lines) if idx not in excluded]
+
+    # Window cutoffs anchored to the data, not the wall clock — same rule
+    # as extract_rfq_list (the dataset's max order date).
+    anchor_iso = _STATE.get("data_anchor_date")
+    anchor_dt = None
+    if anchor_iso:
+        try:
+            anchor_dt = datetime.fromisoformat(anchor_iso)
+        except ValueError:
+            anchor_dt = None
+    if anchor_dt is None:
+        anchor_dt = datetime.now()
+    cutoffs = {w: anchor_dt - timedelta(days=w * 30) for w in (12, 24, 36)}
+
+    qty_12 = qty_24 = qty_36 = qty_all = 0.0
+    spend_12 = spend_24 = spend_36 = spend_all = 0.0
+    first_dt = None
+    last_dt = None
+    last_unit_price = None
+    last_po_for_tiebreak = None
+    pos = set()
+
+    for (date_iso, qty, unit_price, line_total, po, uom) in cleaned_lines:
+        if qty is None or unit_price is None:
+            # Still count toward po_count / first/last but skip aggregates
+            if po: pos.add(po)
+            try:
+                d = datetime.fromisoformat(date_iso) if date_iso else None
+            except ValueError:
+                d = None
+            if d:
+                if first_dt is None or d < first_dt: first_dt = d
+                if last_dt  is None or d > last_dt:  last_dt = d
+            continue
+        try:
+            d = datetime.fromisoformat(date_iso) if date_iso else None
+        except ValueError:
+            d = None
+        ext = float(line_total) if line_total is not None else (qty * unit_price)
+        qty_all += qty
+        spend_all += ext
+        if d:
+            if first_dt is None or d < first_dt: first_dt = d
+            if last_dt is None or d > last_dt or (d == last_dt and (po or "") > (last_po_for_tiebreak or "")):
+                last_dt = d
+                last_unit_price = unit_price
+                last_po_for_tiebreak = po
+            for w in (12, 24, 36):
+                if d >= cutoffs[w]:
+                    if w == 12: qty_12 += qty; spend_12 += ext
+                    if w == 24: qty_24 += qty; spend_24 += ext
+                    if w == 36: qty_36 += qty; spend_36 += ext
+        if po: pos.add(po)
+
+    current_price = last_unit_price if last_unit_price is not None else item.get("last_unit_price")
+
+    item["po_count"] = len(pos)
+    item["qty_12mo"] = qty_12
+    item["qty_24mo"] = qty_24
+    item["qty_36mo"] = qty_36
+    item["qty_all"]  = qty_all
+    # Spend columns: qty × current_price (internally consistent for the table).
+    cp = current_price or 0
+    item["spend_12mo"] = qty_12 * cp
+    item["spend_24mo"] = qty_24 * cp
+    item["spend_36mo"] = qty_36 * cp
+    item["spend_all"]  = qty_all * cp
+    # Historical actuals: sum of line totals on the CLEANED set so file-level
+    # KPIs reconcile to the source minus the analyst's removed errors.
+    item["spend_12mo_actual"] = spend_12
+    item["spend_24mo_actual"] = spend_24
+    item["spend_36mo_actual"] = spend_36
+    item["spend_all_actual"]  = spend_all
+    item["last_unit_price"]   = current_price
+    item["first_order"] = first_dt.date().isoformat() if first_dt else None
+    item["last_order"]  = last_dt.date().isoformat() if last_dt else None
+    # `included` is a soft default; preserve any analyst-set deviation by
+    # only flipping it when it equals what the default WAS at extract time.
+    # Cheapest correct heuristic: leave `included` alone — the user controls
+    # it via the per-row checkbox / smart-trim, and we don't second-guess.
+    return item
+
+
+def _rebuild_kpis_from_items() -> dict:
+    """Recompute file-level headline KPIs from the current ``_STATE["items"]``.
+
+    Used after exclusions change so the top-of-page KPI tiles (Items / 12mo /
+    24mo / 36mo / Total spend) and active-items counts stay reconciled to
+    the cleaned per-item aggregates. ``annual_spend`` stays as the original
+    extract — exclusions are too rare to merit re-rolling the per-year
+    bars; if needed later we can re-derive from po_lines_by_key.
+
+    Returns the new KPI dict (also written to ``_STATE["kpis"]``).
+    """
+    items = _STATE.get("items", []) or []
+    if not items:
+        return _STATE.get("kpis", {})
+    prev = dict(_STATE.get("kpis", {}))
+    items_24mo = sum(1 for it in items if (it.get("qty_24mo") or 0) > 0)
+    items_12mo = sum(1 for it in items if (it.get("qty_12mo") or 0) > 0)
+    items_36mo = sum(1 for it in items if (it.get("qty_36mo") or 0) > 0)
+    total_spend = sum(it.get("spend_all_actual") or 0 for it in items)
+    spend_12mo = sum(it.get("spend_12mo_actual") or 0 for it in items)
+    spend_24mo = sum(it.get("spend_24mo_actual") or 0 for it in items)
+    spend_36mo = sum(it.get("spend_36mo_actual") or 0 for it in items)
+    kpis = {
+        **prev,
+        "item_count":  len(items),
+        "items_12mo":  items_12mo,
+        "items_24mo":  items_24mo,
+        "items_36mo":  items_36mo,
+        "total_spend": total_spend,
+        "spend_12mo":  spend_12mo,
+        "spend_24mo":  spend_24mo,
+        "spend_36mo":  spend_36mo,
+    }
+    _STATE["kpis"] = kpis
+    return kpis
+
+
+def apply_all_item_exclusions_to_aggregates(rebuild_kpis: bool = True) -> dict:
+    """Replay every saved exclusion against the current items list.
+
+    Called at the tail of ``extract_rfq_list`` when a previously-saved
+    session is reloaded — items are rebuilt from scratch, but exclusions
+    were restored ahead of the extract via ``restore_state``, so we need
+    to re-derive aggregates for every affected item.
+
+    Returns ``{"n_items_updated": int, "kpis": <updated>}``.
+    """
+    excl = _STATE.get("item_exclusions", {}) or {}
+    n = 0
+    for item_num in list(excl.keys()):
+        rec = _recompute_item_aggregates_for(item_num)
+        if rec:
+            n += 1
+    new_kpis = _rebuild_kpis_from_items() if rebuild_kpis else _STATE.get("kpis", {})
+    return {"n_items_updated": n, "kpis": new_kpis}
 
 
 # ---------------------------------------------------------------------------
