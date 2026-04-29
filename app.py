@@ -1289,35 +1289,61 @@ def get_item_history(item_num: str) -> dict:
 ITEM_OVERLAY_TYPO_RATIO_MAX = 0.4
 
 
+# Supplier-bid status priority for the per-item overlay's canonical pick.
+# PRICED beats UOM_DISC beats SUBSTITUTE beats anything else. NEED_INFO and
+# NO_BID don't carry a usable price so they're never canonical (filtered out
+# upstream). Within the same status the canonical pick is the LOWEST price
+# — it's the most aggressive offer the supplier put on the table for this
+# item and matches what the analyst is likeliest to be asked to evaluate.
+_BID_STATUS_PRIORITY = {
+    "PRICED": 0,
+    "UOM_DISC": 1,
+    "SUBSTITUTE": 2,
+}
+
+
 def _build_item_bid_overlay(rfq_key: str, expected_today, latest_price,
                             locked_supplier: str = None) -> list:
-    """Collect every priced supplier bid for one item and tag each with a
-    distance metric vs. the cleaned trend.
+    """Collect ONE canonical priced supplier bid per supplier for one item,
+    tagged with a distance metric vs. the cleaned trend.
 
     Walks ``_STATE["bids"][supplier]["bids"]`` for every loaded supplier and
     matches on the canonical ``rfq_key`` (already normalized via norm_pn).
     Bids with status PRICED, UOM_DISC, and SUBSTITUTE that carry an
-    effective_price > 0 are surfaced. NO_BID and NEED_INFO are skipped.
-    UOM_DISC and SUBSTITUTE carry their own status flags so the UI can
-    distinguish them visually.
+    effective_price > 0 are eligible. NO_BID and NEED_INFO are skipped.
 
-    Distance scoring:
+    Why dedupe per supplier:
+        Suppliers routinely return MULTIPLE lines for the same PN (qty break
+        tiers, alt SKUs they offered, or literal duplicate rows in their
+        template). Without dedup, a single item explodes into 20-30 chart
+        markers. The comparison matrix and scenario engine already collapse
+        per-(supplier, rfq_key) to one bid; this overlay matches.
+
+    Canonical pick (per supplier):
+        1. Lowest ``_BID_STATUS_PRIORITY`` (PRICED beats UOM_DISC beats SUBSTITUTE)
+        2. Within ties, the lowest effective_price (the supplier's most
+           aggressive offer — closest to what the analyst will evaluate).
+        Each canonical bid carries:
+          * ``alt_quotes`` — the OTHER prices this supplier returned for
+            the same item (sorted ascending; status preserved)
+          * ``n_alt_quotes`` — count of those alternates
+        so the UI can surface "+N alt quotes" without flooding the screen.
+
+    Distance scoring against the reference price:
       * If a non-None ``expected_today`` is available, use it as the
         reference and report ``ratio = price / expected_today`` plus
         ``pct_diff = (ratio - 1) * 100``.
-      * Otherwise fall back to ``latest_price`` for context (no trend
-        means no extrapolation, so ``ratio`` is informational only).
+      * Otherwise fall back to ``latest_price`` (no trend means no
+        extrapolation, so ``ratio`` is informational only).
       * ``possible_typo`` is True iff a reference exists AND
         ``ratio <= ITEM_OVERLAY_TYPO_RATIO_MAX`` (≥60% below the line).
 
     Lock awareness:
       * Each entry carries an ``is_locked`` flag set when its supplier
-        equals ``locked_supplier``. The UI uses this to render the locked
-        bid distinctly and to disable cross-supplier lock buttons.
+        equals ``locked_supplier``. The UI renders the locked bid
+        distinctly and disables cross-supplier lock buttons.
 
-    Returns a list sorted ascending by effective_price so the UI can render
-    overlays in price order. The locked bid (if any) keeps its natural
-    sort position — it's a status flag, not a sort key.
+    Returns a list sorted ascending by canonical price.
     """
     out = []
     bids_by_supplier = _STATE.get("bids", {}) or {}
@@ -1327,37 +1353,59 @@ def _build_item_bid_overlay(rfq_key: str, expected_today, latest_price,
     for supplier, parsed in bids_by_supplier.items():
         if not isinstance(parsed, dict):
             continue
+        # Collect every eligible bid record for this supplier + item.
+        candidates = []
         for b in parsed.get("bids", []) or []:
             if b.get("rfq_key") != rfq_key:
                 continue
-            # Use the engine's pre-computed effective_price (verified takes
-            # precedence over quoted) — same field the comparison matrix
-            # and scenario evaluation use, so what the analyst sees here
-            # matches what the award engine will award against.
             price = b.get("effective_price")
             if price is None or price <= 0:
                 continue
-            ratio = (price / reference) if (reference and reference > 0) else None
-            pct_diff = ((ratio - 1.0) * 100.0) if ratio is not None else None
-            possible_typo = (
-                ratio is not None and ratio <= ITEM_OVERLAY_TYPO_RATIO_MAX
-            )
-            out.append({
-                "supplier": supplier,
-                "price": float(price),
-                "qty": b.get("qty"),
-                "uom": b.get("uom") or "",
-                "status": b.get("status") or "",
-                "alt_part": b.get("alt_part") or "",
-                "notes": b.get("notes") or "",
-                "ratio": ratio,
-                "pct_diff": pct_diff,
-                "possible_typo": possible_typo,
-                "reference": ("trend" if expected_today is not None
-                              else ("latest" if latest_price is not None else None)),
-                "is_locked": (locked_supplier is not None
-                              and supplier == locked_supplier),
+            status = b.get("status") or ""
+            if status not in _BID_STATUS_PRIORITY:
+                continue
+            candidates.append((b, status, float(price)))
+        if not candidates:
+            continue
+        # Sort: status priority asc, then price asc. First entry is canonical.
+        candidates.sort(key=lambda c: (_BID_STATUS_PRIORITY[c[1]], c[2]))
+        canonical_b, canonical_status, canonical_price = candidates[0]
+        # The other quotes — surface as alt_quotes for the UI to show. Trim
+        # to a reasonable cap so a pathological 200-row supplier file doesn't
+        # blow the JSON payload.
+        alt_quotes = []
+        for b2, st2, pr2 in candidates[1:21]:  # cap at 20 alts
+            alt_quotes.append({
+                "price": pr2,
+                "status": st2,
+                "qty": b2.get("qty"),
+                "uom": b2.get("uom") or "",
+                "alt_part": b2.get("alt_part") or "",
+                "notes": (b2.get("notes") or "")[:120],
             })
+        n_alt = len(candidates) - 1
+
+        ratio = (canonical_price / reference) if (reference and reference > 0) else None
+        pct_diff = ((ratio - 1.0) * 100.0) if ratio is not None else None
+        possible_typo = (ratio is not None and ratio <= ITEM_OVERLAY_TYPO_RATIO_MAX)
+        out.append({
+            "supplier": supplier,
+            "price": canonical_price,
+            "qty": canonical_b.get("qty"),
+            "uom": canonical_b.get("uom") or "",
+            "status": canonical_status,
+            "alt_part": canonical_b.get("alt_part") or "",
+            "notes": (canonical_b.get("notes") or "")[:200],
+            "ratio": ratio,
+            "pct_diff": pct_diff,
+            "possible_typo": possible_typo,
+            "reference": ("trend" if expected_today is not None
+                          else ("latest" if latest_price is not None else None)),
+            "is_locked": (locked_supplier is not None
+                          and supplier == locked_supplier),
+            "n_alt_quotes": n_alt,
+            "alt_quotes": alt_quotes,
+        })
     out.sort(key=lambda r: r["price"])
     return out
 
