@@ -2786,6 +2786,15 @@ function _renderItemBidsSection(h) {
           ${typoBadge}
         </div>
         ${b.alt_part ? `<div style="margin-top:4px;color:var(--ink-2);font-size:10px;">alt: ${_escapeHtml(b.alt_part)}</div>` : ''}
+        ${(b.n_alt_quotes && b.n_alt_quotes > 0) ? `
+          <details style="margin-top:6px;">
+            <summary style="cursor:pointer;color:var(--ink-2);font-size:10px;letter-spacing:0.04em;list-style:none;">+${b.n_alt_quotes} other quote${b.n_alt_quotes === 1 ? '' : 's'} from ${_escapeHtml(b.supplier)} for this item ▾</summary>
+            <div style="margin-top:4px;padding:4px 6px;background:rgba(0,0,0,0.18);border-radius:3px;font-size:10px;color:var(--ink-1);line-height:1.55;">
+              ${(b.alt_quotes || []).map(a => `<div>$${a.price.toFixed(2)}${a.status && a.status !== 'PRICED' ? ` <span style="color:var(--ink-2);">[${_escapeHtml(a.status)}]</span>` : ''}${a.alt_part ? ` <span style="color:var(--ink-2);">alt: ${_escapeHtml(a.alt_part)}</span>` : ''}${a.notes ? ` <span style="color:var(--ink-2);font-style:italic;">${_escapeHtml(a.notes)}</span>` : ''}</div>`).join('')}
+              <div style="margin-top:4px;color:var(--ink-2);font-size:9px;">Canonical pick: lowest of (PRICED &gt; UOM_DISC &gt; SUBSTITUTE). Multiple quotes per supplier per item usually mean qty-break tiers, alt SKUs, or duplicate template rows. Worth confirming with the supplier if the spread is wide.</div>
+            </div>
+          </details>
+        ` : ''}
         <button type="button"
           class="im-bid-lock-btn"
           data-supplier="${_escapeHtml(b.supplier)}"
