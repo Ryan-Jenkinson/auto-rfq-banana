@@ -1323,21 +1323,42 @@ BID_STATUS_NEED_INFO   = "NEED_INFO"     # supplier asked for clarification
 BID_STATUS_UOM_DISC    = "UOM_DISC"      # priced but with a UOM-mismatch warning
 BID_STATUS_SUBSTITUTE  = "SUBSTITUTE"    # priced with an alternate part offered
 
-NO_BID_NOTE_MARKERS = (
+# Substring-safe no-bid markers — these phrases are long enough that they can't
+# accidentally match other words via substring search.
+NO_BID_LONG_MARKERS = (
     "need more information", "need more info", "need info", "more info",
-    "n/a", "na", "discontinued", "obsolete", "no quote", "no bid",
+    "discontinued", "obsolete", "no quote", "no bid",
     "unable to quote", "cannot quote", "not available", "not stocked",
-    "no longer available", "tbd", "to be quoted",
+    "no longer available", "to be quoted",
 )
+# Short markers ("na", "tbd", "n/a") that need WORD-BOUNDARY matching to avoid
+# false positives — "na" was matching "fasteNAl" in supplier notes, causing
+# every UOM-discrepancy line to be misclassified as NO_BID. Discovered during
+# the demo-existing-rfq workflow on the real Fastenal bid file (2026-04-29).
+import re as _re
+_NO_BID_SHORT_RE = _re.compile(r"\b(?:n/?a|tbd)\b", _re.IGNORECASE)
 
 
 def _matches_no_bid(notes_text: str) -> bool:
+    """True if the notes text contains an explicit no-bid signal.
+
+    Long markers (multi-word phrases) use substring matching — they can't
+    accidentally match other words. Short ambiguous markers (na, tbd, n/a)
+    use word-boundary regex to avoid matching them inside larger words like
+    "fasteNAl".
+    """
     if not notes_text:
         return False
     t = str(notes_text).strip().lower()
     if not t:
         return False
-    return any(m in t for m in NO_BID_NOTE_MARKERS)
+    if _NO_BID_SHORT_RE.search(t):
+        return True
+    return any(m in t for m in NO_BID_LONG_MARKERS)
+
+
+# Backwards-compatible alias for any external code that imports the constant.
+NO_BID_NOTE_MARKERS = NO_BID_LONG_MARKERS + ("n/a", "na", "tbd")
 
 
 def _detect_our_format(ws) -> int:
@@ -1591,6 +1612,203 @@ def list_supplier_bids() -> list:
         }
         for s, p in bids.items()
     ]
+
+
+def _norm_uom(u) -> str:
+    """Normalize a UOM string for equality checks. Empty string if missing."""
+    if not u:
+        return ""
+    s = str(u).strip().upper()
+    # Common aliases — Each, EACH, Ea., EA all normalize to "EA"
+    s = s.replace(".", "").replace("EACH", "EA")
+    s = s.replace("PACKAGE", "PK").replace("PACK", "PK")
+    s = s.replace("FOOT", "FT").replace("FEET", "FT")
+    s = s.replace("INCH", "IN").replace("INCHES", "IN")
+    return s
+
+
+def compute_clean_savings_summary_DEPRECATED_BIDLINE_BASED() -> dict:
+    """Compute "clean" savings metrics that exclude bids polluted by data-quality
+    issues. Operates on the current _STATE bids + items.
+
+    Three savings tiers per supplier, each progressively stricter:
+
+    - **raw**: every bid with a price > 0, including UOM_DISC and SUBSTITUTE
+      statuses. This is what the current dashboard shows, but it's polluted
+      when supplier UOM differs from history UOM (per-each Fastenal price
+      compared against per-package McMaster anchor inflates apparent savings
+      to absurd values).
+
+    - **clean**: bids with status == PRICED only. Excludes UOM_DISC,
+      NO_BID, NEED_INFO, SUBSTITUTE. Catches the explicitly-flagged UOM
+      mismatches but misses implicit ones (Grainger / MSC don't always note
+      UOM in the response — they just quote in their own units).
+
+    - **strict**: clean + the bid's UOM matches the history's UOM (after
+      normalization). Catches implicit UOM mismatches the supplier didn't
+      annotate. This is the most defensible savings number.
+
+    Returns:
+        {
+          "by_supplier": [
+            {"supplier", "raw_savings", "clean_savings", "strict_savings",
+             "n_raw", "n_clean", "n_strict",
+             "n_excluded_by_status", "n_excluded_by_uom"},
+            ...
+          ],
+          "totals": {"raw": float, "clean": float, "strict": float},
+        }
+
+    Negative savings = bid is more expensive than history. Positive savings
+    = bid is cheaper.
+
+    Note this is ADDITIVE — it doesn't modify any existing pipeline output.
+    Designed to be surfaced alongside the existing comparison matrix in the
+    dashboard so users can see both the raw and corrected numbers and judge
+    which to use for their decision.
+    """
+    items = _STATE.get("items", [])
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+
+    # Build a per-item lookup for history qty + price + UOM
+    items_by_key = {}
+    for it in items:
+        items_by_key[it["key"]] = {
+            "qty_24mo": it.get("qty_24mo") or 0,
+            "last_unit_price": it.get("last_unit_price") or 0,
+            "uom": _norm_uom(it.get("uom")),
+        }
+
+    by_supplier = []
+    totals = {"raw": 0.0, "clean": 0.0, "strict": 0.0}
+
+    for sup, parsed in bids_by_supplier.items():
+        raw_save = clean_save = strict_save = 0.0
+        n_raw = n_clean = n_strict = 0
+        n_excl_status = n_excl_uom = 0
+
+        for b in parsed.get("bids", []):
+            bid_price = b.get("effective_price") or 0
+            if not bid_price or bid_price <= 0:
+                continue
+            it = items_by_key.get(b.get("rfq_key"))
+            if not it: continue
+            hist_price = it["last_unit_price"]
+            qty = it["qty_24mo"]
+            if not (hist_price > 0 and qty > 0): continue
+
+            # RAW — all priced bids contribute
+            line_savings = (hist_price - bid_price) * qty
+            raw_save += line_savings; n_raw += 1
+
+            # CLEAN — status-filtered
+            if b.get("status") != BID_STATUS_PRICED:
+                n_excl_status += 1
+                continue
+            clean_save += line_savings; n_clean += 1
+
+            # STRICT — additionally require UOM match (when both knowable)
+            bid_uom = _norm_uom(b.get("uom"))
+            hist_uom = it["uom"]
+            if bid_uom and hist_uom and bid_uom != hist_uom:
+                n_excl_uom += 1
+                continue
+            strict_save += line_savings; n_strict += 1
+
+        by_supplier.append({
+            "supplier": sup,
+            "raw_savings": round(raw_save, 2),
+            "clean_savings": round(clean_save, 2),
+            "strict_savings": round(strict_save, 2),
+            "n_raw": n_raw,
+            "n_clean": n_clean,
+            "n_strict": n_strict,
+            "n_excluded_by_status": n_excl_status,
+            "n_excluded_by_uom": n_excl_uom,
+        })
+        totals["raw"] += raw_save
+        totals["clean"] += clean_save
+        totals["strict"] += strict_save
+
+    by_supplier.sort(key=lambda d: -d["strict_savings"])
+    return {
+        "by_supplier": by_supplier,
+        "totals": {k: round(v, 2) for k, v in totals.items()},
+    }
+
+
+def compute_clean_savings_summary() -> dict:
+    """Compute "clean" savings metrics that exclude bids polluted by data-quality
+    issues. Operates on the comparison matrix output (item-deduplicated).
+
+    Three savings tiers per supplier, each progressively stricter — same shape
+    as the deprecated version above, but iterates over the comparison matrix
+    rows (one row per item) rather than the raw bid list (which has duplicate
+    lines per item in some files like Fastenal).
+
+    See compute_clean_savings_summary_DEPRECATED_BIDLINE_BASED for the prior
+    implementation that double-counted dup'd bid lines. Kept temporarily for
+    diff visibility; remove once the new function is verified correct.
+    """
+    matrix = compute_comparison_matrix()
+    rows = matrix.get("rows", [])
+    suppliers = matrix.get("suppliers", [])
+
+    by_supplier_dict = {sup: {
+        "supplier": sup,
+        "raw_savings": 0.0, "clean_savings": 0.0, "strict_savings": 0.0,
+        "n_raw": 0, "n_clean": 0, "n_strict": 0,
+        "n_excluded_by_status": 0, "n_excluded_by_uom": 0,
+    } for sup in suppliers}
+
+    totals = {"raw": 0.0, "clean": 0.0, "strict": 0.0}
+
+    for r in rows:
+        hist_price = r.get("last_unit_price") or 0
+        qty = r.get("qty_24mo") or 0
+        if hist_price <= 0 or qty <= 0:
+            continue
+        hist_uom = _norm_uom(r.get("uom"))
+        bids = r.get("bids") or {}
+        for sup, b in bids.items():
+            if not isinstance(b, dict): continue
+            bid_price = b.get("price") or 0
+            if not bid_price or bid_price <= 0: continue
+            line_savings = (hist_price - bid_price) * qty
+
+            agg = by_supplier_dict[sup]
+            # RAW
+            agg["raw_savings"] += line_savings
+            agg["n_raw"] += 1
+            totals["raw"] += line_savings
+
+            # CLEAN — status-filtered
+            if b.get("status") != BID_STATUS_PRICED:
+                agg["n_excluded_by_status"] += 1
+                continue
+            agg["clean_savings"] += line_savings
+            agg["n_clean"] += 1
+            totals["clean"] += line_savings
+
+            # STRICT — clean + UOM match
+            bid_uom = _norm_uom((b.get("raw") or {}).get("uom"))
+            if bid_uom and hist_uom and bid_uom != hist_uom:
+                agg["n_excluded_by_uom"] += 1
+                continue
+            agg["strict_savings"] += line_savings
+            agg["n_strict"] += 1
+            totals["strict"] += line_savings
+
+    by_supplier = list(by_supplier_dict.values())
+    by_supplier.sort(key=lambda d: -d["strict_savings"])
+    for s in by_supplier:
+        s["raw_savings"] = round(s["raw_savings"], 2)
+        s["clean_savings"] = round(s["clean_savings"], 2)
+        s["strict_savings"] = round(s["strict_savings"], 2)
+    return {
+        "by_supplier": by_supplier,
+        "totals": {k: round(v, 2) for k, v in totals.items()},
+    }
 
 
 def remove_supplier_bid(supplier_name: str) -> bool:

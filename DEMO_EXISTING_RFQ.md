@@ -37,6 +37,43 @@ This branch (`demo-existing-rfq`) exists to support a one-off demo using the Fas
 | PUSH_BACK | 52 (Fastenal more expensive than anchor) |
 | EXCLUDE | 46 |
 
+## Three-supplier savings picture (after the branch's bug fix + clean savings filter)
+
+End-to-end test on all three real bid files (Fastenal, Grainger, MSC) against the McMaster Coupa multi-year history:
+
+| Supplier | RAW $ (current display) | CLEAN $ (status-filtered) | STRICT $ (status + UOM-match) | Items in strict set |
+|---|---|---|---|---|
+| Fastenal | **−$1,742,020** | $34,405 | **+$24,792** | 278 |
+| MSC | −$570,304 | −$570,304 | **−$606,348** | 1,451 |
+| Grainger | −$1,501,253 | −$1,501,253 | **−$1,346,424** | 2,285 |
+| **TOTAL** | **−$3,813,576** | −$2,037,152 | **−$1,927,979** | |
+
+**RAW = current dashboard behavior** — the −$3.8M figure is dominated by UOM mismatches where Fastenal quotes per-each (e.g., $0.0123) against McMaster anchors that are per-package (e.g., $1.23). Multiplied across thousands of units, the apparent "loss" is an artifact, not real procurement signal.
+
+**CLEAN = excludes lines flagged UOM_DISC / NO_BID / NEED_INFO / SUBSTITUTE.** Catches Fastenal's explicit UOM-discrepancy notes but doesn't help with Grainger/MSC where the mismatch is implicit (they quote in their own units without flagging).
+
+**STRICT = CLEAN + bid UOM matches history UOM.** The most defensible figure. This is what to use in director conversations.
+
+### What the STRICT numbers actually mean for the director
+
+> "Across 4,000+ truly comparable line items (where the UOMs match and the bid status is clean), McMaster is currently CHEAPER than the three RFQ suppliers IN AGGREGATE by about $1.9M over a 24-month qty horizon. That doesn't mean we shouldn't switch — it means **blanket switching loses money, but per-item carve-outs save money.** Fastenal is the only supplier with net savings (~$25K) on items where they beat McMaster. Grainger and MSC each have hundreds of items where they're cheaper (the carve-out opportunities), but more items where they're more expensive."
+
+The recommendation engine already surfaces this as ACCEPT items per-supplier:
+- 153 ACCEPT items for Fastenal (= clear savings vs history)
+- Similar buckets for Grainger and MSC
+
+The carve-out award strategy in the comparison matrix is the right operationalization of this.
+
+### Bug fixes shipped on this branch
+
+1. **`_matches_no_bid` word-boundary fix** — `"na"` was a no-bid marker that matched `"fasteNAl"` via substring search. Result: every Fastenal note containing the word "Fastenal" got mis-classified as NO_BID. Fixed with regex word boundaries on the short markers (`na`, `tbd`, `n/a`). Multi-word markers stay as substring (no risk of accidental match). Caught 1,896 priced bids vs 1,815 before the fix (+81 correctly recovered).
+
+2. **`compute_clean_savings_summary()` (additive)** — new function that produces the RAW / CLEAN / STRICT savings tiers per supplier. Doesn't modify any existing pipeline output. JS dashboard can opt into rendering the cleaned numbers alongside the existing display.
+
+Both fixes are good candidates to backport to main:
+- The no_bid fix is unambiguously correct — would benefit production usage with any supplier whose name happens to contain "na" (Fastenal is the obvious example, but also any "national", "international", "Carolina"-named supplier).
+- The clean savings function is opt-in — surfacing it in the dashboard is the next decision.
+
 ## Caveats to call out during the demo
 
 1. **UOM-mismatch items dominate the ASK_CLARIFICATION bucket.** Many McMaster fasteners are sold in packages (of 10, 50, etc.) where Fastenal sells per-each. The bid file's notes column flags these clearly ("UOM DISCREPANCY, FASTENAL IS PER EACH, MCMASTER IS PER PACKAGE"). The comparison can't trust the per-unit price comparison until UOM is normalized — which is the entire point of the ASK_CLARIFICATION bucket. Resolve manually for the high-spend ones, push the rest back to Fastenal for confirmation.
