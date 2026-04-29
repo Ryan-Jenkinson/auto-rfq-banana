@@ -1459,19 +1459,97 @@ async function _refreshConsolidationAndMatrix() {
 
   const out = await _py.runPythonAsync(`
 import json
-from app_engine import compute_comparison_matrix, compute_consolidation_analysis, list_award_scenarios
+from app_engine import compute_comparison_matrix, compute_consolidation_analysis, list_award_scenarios, compute_clean_savings_summary
 result = {
   "matrix": compute_comparison_matrix(),
   "consolidation": compute_consolidation_analysis(),
   "scenarios": list_award_scenarios(),
+  "clean_savings": compute_clean_savings_summary(),
 }
 json.dumps(result, default=str)
 `);
   const data = JSON.parse(out);
   _renderBidCoverageKPIs(data.matrix);
+  _renderCleanSavingsPanel(data.clean_savings);
   _renderConsolidation(data.consolidation);
   _renderComparisonMatrix(data.matrix);
   _renderScenariosBlock(data.scenarios, data.consolidation);
+}
+
+// Renders the RAW / CLEAN / STRICT savings tiers as a panel below the bid-coverage KPIs.
+// Added on the demo-existing-rfq branch to surface the "real" savings number for the
+// Fastenal/Grainger/MSC RFQ demo where the RAW number is polluted by UOM mismatches.
+//
+// Tiers (per supplier + aggregate):
+//   RAW    = current dashboard behavior — every priced bid contributes (UOM-mismatched lines too)
+//   CLEAN  = excludes lines flagged UOM_DISC / NO_BID / NEED_INFO / SUBSTITUTE
+//   STRICT = CLEAN + bid UOM matches history UOM after normalization
+function _renderCleanSavingsPanel(clean) {
+  if (!clean || !clean.by_supplier) return;
+  const wrap = $('bid-summary-row');
+  if (!wrap) return;
+
+  // Remove any prior render (so re-runs don't duplicate)
+  const prior = document.getElementById('clean-savings-panel');
+  if (prior) prior.remove();
+
+  const fmt$ = (n) => n == null ? '—' : (n < 0 ? '−$' : '$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+  const colorOf = (n) => n == null ? 'var(--ink-2)' : (n > 0 ? 'var(--green)' : (n < 0 ? 'var(--red)' : 'var(--ink-1)'));
+  const t = clean.totals || {};
+
+  let rowsHtml = '';
+  for (const s of (clean.by_supplier || [])) {
+    rowsHtml += `
+      <tr>
+        <td style="padding:8px 12px;font-weight:600;color:var(--ink-0);">${s.supplier}</td>
+        <td style="padding:8px 12px;text-align:right;font-family:var(--mono);color:${colorOf(s.raw_savings)};">${fmt$(s.raw_savings)} <span style="color:var(--ink-2);font-size:11px;">(${s.n_raw})</span></td>
+        <td style="padding:8px 12px;text-align:right;font-family:var(--mono);color:${colorOf(s.clean_savings)};">${fmt$(s.clean_savings)} <span style="color:var(--ink-2);font-size:11px;">(${s.n_clean})</span></td>
+        <td style="padding:8px 12px;text-align:right;font-family:var(--mono);color:${colorOf(s.strict_savings)};font-weight:700;">${fmt$(s.strict_savings)} <span style="color:var(--ink-2);font-size:11px;font-weight:400;">(${s.n_strict})</span></td>
+        <td style="padding:8px 12px;text-align:right;font-family:var(--mono);color:var(--ink-2);font-size:11px;">${s.n_excluded_by_status} status · ${s.n_excluded_by_uom} UOM</td>
+      </tr>
+    `;
+  }
+
+  const html = `
+    <div id="clean-savings-panel" style="margin-top:18px;padding:18px 20px;background:rgba(138,124,255,0.04);border:1px solid var(--line);border-radius:6px;">
+      <details>
+        <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--ink-0);user-select:none;">
+          Savings comparison — RAW vs CLEAN vs STRICT
+          <span style="color:var(--ink-2);font-size:11px;font-weight:400;margin-left:8px;">(click to expand · the STRICT figure is the most defensible for director conversations)</span>
+        </summary>
+        <div style="margin-top:14px;font-size:12px;color:var(--ink-2);line-height:1.5;">
+          <strong style="color:var(--ink-0);">RAW</strong> = every priced bid (current behavior, polluted by UOM mismatches).
+          <strong style="color:var(--ink-0);">CLEAN</strong> = excludes UOM_DISC / NO_BID / NEED_INFO / SUBSTITUTE statuses.
+          <strong style="color:var(--ink-0);">STRICT</strong> = CLEAN + bid UOM equals history UOM (catches implicit mismatches).
+          Positive = savings vs history. Negative = supplier more expensive.
+        </div>
+        <table style="width:100%;margin-top:14px;border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr style="border-bottom:1px solid var(--line);color:var(--ink-2);font-size:11px;text-transform:uppercase;letter-spacing:0.06em;">
+              <th style="padding:6px 12px;text-align:left;">Supplier</th>
+              <th style="padding:6px 12px;text-align:right;">RAW</th>
+              <th style="padding:6px 12px;text-align:right;">CLEAN</th>
+              <th style="padding:6px 12px;text-align:right;background:rgba(255,183,51,0.06);">STRICT</th>
+              <th style="padding:6px 12px;text-align:right;">Excluded</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml}
+          </tbody>
+          <tfoot>
+            <tr style="border-top:2px solid var(--line);font-weight:700;">
+              <td style="padding:10px 12px;color:var(--ink-0);">TOTAL</td>
+              <td style="padding:10px 12px;text-align:right;font-family:var(--mono);color:${colorOf(t.raw)};">${fmt$(t.raw)}</td>
+              <td style="padding:10px 12px;text-align:right;font-family:var(--mono);color:${colorOf(t.clean)};">${fmt$(t.clean)}</td>
+              <td style="padding:10px 12px;text-align:right;font-family:var(--mono);color:${colorOf(t.strict)};background:rgba(255,183,51,0.06);">${fmt$(t.strict)}</td>
+              <td></td>
+            </tr>
+          </tfoot>
+        </table>
+      </details>
+    </div>
+  `;
+  wrap.insertAdjacentHTML('afterend', html);
 }
 
 // ----- Award scenarios block -----
