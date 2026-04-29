@@ -75,9 +75,9 @@
       <div class="brand">Auto RFQ Banana <span class="brand-sub">/ build · send · compare</span></div>
     </div>
     <div style="margin-left:auto;display:flex;align-items:center;gap:14px;">
-      <button id="open-profile" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⌂ PROFILE</button>
-      <button id="open-audit" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⊞ AUDIT</button>
-      <button id="open-settings" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⚙ THRESHOLDS</button>
+      <button id="open-profile" type="button" title="Set your name, email, and signature line — these appear on outbound RFQ files, follow-up xlsx, and award letters as the contact-of-record." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⌂ PROFILE</button>
+      <button id="open-audit" type="button" title="Open the audit log — every important action (extract, smart trim, bid intake, threshold change, scenario save, award letter, exclusion, lock, etc.) is recorded with a timestamp. The trail feeds the Decision Log xlsx for legal-hold." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⊞ AUDIT</button>
+      <button id="open-settings" type="button" title="Tune the 11 engine thresholds — scoring weights, outlier factor, savings cutoffs, carve-out threshold, etc. Defaults work for most cases; touch only if a specific RFQ needs different judgment." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⚙ THRESHOLDS</button>
       <div class="steps">
         <div class="step-dot active" data-step="1"></div>
         <div class="step-dot" data-step="2"></div>
@@ -93,7 +93,7 @@
     <p class="subtitle">Drop the incumbent supplier's multi-year PO history (xlsx export from Coupa / EAM). The app dedupes to unique items, aggregates per-window spend, and builds the candidate RFQ list for your review. Runs locally — nothing is uploaded.</p>
 
     <div class="file-grid single">
-      <div class="dropzone" id="dz-export">
+      <div class="dropzone" id="dz-export" title="Drop or click to pick the incumbent supplier's multi-year PO export from Coupa or EAM. The app reads it locally — nothing is uploaded. ~25k rows / 50 cols / 3-year history is the typical shape.">
         <div class="dropzone-icon">⬆</div>
         <div class="dropzone-label">Multi-year supplier export</div>
         <div class="dropzone-sub">.xlsx — long PO history from one supplier (e.g. <code>jhflongcoupa.xlsx</code>)</div>
@@ -103,7 +103,7 @@
     </div>
 
     <div class="actions">
-      <button class="btn primary" id="to-mapping" disabled>Continue to column mapping →</button>
+      <button class="btn primary" id="to-mapping" title="Move to step 2 — confirm which export column maps to which engine field (item_num, description, qty, unit_price, etc.). Auto-mapper fills in most rows; you only adjust ones it got wrong." disabled>Continue to column mapping →</button>
     </div>
 
     <div id="reopen-block" style="margin-top:36px;padding:18px 22px;background:var(--bg-1);border:1px solid var(--line);border-radius:6px;">
@@ -114,7 +114,7 @@
           <div style="font-size:12px;color:var(--ink-2);font-style:italic;">You'll still need to drop the source xlsx (we don't bundle source data into the save). Saved decisions and bids re-apply automatically once the source is loaded.</div>
         </div>
         <div style="display:flex;gap:8px;align-items:center;">
-          <button class="btn ghost" id="reopen-from-file" type="button">📂 Pick saved JSON…</button>
+          <button class="btn ghost" id="reopen-from-file" type="button" title="Pick a saved-session JSON to restore mapping, scenarios, supplier bids, thresholds, audit trail, item exclusions, and item locks. You'll still need to drop the source xlsx separately — the binary isn't bundled into the save (keeps the file small + portable).">📂 Pick saved JSON…</button>
           <input type="file" id="reopen-file-input" accept=".json" style="display:none">
         </div>
       </div>
@@ -128,9 +128,9 @@
     <div id="mapping-templates-row" style="margin-bottom:18px;"></div>
     <div id="mapping-table-wrap" class="mapping-table-wrap"></div>
     <div class="actions">
-      <button class="btn ghost" id="back-to-1">← Back</button>
-      <button class="btn ghost" id="save-mapping-template">💾 Save as template…</button>
-      <button class="btn primary" id="to-extract">Build RFQ list →</button>
+      <button class="btn ghost" id="back-to-1" title="Go back to step 1 to drop a different export file.">← Back</button>
+      <button class="btn ghost" id="save-mapping-template" title="Save the current column mapping as a named template — handy when this supplier sends the same file shape every cycle. Templates live in localStorage; one-click re-apply on the next extract.">💾 Save as template…</button>
+      <button class="btn primary" id="to-extract" title="Run the full extract: dedupe to unique items, aggregate per-window spend (12/24/36 mo + all-time), score each item 0-100, flag risky description patterns, and rate the file's overall difficulty.">Build RFQ list →</button>
     </div>
   </section>
 
@@ -142,42 +142,42 @@
     <div id="kpi-row" class="kpi-row"></div>
 
     <div class="filter-row">
-      <label>Window:
-        <select id="active-window">
+      <label title="Which time window the qty + spend columns pivot to. 24 months is the default RFQ baseline. 'All time' shows every priced line ever seen in the export.">Window:
+        <select id="active-window" title="12 / 24 / 36 months back from the dataset's most recent order date (not today's date — exports are often weeks stale).">
           <option value="12">12 months</option>
           <option value="24" selected>24 months</option>
           <option value="36">36 months</option>
           <option value="all">All time</option>
         </select>
       </label>
-      <label>Min spend:
-        <input type="number" id="min-spend" value="0" min="0" step="100">
+      <label title="Hide items whose spend in the active window falls below this dollar threshold. Useful for trimming the long tail of one-off purchases.">Min spend:
+        <input type="number" id="min-spend" value="0" min="0" step="100" title="Items with active-window spend below this $ value are hidden. 0 = show everything.">
       </label>
-      <label>Tier:
-        <select id="tier-filter">
+      <label title="Filter by engine-assigned tier. STRONG/MODERATE are the items most worth bidding out; WEAK/SKIP usually aren't.">Tier:
+        <select id="tier-filter" title="STRONG = high frequency + recent + clean data. MODERATE = some concerns. WEAK = thin/dormant. SKIP = almost certainly not RFQ-worthy.">
           <option value="all" selected>All tiers</option>
           <option value="STRONG">Strong only</option>
           <option value="STRONG_MODERATE">Strong + moderate</option>
           <option value="WEAK">Weak / skip only</option>
         </select>
       </label>
-      <label>Show:
-        <select id="include-filter">
+      <label title="Filter by RFQ-include checkbox state. Useful for double-checking what's about to go out vs what you've trimmed.">Show:
+        <select id="include-filter" title="'Included' = items currently ticked for the RFQ. 'Excluded' = items you've unticked or that smart-trim removed.">
           <option value="all" selected>All items</option>
           <option value="included">Included only</option>
           <option value="excluded">Excluded only</option>
         </select>
       </label>
-      <label>Search:
-        <input type="text" id="rfq-search" placeholder="item / mfg / desc">
+      <label title="Live-filter the table by item number, MFG name, MFG part number, or description text.">Search:
+        <input type="text" id="rfq-search" placeholder="item / mfg / desc" title="Substring match across item_num, mfg_name, mfg_pn, and description fields.">
       </label>
-      <span class="muted" id="rfq-count">—</span>
+      <span class="muted" id="rfq-count" title="Number of items currently visible after all filters / total items in the candidate list.">—</span>
     </div>
 
     <div class="actions" style="margin-top:0;margin-bottom:14px;">
-      <button class="btn ghost" id="bulk-include-all" style="padding:6px 12px;font-size:12px;">Include all visible</button>
-      <button class="btn ghost" id="bulk-exclude-all" style="padding:6px 12px;font-size:12px;">Exclude all visible</button>
-      <button class="btn ghost" id="smart-trim" title="Untick items with weak/skip tier OR concerning description patterns (service / freight / tariff / obsolete / rental)" style="padding:6px 12px;font-size:12px;">⚡ Smart trim</button>
+      <button class="btn ghost" id="bulk-include-all" title="Tick every visible row at once — useful after narrowing the filter to a specific subset you want in the RFQ." style="padding:6px 12px;font-size:12px;">Include all visible</button>
+      <button class="btn ghost" id="bulk-exclude-all" title="Untick every visible row at once — useful after filtering to weak/SKIP tier or risky description patterns." style="padding:6px 12px;font-size:12px;">Exclude all visible</button>
+      <button class="btn ghost" id="smart-trim" title="Bulk-untick items with WEAK/SKIP tier OR risky description patterns (service / freight / tariff / obsolete / rental). Reversible — items stay in the list, just unchecked. The single most common first move on a fresh extract." style="padding:6px 12px;font-size:12px;">⚡ Smart trim</button>
       <span class="muted" id="trim-status"></span>
     </div>
 
@@ -191,10 +191,10 @@
     <div id="charts-stage" class="charts-stage"></div>
 
     <div class="actions">
-      <button class="btn ghost" id="back-to-2">← Back</button>
-      <button class="btn ghost" id="export-rfq-list">⬇ Export candidate list (xlsx)</button>
-      <button class="btn ghost" id="gen-outbound-rfq">📤 Generate outbound RFQ files…</button>
-      <button class="btn primary" id="to-bids">Compare supplier bids →</button>
+      <button class="btn ghost" id="back-to-2" title="Back to column mapping — useful if you need to re-map a column and re-extract.">← Back</button>
+      <button class="btn ghost" id="export-rfq-list" title="Export the FULL candidate list as an internal-audience xlsx (includes historical paid prices, scoring, demand flags). Don't send to suppliers — supplier-bound files are generated separately and exclude internal-only fields.">⬇ Export candidate list (xlsx)</button>
+      <button class="btn ghost" id="gen-outbound-rfq" title="Build per-supplier outbound RFQ workbooks for the items currently ticked. Each is a 5-tab xlsx with locked cells, dropdown validation, hidden round-trip keys, and NO internal-only fields (no historical paid prices). One file per supplier — what actually goes to the bidder.">📤 Generate outbound RFQ files…</button>
+      <button class="btn primary" id="to-bids" title="Move to step 4 — drop returned bid xlsx files from each supplier, see the comparison matrix, run consolidation analysis, save award scenarios, and generate award letters.">Compare supplier bids →</button>
     </div>
   </section>
 
@@ -206,9 +206,9 @@
     <div id="bid-intake-row" class="bid-intake-row"></div>
 
     <div class="actions" style="margin-top:0;">
-      <button class="btn ghost" id="bid-add-btn">＋ Add supplier bid xlsx</button>
+      <button class="btn ghost" id="bid-add-btn" title="Drop or pick a returned-bid xlsx from one supplier. Auto-detects 'our format' (the template you sent in step 3); if the supplier reformatted, you'll get a manual column-mapping prompt. Add as many suppliers as you want — typical RFQs are 2-5.">＋ Add supplier bid xlsx</button>
       <input type="file" id="bid-file-input" accept=".xlsx" style="display:none">
-      <button class="btn ghost" id="bid-clear-btn">Clear all bids</button>
+      <button class="btn ghost" id="bid-clear-btn" title="Remove every loaded bid (does not delete the source xlsx). Use to start step 4 over with a clean slate.">Clear all bids</button>
     </div>
 
     <div id="bid-summary-row" class="kpi-row" style="margin-top:32px;"></div>
@@ -223,7 +223,7 @@
     <div id="scenarios-section" style="margin-top:48px;"></div>
 
     <div class="actions">
-      <button class="btn ghost" id="back-to-3">← Back to RFQ list</button>
+      <button class="btn ghost" id="back-to-3" title="Back to step 3 — useful for tweaking the candidate list (smart-trim again, untick more outliers in per-item modals) before re-running comparisons.">← Back to RFQ list</button>
     </div>
   </section>
 

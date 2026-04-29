@@ -77,6 +77,8 @@ Both fields persist via `serialize_state` / `restore_state` so the curation work
 
 **Click-targets convention.** Every visible card / KPI / chip in the dashboard is either a click-target (drives the working table or opens a modal) or labeled non-interactive. Module-level state `_matrixFilter` holds the active filters for the comparison matrix; `_lastMatrixData` caches the most recent server payload so filter clicks re-render in-browser without re-running the Python compute (the matrix takes 1-2 s on the McMaster dataset). `_applyMatrixFilter(rows)` is the single point of truth for the filter logic. CSS classes `.kpi.clickable`, `.clickable-card`, `.clickable-row`, `.clickable-chip`, and `.matrix-cell` give the visual cue; `.matrix-filter-bar` + `.matrix-filter-pill` style the active-filter pill bar at the top of the matrix.
 
+**ELI5 tooltips on every interactive surface.** Every clickable / hoverable element in the dashboard carries a `title=""` tooltip with a plain-language explanation: what the field means, where the math came from (e.g. "12mo $ = qty_12mo × LAST $/ea"), what clicking does, when to use it. Surfaces covered: topbar buttons (Profile / Audit / Thresholds), step nav buttons, dropzones, column-mapping fields, RFQ-list filter inputs + bulk action buttons, every RFQ-table column header, KPI tiles, recommendation chips, supplier intake cards, consolidation candidate rows, comparison-matrix cells (with per-status text), per-item modal columns + lock buttons, scenario quick-create buttons + per-scenario action buttons. Treat any future click-target as incomplete until it has a tooltip.
+
 ## Engine entry points (Python)
 
 | Function | Purpose |

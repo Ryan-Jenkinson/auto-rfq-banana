@@ -759,22 +759,24 @@ function _renderRfqTable() {
   const fmt = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const fmtQty = (n) => n == null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 
+  // ELI5 tooltips on every column header — plain-language explanations a
+  // procurement person reads first time they look at the table.
   let head = `<tr>
-    <th class="cell-include">RFQ</th>
-    <th>Item #</th>
-    <th>Tier</th>
-    <th>Description</th>
-    <th>MFG</th>
-    <th>MFG PN</th>
-    <th class="num">12mo qty</th>
-    <th class="num">12mo $</th>
-    <th class="num">24mo qty</th>
-    <th class="num">24mo $</th>
-    <th class="num">36mo qty</th>
-    <th class="num">36mo $</th>
-    <th class="num">Last $/ea</th>
-    <th>UOM</th>
-    <th>Last order</th>
+    <th class="cell-include" title="Untick to drop an item from the RFQ. Default tick = had qty in the last 24 months. The 'Smart trim' button bulk-unticks WEAK/SKIP rows + risky description patterns.">RFQ</th>
+    <th title="Andersen item number (or McMaster Part Number when EAM is blank). The dedup key the engine matched on across the multi-year export.">Item #</th>
+    <th title="Engine score 0-100 + tier. STRONG = order frequency + recent activity + clean data. MODERATE = some flags. WEAK = thin/dormant history. SKIP = almost certainly not RFQ-worthy. Hover any tier chip for the per-item reason list.">Tier</th>
+    <th title="The description Andersen has on file for this item. Chips next to it: red = service / freight / tariff / obsolete / rental (usually don't belong in an RFQ); amber = custom / repair / misc (caution); UOM mixed / MFG blank flags surface data hygiene issues.">Description</th>
+    <th title="Manufacturer name. Often the strongest signal an RFQ has — suppliers price by manufacturer first, item number second. 'MFG blank' chip means the export didn't carry one for this item.">MFG</th>
+    <th title="Manufacturer's part number. The supplier-side anchor key — what the bidder uses to look up their cost. Blank means the export didn't carry one (very common in McMaster data).">MFG PN</th>
+    <th class="num" title="Quantity ordered in the last 12 months (anchored to the dataset's most recent order date, not today's date — exports are often weeks stale).">12mo qty</th>
+    <th class="num" title="12mo $ = qty_12mo × LAST $/ea. Internally consistent: 5 bananas at $5 each = $25. NOT the historical sum of line totals — that's spend_12mo_actual which you'd see in the headline KPI tile above.">12mo $</th>
+    <th class="num" title="Quantity ordered in the last 24 months. The default RFQ baseline window — what the outbound RFQ xlsx asks suppliers to bid against.">24mo qty</th>
+    <th class="num" title="24mo $ = qty_24mo × LAST $/ea. The spend baseline this RFQ is bidding against.">24mo $</th>
+    <th class="num" title="Quantity ordered in the last 36 months. Wider net — catches slow-moving items the 24-mo window would miss.">36mo qty</th>
+    <th class="num" title="36mo $ = qty_36mo × LAST $/ea.">36mo $</th>
+    <th class="num" title="The exact unit price of the most-recent priced order line for this item — to-the-penny, no rounding, no averaging. Drives every spend column in this row. Excluding outliers in the per-item modal recomputes this from the cleaned set.">Last $/ea</th>
+    <th title="Unit of measure (canonicalized — Each / EA / EACH all map to EA). 'UOM mixed' chip means the history has more than one distinct UOM for this item — worth confirming before sending out the RFQ.">UOM</th>
+    <th title="Date of the most recent priced order. 'Stale &gt;12mo' chip if it's been over a year — supplier may have changed pricing or stopped carrying the part.">Last order</th>
   </tr>`;
   $('rfq-table').querySelector('thead').innerHTML = head;
 
@@ -1953,15 +1955,17 @@ function _renderScenariosBlock(scenarios, consol) {
   let html = '<h2 style="margin-top:0;">Award scenarios</h2>';
   html += '<p class="subtitle" style="margin-bottom:18px;">Save named what-ifs (lowest-price / consolidate to one supplier / incumbent-preferred / qualified-only). Compare two side-by-side to see where the awards differ.</p>';
 
-  // Quick-create row
+  // Quick-create row — each strategy button carries an ELI5 explanation of
+  // what the engine does when you pick it, so the analyst can tell which
+  // award philosophy matches the situation without re-reading the docs.
   html += `<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap;">
-    <button class="btn ghost" data-scenario-quick="lowest_price">＋ Lowest price</button>
-    <button class="btn ghost" data-scenario-quick="lowest_qualified">＋ Lowest qualified (no UOM/sub)</button>`;
+    <button class="btn ghost" data-scenario-quick="lowest_price" title="Award every item to whichever supplier bid the lowest priced offer — UOM mismatches and substitute parts INCLUDED. Maximizes raw savings on paper; least defensible if a 'lowest' price is actually a UOM error.">＋ Lowest price</button>
+    <button class="btn ghost" data-scenario-quick="lowest_qualified" title="Like 'Lowest price' but EXCLUDES bids flagged UOM_DISC or SUBSTITUTE — picks the lowest 'clean' bid per item. The defensible default — what you'd present in an audit.">＋ Lowest qualified (no UOM/sub)</button>`;
   // One consolidate-to button per supplier
   for (const sup of (Object.keys(_loadedBids) || [])) {
-    html += `<button class="btn ghost" data-scenario-consolidate="${_escapeHtml(sup)}">＋ Consolidate to ${_escapeHtml(sup)}</button>`;
+    html += `<button class="btn ghost" data-scenario-consolidate="${_escapeHtml(sup)}" title="Award everything to ${_escapeHtml(sup)} as primary, but carve out items where another supplier saves &gt;30% (the carve_out_min_savings_pct threshold). Models 'one PO, fewer relationships, identified exceptions' — Ryan's actual award strategy.">＋ Consolidate to ${_escapeHtml(sup)}</button>`;
   }
-  html += `<button class="btn ghost" data-scenario-quick="incumbent_preferred">＋ Incumbent preferred</button>`;
+  html += `<button class="btn ghost" data-scenario-quick="incumbent_preferred" title="Stay with the incumbent supplier wherever they bid — unless competition saves at least min_savings_pct_to_switch (threshold setting). Use when relationship continuity matters or switching costs are real.">＋ Incumbent preferred</button>`;
   html += `</div>`;
 
   if (!scenarios || !scenarios.length) {
@@ -2000,17 +2004,17 @@ function _renderScenariosBlock(scenarios, consol) {
       <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${(t.items_switched||0).toLocaleString()}</td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-2);font-size:11px;">${(s.saved_at||'').slice(0,16).replace('T',' ')}</td>
       <td style="padding:12px 14px;text-align:right;white-space:nowrap;">
-        <button class="btn ghost" data-scen-letters="${_escapeHtml(s.name)}" title="Generate one award letter xlsx per awarded supplier" style="padding:4px 10px;font-size:11px;">📨 Letters</button>
-        <button class="btn ghost" data-scen-summary="${_escapeHtml(s.name)}" title="Generate the internal-audience full-detail summary xlsx" style="padding:4px 10px;font-size:11px;">📊 Internal</button>
-        <button class="btn ghost" data-scen-decision="${_escapeHtml(s.name)}" title="Generate the legal-hold decision log (xlsx + markdown for Copilot)" style="padding:4px 10px;font-size:11px;">📜 Decision Log</button>
-        <button class="btn ghost" data-scen-delete="${_escapeHtml(s.name)}" style="padding:4px 10px;font-size:11px;">×</button>
+        <button class="btn ghost" data-scen-letters="${_escapeHtml(s.name)}" title="Generate ONE award letter xlsx per awarded supplier — each letter contains only that supplier's awarded items + their bid + the qty awarded. Strict isolation guard: any cross-supplier name leaks throws IsolationViolation. Safe to email." style="padding:4px 10px;font-size:11px;">📨 Letters</button>
+        <button class="btn ghost" data-scen-summary="${_escapeHtml(s.name)}" title="Generate the cross-supplier full-detail summary xlsx — all bids, all decisions, all suppliers in one workbook. Banner says 'INTERNAL — NEVER FORWARD'. For Andersen-internal use only; never send to a supplier." style="padding:4px 10px;font-size:11px;">📊 Internal</button>
+        <button class="btn ghost" data-scen-decision="${_escapeHtml(s.name)}" title="Build the Decision Log — a per-RFQ legal-hold record per awarded item: every bid received, the engine's recommendation + reason, the scenario applied, manual overrides + rationale, threshold values active at the time, the audit trail. xlsx + matching markdown for Copilot. Retain for several years." style="padding:4px 10px;font-size:11px;">📜 Decision Log</button>
+        <button class="btn ghost" data-scen-delete="${_escapeHtml(s.name)}" title="Delete this scenario from the saved set. Doesn't undo any letters or logs already exported." style="padding:4px 10px;font-size:11px;">×</button>
       </td>
     </tr>`;
   }
   html += '</tbody></table></div>';
 
   html += `<div style="display:flex;gap:10px;margin-bottom:18px;">
-    <button class="btn primary" id="scen-compare-btn">⇄ Compare selected (pick exactly 2)</button>
+    <button class="btn primary" id="scen-compare-btn" title="Tick exactly two scenarios in the table above, then click here to see a side-by-side: per-item award diffs, totals delta, where they agree/disagree. The 'show me which is the better strategy' view.">⇄ Compare selected (pick exactly 2)</button>
   </div>`;
 
   html += '<div id="scenarios-compare-result"></div>';
