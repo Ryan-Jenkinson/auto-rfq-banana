@@ -225,3 +225,88 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
   0%, 49%   { opacity: 1; }
   50%, 100% { opacity: 0.3; }
 }
+
+/* Click-targets audit (2026-04-29): every clickable-looking element gets
+   a hover cue. KPI tiles, supplier intake cards, consolidation rows,
+   recommendation chips, and matrix cells use these helpers so users can
+   tell at a glance what's interactive. */
+.kpi.clickable, .clickable-card, .clickable-row, .clickable-chip {
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, transform 0.05s;
+}
+.kpi.clickable:hover, .clickable-card:hover {
+  border-color: var(--accent);
+  background: var(--bg-2);
+}
+.kpi.clickable:focus-visible,
+.clickable-card:focus-visible,
+.clickable-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.clickable-row { cursor: pointer; }
+.clickable-row:hover { background: rgba(255,183,51,0.05) !important; }
+.clickable-chip:hover { filter: brightness(1.18); transform: translateY(-1px); }
+.clickable-chip.active {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: rgba(255,183,51,0.18) !important;
+}
+
+/* Filter-pill bar above the comparison matrix — surfaces the active filter
+   set with × buttons to clear individual filters and a "clear all" link. */
+.matrix-filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+}
+.matrix-filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(255,183,51,0.14);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.matrix-filter-pill button {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 0 0 4px;
+  cursor: pointer;
+}
+.matrix-filter-pill button:hover { color: var(--ink-0); }
+.matrix-filter-clear {
+  margin-left: auto;
+  color: var(--cyan);
+  cursor: pointer;
+  text-decoration: underline;
+  background: transparent;
+  border: none;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* Matrix cell highlighting — clicking a cell opens the per-item modal and
+   the cell briefly pulses so the eye registers which one was clicked. */
+.matrix-cell {
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.matrix-cell:hover { background: rgba(255,183,51,0.08); }
+.matrix-supplier-emphasized { background: rgba(255,183,51,0.05); }

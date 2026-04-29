@@ -625,15 +625,94 @@ function _renderKpis() {
     `;
   }
 
+  // Each KPI is wired as a filter — click flips the RFQ-table filters to
+  // show that slice. data-* attributes pick this up via the listener at the
+  // bottom of this function. tabindex + role expose them as buttons for
+  // keyboard nav. Hover cue lives in app.css (.kpi.clickable).
   $('kpi-row').innerHTML = `
-    <div class="kpi"><div class="kpi-label">Items</div><div class="kpi-value">${k.item_count.toLocaleString()}</div><div class="kpi-sub">unique part numbers</div></div>
-    <div class="kpi"><div class="kpi-label">Total spend (all)</div><div class="kpi-value">${fmt$(k.total_spend)}</div><div class="kpi-sub">${k.po_count.toLocaleString()} POs · ${k.line_count.toLocaleString()} lines</div></div>
-    <div class="kpi"><div class="kpi-label">Date range</div><div class="kpi-value">${k.years_span.toFixed(2)} yr</div><div class="kpi-sub">${k.first_order} → ${k.last_order}</div></div>
-    <div class="kpi"><div class="kpi-label">12-mo spend</div><div class="kpi-value">${fmt$(k.spend_12mo)}</div><div class="kpi-sub">${k.items_12mo.toLocaleString()} items active</div></div>
-    <div class="kpi"><div class="kpi-label">24-mo spend</div><div class="kpi-value">${fmt$(k.spend_24mo)}</div><div class="kpi-sub">${k.items_24mo.toLocaleString()} items active</div></div>
-    <div class="kpi"><div class="kpi-label">36-mo spend</div><div class="kpi-value">${fmt$(k.spend_36mo)}</div><div class="kpi-sub">${k.items_36mo.toLocaleString()} items active</div></div>
-    ${difficultyTile}
+    <div class="kpi clickable" tabindex="0" role="button" data-kpi-action="show-all" title="Show all items in the candidate list — clears window/tier/include/min-spend filters."><div class="kpi-label">Items</div><div class="kpi-value">${k.item_count.toLocaleString()}</div><div class="kpi-sub">unique part numbers · click to clear filters</div></div>
+    <div class="kpi clickable" tabindex="0" role="button" data-kpi-action="show-all" title="Total all-time spend across every PO line — click to clear filters and show every item."><div class="kpi-label">Total spend (all)</div><div class="kpi-value">${fmt$(k.total_spend)}</div><div class="kpi-sub">${k.po_count.toLocaleString()} POs · ${k.line_count.toLocaleString()} lines</div></div>
+    <div class="kpi clickable" tabindex="0" role="button" data-kpi-action="scroll-charts" title="Click to scroll to the annual-spend + top-15 charts."><div class="kpi-label">Date range</div><div class="kpi-value">${k.years_span.toFixed(2)} yr</div><div class="kpi-sub">${k.first_order} → ${k.last_order}</div></div>
+    <div class="kpi clickable" tabindex="0" role="button" data-kpi-action="window-12" title="Filter the table to the 12-month window (qty + spend re-pivot to last 12 months)."><div class="kpi-label">12-mo spend</div><div class="kpi-value">${fmt$(k.spend_12mo)}</div><div class="kpi-sub">${k.items_12mo.toLocaleString()} items active · click to filter</div></div>
+    <div class="kpi clickable" tabindex="0" role="button" data-kpi-action="window-24" title="Filter the table to the 24-month window — the default RFQ baseline."><div class="kpi-label">24-mo spend</div><div class="kpi-value">${fmt$(k.spend_24mo)}</div><div class="kpi-sub">${k.items_24mo.toLocaleString()} items active · click to filter</div></div>
+    <div class="kpi clickable" tabindex="0" role="button" data-kpi-action="window-36" title="Filter the table to the 36-month window — wider net, catches slow-moving items."><div class="kpi-label">36-mo spend</div><div class="kpi-value">${fmt$(k.spend_36mo)}</div><div class="kpi-sub">${k.items_36mo.toLocaleString()} items active · click to filter</div></div>
+    ${difficultyTile.replace('<div class="kpi"', '<div class="kpi clickable" tabindex="0" role="button" data-kpi-action="difficulty"').replace('">', '" title="Click to view the difficulty signals (what\'s dragging the score down).">')}
   `;
+  for (const tile of $('kpi-row').querySelectorAll('[data-kpi-action]')) {
+    const handle = (ev) => {
+      if (ev.type === 'keydown' && ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();
+      _handleRfqKpiClick(tile.getAttribute('data-kpi-action'));
+    };
+    tile.addEventListener('click', handle);
+    tile.addEventListener('keydown', handle);
+  }
+}
+
+function _handleRfqKpiClick(action) {
+  // Each branch flips the filter inputs the user already understands and
+  // triggers the same _renderRfqTable / _saveMgr.markDirty flow that
+  // typing into the filter would. No new render path; just shortcuts.
+  if (action === 'show-all') {
+    if ($('active-window')) $('active-window').value = 'all';
+    if ($('tier-filter'))   $('tier-filter').value = 'all';
+    if ($('include-filter'))$('include-filter').value = 'all';
+    if ($('min-spend'))     $('min-spend').value = '0';
+    if ($('rfq-search'))    $('rfq-search').value = '';
+  } else if (action === 'window-12' || action === 'window-24' || action === 'window-36') {
+    const w = action.split('-')[1];
+    if ($('active-window')) $('active-window').value = w;
+  } else if (action === 'scroll-charts') {
+    const stage = $('charts-stage');
+    if (stage) stage.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  } else if (action === 'difficulty') {
+    _showDifficultyModal();
+    return;
+  } else {
+    return;
+  }
+  _renderRfqTable();
+  if (_saveMgr) _saveMgr.markDirty();
+}
+
+function _showDifficultyModal() {
+  if (!_rfqResult || !_rfqResult.difficulty) return;
+  const d = _rfqResult.difficulty;
+  let modal = document.getElementById('difficulty-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'difficulty-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:5500;background:rgba(8,12,22,0.78);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:24px;';
+    document.body.appendChild(modal);
+  }
+  modal.style.display = 'flex';
+  const diffColor = d.score >= 70 ? 'var(--red)' : d.score >= 50 ? 'var(--accent)' : d.score >= 30 ? 'var(--cyan)' : 'var(--green)';
+  let signalsHtml = '';
+  for (const sig of (d.signals || [])) {
+    signalsHtml += `<li style="margin-bottom:8px;color:var(--ink-1);">
+      <strong style="color:var(--ink-0);">${_escapeHtml(sig.label || sig.name || '?')}</strong>
+      ${sig.value != null ? ` <span style="color:var(--ink-2);font-family:var(--mono);">(${_escapeHtml(String(sig.value))})</span>` : ''}
+      ${sig.detail ? ` — ${_escapeHtml(sig.detail)}` : ''}
+    </li>`;
+  }
+  modal.innerHTML = `
+    <div style="background:var(--bg-1);border:1px solid var(--line);border-radius:8px;max-width:680px;width:100%;max-height:88vh;overflow:auto;padding:28px 32px;box-shadow:0 24px 80px rgba(0,0,0,0.6);font-family:var(--ui);">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px;">
+        <div>
+          <div style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">FILE DIFFICULTY</div>
+          <div style="font-size:48px;font-weight:700;line-height:1;color:${diffColor};font-family:var(--mono);">${d.score}<span style="font-size:18px;color:var(--ink-2);font-weight:400;">/100</span></div>
+          <div style="font-size:14px;font-weight:600;color:${diffColor};margin-top:6px;text-transform:uppercase;letter-spacing:0.08em;">${d.level}</div>
+        </div>
+        <button id="diff-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;">×</button>
+      </div>
+      <p style="color:var(--ink-1);font-size:14px;line-height:1.6;margin-bottom:18px;">${_escapeHtml(d.summary || '')}</p>
+      <h3 style="margin:18px 0 10px;font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;">Signals dragging the score</h3>
+      <ul style="padding-left:20px;line-height:1.6;font-size:13px;margin:0;">${signalsHtml || '<li style="color:var(--ink-2);">No signals — this is a clean file.</li>'}</ul>
+    </div>
+  `;
+  document.getElementById('diff-close').addEventListener('click', () => { modal.style.display = 'none'; });
+  modal.addEventListener('click', (e) => { if (e.target === modal) modal.style.display = 'none'; });
 }
 
 function _activeWindow() { return $('active-window').value || '24'; }
@@ -896,15 +975,26 @@ function _drawTopBars() {
   const max = Math.max(1, ...top.map(it => it.spend_24mo || 0));
   let s = '';
   const barH = innerH / Math.max(1, top.length) - 3;
+  // Each bar is wrapped in a <g data-bar-item="..."> so a delegated click
+  // handler below can route bar/label clicks to _openItemHistory. Hover
+  // cue: subtle accent fill so the user knows the bar is interactive.
   top.forEach((it, i) => {
     const w = (it.spend_24mo || 0) / max * innerW;
     const y = padT + i * (barH + 3);
-    s += `<rect class="bar" x="${padL}" y="${y}" width="${w.toFixed(1)}" height="${barH.toFixed(1)}" rx="2"/>`;
     const lbl = _truncate(it.item_num, 14);
+    s += `<g class="top-bar-row" data-bar-item="${_escapeHtml(it.item_num)}" style="cursor:pointer;">`;
+    // Invisible full-row hit-box so the label text is also clickable.
+    s += `<rect x="0" y="${y}" width="${W}" height="${barH.toFixed(1)}" fill="transparent" pointer-events="all"/>`;
+    s += `<rect class="bar" x="${padL}" y="${y}" width="${w.toFixed(1)}" height="${barH.toFixed(1)}" rx="2"/>`;
     s += `<text x="${padL - 6}" y="${y + barH / 2 + 3}" text-anchor="end" font-size="10" fill="var(--ink-1)" font-family="var(--mono)">${_escapeHtml(lbl)}</text>`;
     s += `<text x="${padL + w + 4}" y="${y + barH / 2 + 3}" font-size="10" fill="var(--ink-2)" font-family="var(--mono)">$${Math.round(it.spend_24mo || 0).toLocaleString()}</text>`;
+    s += `<title>${_escapeHtml(it.item_num)} — $${Math.round(it.spend_24mo || 0).toLocaleString()} 24-mo · click to drill in</title>`;
+    s += `</g>`;
   });
   svg.innerHTML = s;
+  svg.querySelectorAll('[data-bar-item]').forEach(g => {
+    g.addEventListener('click', () => _openItemHistory(g.getAttribute('data-bar-item')));
+  });
 }
 
 function _drawAnnualBars() {
@@ -1285,6 +1375,26 @@ if ($('reopen-file-input')) {
 // ==========================================================================
 let _loadedBids = {};   // {supplier_name: parsed_result}
 
+// ----------------------------------------------------------------------------
+// Comparison-matrix filter state — drives the working-table filtering surfaced
+// by the click-targets audit (KPI tiles, recommendation chips, supplier cards,
+// consolidation rows all funnel into here). Each field is independent — set
+// any combo and `_applyMatrixFilter(rows)` returns the filtered subset:
+//   coverage:        'FULL' | 'PARTIAL' | 'SINGLE' | 'NONE' | null
+//   recommendation:  'ACCEPT' | 'PUSH_BACK' | 'ASK_CLARIFICATION' |
+//                    'MANUAL_REVIEW' | 'EXCLUDE' | null
+//   supplier:        supplier name (only show items where this supplier
+//                    has a priced bid; their column gets emphasized)
+//   outliersOnly:    true → only rows with outlier_flag set
+//   typoOnly:        true → only rows where any priced bid has ratio ≤ 0.4
+//                    against history (the per-item POSSIBLE_TYPO threshold)
+// `_lastMatrixData` caches the last server-side payload so filter clicks can
+// re-render without re-running the Python matrix compute (the matrix is
+// expensive — ~1-2 s on 11k items).
+// ----------------------------------------------------------------------------
+let _matrixFilter = { coverage: null, recommendation: null, supplier: null, outliersOnly: false, typoOnly: false };
+let _lastMatrixData = null;
+
 async function _onAddBidClick() {
   const input = $('bid-file-input');
   input.value = '';
@@ -1358,15 +1468,22 @@ function _renderBidIntakeRow() {
     wrap.innerHTML = `<div style="padding:32px;text-align:center;color:var(--ink-2);border:1px dashed var(--line);border-radius:6px;font-family:var(--ui);">No supplier bids loaded yet. Click "Add supplier bid xlsx" below.</div>`;
     return;
   }
+  // Card body is itself a click-target — clicking sets the matrix filter to
+  // this supplier (single-supplier focus mode in the comparison matrix
+  // below). The × and follow-up buttons inside the card stop propagation
+  // so they keep their original behavior.
   let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;">';
   for (const sup of suppliers) {
     const p = _loadedBids[sup];
     const s = p.summary || {};
+    const isFocused = (_matrixFilter.supplier === sup);
+    const focusBorder = isFocused ? 'var(--accent)' : 'var(--line)';
+    const focusBg = isFocused ? 'rgba(255,183,51,0.06)' : 'var(--bg-1)';
     html += `
-      <div style="background:var(--bg-1);border:1px solid var(--line);border-radius:6px;padding:18px;">
+      <div class="clickable-card" tabindex="0" role="button" data-supplier-card="${_escapeHtml(sup)}" title="Click to focus the comparison matrix on ${_escapeHtml(sup)} — only items they priced will show. Click again to clear." style="background:${focusBg};border:1px solid ${focusBorder};border-radius:6px;padding:18px;${isFocused ? 'box-shadow:0 0 0 1px var(--accent) inset;' : ''}">
         <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;">
-          <div style="font-family:var(--ui);font-weight:600;font-size:16px;color:var(--ink-0);">${_escapeHtml(sup)}</div>
-          <button class="btn ghost" data-remove-supplier="${_escapeHtml(sup)}" style="padding:4px 10px;font-size:11px;">×</button>
+          <div style="font-family:var(--ui);font-weight:600;font-size:16px;color:var(--ink-0);">${_escapeHtml(sup)}${isFocused ? ' <span style="font-size:10px;color:var(--accent);font-family:var(--mono);letter-spacing:0.1em;margin-left:4px;">FOCUSED</span>' : ''}</div>
+          <button class="btn ghost" data-remove-supplier="${_escapeHtml(sup)}" title="Remove this supplier's bid from the analysis (does not delete the source xlsx)." style="padding:4px 10px;font-size:11px;">×</button>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;font-family:var(--mono);font-size:11px;">
           <div><span style="color:var(--ink-2);">Lines</span> <strong style="color:var(--ink-0);">${(s.n_lines||0).toLocaleString()}</strong></div>
@@ -1381,13 +1498,30 @@ function _renderBidIntakeRow() {
           <strong style="color:var(--accent);font-size:18px;">$${(s.total_quoted_value||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</strong>
         </div>
         <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn ghost" data-followup-supplier="${_escapeHtml(sup)}" style="padding:6px 12px;font-size:11px;">⬇ Follow-up xlsx</button>
+          <button class="btn ghost" data-followup-supplier="${_escapeHtml(sup)}" title="Build a 7-tab follow-up xlsx with the items where ${_escapeHtml(sup)} bid NO_BID / NEED_INFO / UOM_DISC / SUBSTITUTE — for one round of cleanup before awarding." style="padding:6px 12px;font-size:11px;">⬇ Follow-up xlsx</button>
         </div>
       </div>
     `;
   }
   html += '</div>';
   wrap.innerHTML = html;
+  // Card-body click → toggle supplier focus on the matrix.
+  wrap.querySelectorAll('[data-supplier-card]').forEach(card => {
+    const handle = (ev) => {
+      if (ev.type === 'keydown' && ev.key !== 'Enter' && ev.key !== ' ') return;
+      // Don't re-fire if the inner buttons (× / follow-up) handled it.
+      if (ev.target.closest('[data-remove-supplier]') || ev.target.closest('[data-followup-supplier]')) return;
+      ev.preventDefault();
+      const sup = card.getAttribute('data-supplier-card');
+      _matrixFilter.supplier = (_matrixFilter.supplier === sup) ? null : sup;
+      _rerenderMatrixWithFilters();
+      // Scroll to the matrix so the user sees what they filtered.
+      const compEl = $('comparison-section');
+      if (compEl) compEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+    card.addEventListener('click', handle);
+    card.addEventListener('keydown', handle);
+  });
   wrap.querySelectorAll('[data-remove-supplier]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const sup = btn.getAttribute('data-remove-supplier');
@@ -2117,15 +2251,42 @@ function _renderBidCoverageKPIs(matrix) {
   if (!wrap) return;
   const sm = matrix.summary || {};
   const fmt$ = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // Each coverage / outlier KPI is wired into the matrix filter so clicking
+  // narrows the comparison matrix below to that slice. The two totals
+  // (lowest-bid total + historical baseline) stay non-interactive — they
+  // are aggregates with no obvious filter equivalent.
+  const isActive = (cov) => _matrixFilter.coverage === cov ? ' active' : '';
+  const isOutliers = _matrixFilter.outliersOnly ? ' active' : '';
   wrap.innerHTML = `
-    <div class="kpi"><div class="kpi-label">3+ bids</div><div class="kpi-value" style="color:var(--green);">${(sm.n_with_3plus_bids||0).toLocaleString()}</div><div class="kpi-sub">full competition</div></div>
-    <div class="kpi"><div class="kpi-label">2 bids</div><div class="kpi-value" style="color:var(--accent);">${(sm.n_with_2_bids||0).toLocaleString()}</div><div class="kpi-sub">partial competition</div></div>
-    <div class="kpi"><div class="kpi-label">1 bid</div><div class="kpi-value" style="color:var(--cyan);">${(sm.n_with_1_bid||0).toLocaleString()}</div><div class="kpi-sub">single source</div></div>
-    <div class="kpi"><div class="kpi-label">0 bids</div><div class="kpi-value" style="color:var(--red);">${(sm.n_with_0_bids||0).toLocaleString()}</div><div class="kpi-sub">no bid — follow up</div></div>
-    <div class="kpi"><div class="kpi-label">Outliers</div><div class="kpi-value" style="color:var(--red);">${(sm.n_outliers_flagged||0).toLocaleString()}</div><div class="kpi-sub">>3× median or vs hist</div></div>
-    <div class="kpi"><div class="kpi-label">Lowest-bid total</div><div class="kpi-value">${fmt$(sm.total_lowest_value)}</div><div class="kpi-sub">if every item awarded to its lowest bid</div></div>
-    <div class="kpi"><div class="kpi-label">Historical baseline</div><div class="kpi-value">${fmt$(sm.total_historical_value)}</div><div class="kpi-sub">qty × last-paid price</div></div>
+    <div class="kpi clickable${isActive('FULL')}" tabindex="0" role="button" data-cov-filter="FULL" title="Click to filter the comparison matrix to items with 3+ priced bids — full competition. Click again to clear."><div class="kpi-label">3+ bids</div><div class="kpi-value" style="color:var(--green);">${(sm.n_with_3plus_bids||0).toLocaleString()}</div><div class="kpi-sub">full competition · click to filter</div></div>
+    <div class="kpi clickable${isActive('PARTIAL')}" tabindex="0" role="button" data-cov-filter="PARTIAL" title="Click to filter the matrix to items with exactly 2 priced bids — partial competition."><div class="kpi-label">2 bids</div><div class="kpi-value" style="color:var(--accent);">${(sm.n_with_2_bids||0).toLocaleString()}</div><div class="kpi-sub">partial competition · click to filter</div></div>
+    <div class="kpi clickable${isActive('SINGLE')}" tabindex="0" role="button" data-cov-filter="SINGLE" title="Click to filter the matrix to single-source items — only one supplier bid. Worth a follow-up before awarding."><div class="kpi-label">1 bid</div><div class="kpi-value" style="color:var(--cyan);">${(sm.n_with_1_bid||0).toLocaleString()}</div><div class="kpi-sub">single source · click to filter</div></div>
+    <div class="kpi clickable${isActive('NONE')}" tabindex="0" role="button" data-cov-filter="NONE" title="Click to filter the matrix to items with NO priced bid from any supplier — these need a follow-up RFQ or to be dropped."><div class="kpi-label">0 bids</div><div class="kpi-value" style="color:var(--red);">${(sm.n_with_0_bids||0).toLocaleString()}</div><div class="kpi-sub">no bid — follow up · click to filter</div></div>
+    <div class="kpi clickable${isOutliers}" tabindex="0" role="button" data-cov-filter="OUTLIERS" title="Click to filter the matrix to items where at least one bid is flagged as an outlier (>3× the cross-supplier median or vs history)."><div class="kpi-label">Outliers</div><div class="kpi-value" style="color:var(--red);">${(sm.n_outliers_flagged||0).toLocaleString()}</div><div class="kpi-sub">>3× median or vs hist · click to filter</div></div>
+    <div class="kpi" title="If every item went to its lowest priced bidder, this is the total spend.${matrix.summary && matrix.summary.flagged_only_total_lowest_value ? ' This is the RAW figure — see the savings tiers panel for CLEAN/STRICT.' : ''}"><div class="kpi-label">Lowest-bid total</div><div class="kpi-value">${fmt$(sm.total_lowest_value)}</div><div class="kpi-sub">if every item awarded to its lowest bid</div></div>
+    <div class="kpi" title="What we paid historically for the same items (qty × last-paid price). The savings comparison baseline."><div class="kpi-label">Historical baseline</div><div class="kpi-value">${fmt$(sm.total_historical_value)}</div><div class="kpi-sub">qty × last-paid price</div></div>
   `;
+  for (const tile of wrap.querySelectorAll('[data-cov-filter]')) {
+    const handle = (ev) => {
+      if (ev.type === 'keydown' && ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();
+      _toggleCoverageFilter(tile.getAttribute('data-cov-filter'));
+    };
+    tile.addEventListener('click', handle);
+    tile.addEventListener('keydown', handle);
+  }
+}
+
+function _toggleCoverageFilter(cov) {
+  // OUTLIERS is a different axis from coverage — it can stack with a
+  // coverage filter. Coverage filters (FULL/PARTIAL/SINGLE/NONE) are
+  // mutually exclusive — clicking the active one clears it.
+  if (cov === 'OUTLIERS') {
+    _matrixFilter.outliersOnly = !_matrixFilter.outliersOnly;
+  } else {
+    _matrixFilter.coverage = (_matrixFilter.coverage === cov) ? null : cov;
+  }
+  _rerenderMatrixWithFilters();
 }
 
 function _renderConsolidation(consol) {
@@ -2150,9 +2311,11 @@ function _renderConsolidation(consol) {
   </tr></thead><tbody>`;
   cands.forEach((c, i) => {
     const isWinner = i === 0;
-    html += `<tr style="border-bottom:1px solid var(--line);${isWinner ? 'background:rgba(255,183,51,0.06);' : ''}">
+    const isFocused = (_matrixFilter.supplier === c.supplier);
+    const rowBg = isFocused ? 'background:rgba(255,183,51,0.12);' : (isWinner ? 'background:rgba(255,183,51,0.06);' : '');
+    html += `<tr class="clickable-row" data-consol-supplier="${_escapeHtml(c.supplier)}" title="Click to focus the comparison matrix on ${_escapeHtml(c.supplier)} — see exactly which items they bid and at what price." style="border-bottom:1px solid var(--line);${rowBg}">
       <td style="padding:12px 14px;font-weight:${isWinner ? '700' : '400'};color:${isWinner ? 'var(--accent)' : 'var(--ink-0)'};">
-        ${isWinner ? '★ ' : ''}${_escapeHtml(c.supplier)}
+        ${isWinner ? '★ ' : ''}${_escapeHtml(c.supplier)}${isFocused ? ' <span style="font-size:10px;color:var(--accent);font-family:var(--mono);letter-spacing:0.08em;margin-left:6px;">FOCUSED</span>' : ''}
       </td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${c.n_items_quoted.toLocaleString()}</td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${c.pct_items_quoted.toFixed(1)}%</td>
@@ -2249,44 +2412,140 @@ function _renderConsolidation(consol) {
   }
 
   el.innerHTML = html;
+  // Wire candidate rows → focus matrix on that supplier.
+  el.querySelectorAll('[data-consol-supplier]').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const sup = tr.getAttribute('data-consol-supplier');
+      _matrixFilter.supplier = (_matrixFilter.supplier === sup) ? null : sup;
+      _rerenderMatrixWithFilters();
+      const compEl = $('comparison-section');
+      if (compEl) compEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+}
+
+// Module-level color/label maps reused by the matrix renderer + the
+// recommendation-chip filter. Kept at file scope so the chip click handler
+// reads the same palette without duplicating literals.
+const _MATRIX_REC_COLORS = {
+  ACCEPT:           'var(--green)',
+  PUSH_BACK:        'var(--accent)',
+  ASK_CLARIFICATION:'var(--cyan)',
+  MANUAL_REVIEW:    'var(--ink-1)',
+  EXCLUDE:          'var(--red)',
+};
+const _MATRIX_REC_LABELS = {
+  ACCEPT:           'Accept',
+  PUSH_BACK:        'Push back',
+  ASK_CLARIFICATION:'Ask clarification',
+  MANUAL_REVIEW:    'Manual review',
+  EXCLUDE:          'Exclude',
+};
+
+function _applyMatrixFilter(rows) {
+  // Single point of truth for the filter logic — used by the matrix render
+  // AND by the row-count badge above the filter pill bar. Returns the
+  // filtered subset; does not mutate.
+  const f = _matrixFilter;
+  let out = rows;
+  // Always hide pure-no-bid items by default — same baseline as before
+  // the audit. The "0 bids" coverage filter overrides it to surface them.
+  if (f.coverage === 'NONE') {
+    out = out.filter(r => r.coverage === 'NONE');
+  } else if (f.coverage) {
+    out = out.filter(r => r.coverage === f.coverage);
+  } else {
+    out = out.filter(r => r.n_quoted > 0);
+  }
+  if (f.recommendation) {
+    out = out.filter(r => (r.recommendation || 'MANUAL_REVIEW') === f.recommendation);
+  }
+  if (f.supplier) {
+    out = out.filter(r => {
+      const b = (r.bids || {})[f.supplier];
+      return b && b.price != null && b.price > 0;
+    });
+  }
+  if (f.outliersOnly) {
+    out = out.filter(r => !!r.outlier_flag || r.has_outlier === true || r.outliers_n > 0);
+  }
+  if (f.typoOnly) {
+    out = out.filter(r => {
+      const hist = r.last_unit_price || 0;
+      if (!hist) return false;
+      for (const sup of Object.keys(r.bids || {})) {
+        const b = r.bids[sup];
+        if (b && b.price != null && b.price / hist <= 0.4) return true;
+      }
+      return false;
+    });
+  }
+  return out;
+}
+
+function _rerenderMatrixWithFilters() {
+  if (_lastMatrixData) _renderComparisonMatrix(_lastMatrixData);
+  _renderBidIntakeRow();
+  if (_lastMatrixData) _renderBidCoverageKPIs(_lastMatrixData);
+}
+
+function _renderMatrixFilterPills() {
+  const f = _matrixFilter;
+  const pills = [];
+  if (f.coverage)        pills.push({ label: `coverage=${f.coverage}`, key: 'coverage' });
+  if (f.recommendation)  pills.push({ label: `rec=${_MATRIX_REC_LABELS[f.recommendation] || f.recommendation}`, key: 'recommendation' });
+  if (f.supplier)        pills.push({ label: `supplier=${f.supplier}`, key: 'supplier' });
+  if (f.outliersOnly)    pills.push({ label: 'outliers only', key: 'outliersOnly' });
+  if (f.typoOnly)        pills.push({ label: 'possible typos only', key: 'typoOnly' });
+  if (!pills.length) return '';
+  let html = '<div class="matrix-filter-bar"><span style="color:var(--ink-2);">Filtering:</span>';
+  for (const p of pills) {
+    html += `<span class="matrix-filter-pill">${_escapeHtml(p.label)}<button type="button" data-pill-clear="${p.key}" title="Remove this filter">×</button></span>`;
+  }
+  html += '<button type="button" class="matrix-filter-clear" data-pill-clear-all>clear all</button></div>';
+  return html;
+}
+
+function _clearMatrixFilter(key) {
+  if (key === 'coverage')         _matrixFilter.coverage = null;
+  else if (key === 'recommendation') _matrixFilter.recommendation = null;
+  else if (key === 'supplier')    _matrixFilter.supplier = null;
+  else if (key === 'outliersOnly')_matrixFilter.outliersOnly = false;
+  else if (key === 'typoOnly')    _matrixFilter.typoOnly = false;
+  else if (key === '*')           _matrixFilter = { coverage: null, recommendation: null, supplier: null, outliersOnly: false, typoOnly: false };
+  _rerenderMatrixWithFilters();
 }
 
 function _renderComparisonMatrix(matrix) {
+  // Cache the latest matrix payload so filter clicks can re-render without
+  // re-fetching from Python (the compute is multi-second on the McMaster
+  // dataset).
+  _lastMatrixData = matrix;
   const el = $('comparison-section');
   const suppliers = matrix.suppliers || [];
   const rows = matrix.rows || [];
   if (!suppliers.length) { el.innerHTML = ''; return; }
 
-  // Recommendation distribution callout
+  // Recommendation distribution chips — each chip is a filter toggle.
   const recCounts = (matrix.summary && matrix.summary.recommendation_counts) || {};
-  const recColors = {
-    ACCEPT:           'var(--green)',
-    PUSH_BACK:        'var(--accent)',
-    ASK_CLARIFICATION:'var(--cyan)',
-    MANUAL_REVIEW:    'var(--ink-1)',
-    EXCLUDE:          'var(--red)',
-  };
-  const recLabels = {
-    ACCEPT:           'Accept',
-    PUSH_BACK:        'Push back',
-    ASK_CLARIFICATION:'Ask clarification',
-    MANUAL_REVIEW:    'Manual review',
-    EXCLUDE:          'Exclude',
-  };
   let recDistHtml = '<div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:18px;font-family:var(--mono);font-size:12px;">';
   for (const k of ['ACCEPT','PUSH_BACK','ASK_CLARIFICATION','MANUAL_REVIEW','EXCLUDE']) {
     const n = recCounts[k] || 0;
-    recDistHtml += `<div style="padding:10px 14px;background:var(--bg-1);border:1px solid var(--line);border-left:3px solid ${recColors[k]};border-radius:4px;">
-      <div style="color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">${recLabels[k]}</div>
-      <div style="color:${recColors[k]};font-size:18px;font-weight:600;margin-top:2px;">${n.toLocaleString()}</div>
+    const active = _matrixFilter.recommendation === k ? ' active' : '';
+    recDistHtml += `<div class="clickable-chip${active}" tabindex="0" role="button" data-rec-filter="${k}" title="Click to filter the comparison matrix to items the engine recommended ${_MATRIX_REC_LABELS[k]}. Click again to clear." style="padding:10px 14px;background:var(--bg-1);border:1px solid var(--line);border-left:3px solid ${_MATRIX_REC_COLORS[k]};border-radius:4px;">
+      <div style="color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">${_MATRIX_REC_LABELS[k]}</div>
+      <div style="color:${_MATRIX_REC_COLORS[k]};font-size:18px;font-weight:600;margin-top:2px;">${n.toLocaleString()}</div>
     </div>`;
   }
   recDistHtml += '</div>';
 
-  // Filter to only items with at least one bid by default — cleaner view
-  const rowsWithBids = rows.filter(r => r.n_quoted > 0);
+  const filtered = _applyMatrixFilter(rows);
+  const totalShown = filtered.length;
+  const totalAll = rows.length;
+  const pillBar = _renderMatrixFilterPills();
 
-  let html = `<h2 style="margin-top:0;">Comparison matrix · ${rowsWithBids.length.toLocaleString()} items with at least one bid <span style="color:var(--ink-2);font-size:14px;font-weight:400;">(${rows.length - rowsWithBids.length} no-bid items hidden)</span></h2>`;
+  let html = `<h2 style="margin-top:0;">Comparison matrix · ${totalShown.toLocaleString()} items shown <span style="color:var(--ink-2);font-size:14px;font-weight:400;">(of ${totalAll.toLocaleString()} total · click any KPI tile, recommendation chip, or supplier card to filter)</span></h2>`;
+  html += pillBar;
   html += recDistHtml;
   html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:70vh;">';
   html += '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
@@ -2296,70 +2555,125 @@ function _renderComparisonMatrix(matrix) {
     <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty 24mo</th>
     <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Last $/ea</th>`;
   for (const sup of suppliers) {
-    html += `<th style="padding:10px;text-align:right;color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;border-left:1px solid var(--line);">${_escapeHtml(sup)}</th>`;
+    const emph = (_matrixFilter.supplier === sup) ? ' matrix-supplier-emphasized' : '';
+    html += `<th class="${emph.trim()}" style="padding:10px;text-align:right;color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;border-left:1px solid var(--line);">${_escapeHtml(sup)}</th>`;
   }
   html += `<th style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Cov</th>
     <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Recommendation</th>
   </tr></thead><tbody>`;
 
   // Sort by 24-mo qty × hist price desc (highest-value items first)
-  rowsWithBids.sort((a, b) => (b.qty_24mo * (b.last_unit_price || 0)) - (a.qty_24mo * (a.last_unit_price || 0)));
+  filtered.sort((a, b) => (b.qty_24mo * (b.last_unit_price || 0)) - (a.qty_24mo * (a.last_unit_price || 0)));
   const cap = 500;
-  const slice = rowsWithBids.slice(0, cap);
+  const slice = filtered.slice(0, cap);
   for (const r of slice) {
     const lowestSup = r.lowest_supplier;
     let cells = '';
     for (const sup of suppliers) {
       const b = r.bids[sup] || {};
       const isLow = (sup === lowestSup);
+      const emph = (_matrixFilter.supplier === sup) ? ' matrix-supplier-emphasized' : '';
       let cellContent = '';
       let cellColor = 'var(--ink-1)';
+      let cellTitle = `Click to drill into ${_escapeHtml(r.item_num)} — opens the per-item modal with ${_escapeHtml(sup)}'s bid + history overlay.`;
       if (b.status === 'MISSING') {
         cellContent = '—';
         cellColor = 'var(--ink-2)';
+        cellTitle = `${_escapeHtml(sup)} did not bid this item. Click to open the per-item modal anyway (other suppliers' bids will be visible).`;
       } else if (b.status === 'NO_BID') {
         cellContent = 'no bid';
         cellColor = 'var(--ink-2)';
+        cellTitle = `${_escapeHtml(sup)} explicitly declined this item. Click to open the per-item modal.`;
       } else if (b.status === 'NEED_INFO') {
         cellContent = 'need info';
         cellColor = 'var(--accent)';
+        cellTitle = `${_escapeHtml(sup)} flagged this as needing more info before quoting. Click to open the per-item modal.`;
       } else if (b.price != null) {
         cellContent = '$' + b.price.toFixed(2);
         if (b.status === 'UOM_DISC') cellContent += ' ⚠';
         if (b.status === 'SUBSTITUTE') cellContent += ' †';
         cellColor = isLow ? 'var(--green)' : 'var(--ink-0)';
       }
-      cells += `<td style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);color:${cellColor};font-weight:${isLow ? '700' : '400'};">${cellContent}</td>`;
+      cells += `<td class="matrix-cell${emph}" data-cell-item="${_escapeHtml(r.item_num)}" data-cell-supplier="${_escapeHtml(sup)}" title="${cellTitle}" style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);color:${cellColor};font-weight:${isLow ? '700' : '400'};">${cellContent}</td>`;
     }
     const covColor = r.coverage === 'FULL' ? 'var(--green)' : r.coverage === 'PARTIAL' ? 'var(--accent)' : r.coverage === 'SINGLE' ? 'var(--cyan)' : 'var(--red)';
     const rec = r.recommendation || 'MANUAL_REVIEW';
-    const recColor = recColors[rec] || 'var(--ink-1)';
-    const recLbl = recLabels[rec] || rec;
+    const recColor = _MATRIX_REC_COLORS[rec] || 'var(--ink-1)';
+    const recLbl = _MATRIX_REC_LABELS[rec] || rec;
     const recReason = r.recommendation_reason || '';
-    html += `<tr style="border-bottom:1px solid rgba(122,109,115,0.25);" data-comp-item="${_escapeHtml(r.item_num)}">
+    html += `<tr class="clickable-row" style="border-bottom:1px solid rgba(122,109,115,0.25);" data-comp-item="${_escapeHtml(r.item_num)}" data-row-rec="${rec}">
       <td style="padding:8px 10px;color:var(--ink-0);">${_escapeHtml(r.item_num)}</td>
       <td style="padding:8px 10px;color:var(--ink-1);max-width:240px;">${_escapeHtml(_truncate(r.description, 50))}</td>
       <td style="padding:8px 10px;text-align:right;color:var(--ink-0);">${(r.qty_24mo||0).toLocaleString()}</td>
       <td style="padding:8px 10px;text-align:right;color:var(--ink-1);">$${(r.last_unit_price||0).toFixed(2)}</td>
       ${cells}
       <td style="padding:8px 10px;text-align:center;color:${covColor};font-weight:600;font-size:10px;">${r.coverage}</td>
-      <td style="padding:8px 10px;color:${recColor};font-size:11px;font-weight:600;" title="${_escapeHtml(recReason)}">${recLbl}</td>
+      <td style="padding:8px 10px;color:${recColor};font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline dotted;" title="${_escapeHtml(recReason)} · click to filter to ${_MATRIX_REC_LABELS[rec] || rec}" data-rec-row-filter="${rec}">${recLbl}</td>
     </tr>`;
   }
-  if (rowsWithBids.length > cap) {
-    html += `<tr><td colspan="${suppliers.length + 6}" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${(rowsWithBids.length - cap).toLocaleString()} more items hidden</td></tr>`;
+  if (filtered.length > cap) {
+    html += `<tr><td colspan="${suppliers.length + 6}" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${(filtered.length - cap).toLocaleString()} more items hidden (sort by qty × hist price desc — narrow the filters to bring more into view)</td></tr>`;
+  }
+  if (!slice.length) {
+    html += `<tr><td colspan="${suppliers.length + 6}" style="padding:24px;text-align:center;color:var(--ink-2);">No items match the active filter set. <button type="button" class="matrix-filter-clear" data-pill-clear-all style="margin-left:8px;">clear all filters</button></td></tr>`;
   }
   html += '</tbody></table></div>';
-  html += '<div style="margin-top:8px;color:var(--ink-2);font-size:11px;font-family:var(--mono);">⚠ = UOM discrepancy noted by supplier &nbsp;·&nbsp; † = substitute part offered &nbsp;·&nbsp; <strong style="color:var(--green);">green</strong> = lowest non-flagged bid</div>';
+  html += '<div style="margin-top:8px;color:var(--ink-2);font-size:11px;font-family:var(--mono);">⚠ = UOM discrepancy noted by supplier &nbsp;·&nbsp; † = substitute part offered &nbsp;·&nbsp; <strong style="color:var(--green);">green</strong> = lowest non-flagged bid &nbsp;·&nbsp; click any cell to open the per-item drill-down</div>';
 
   el.innerHTML = html;
 
-  // Wire row click → open per-item history modal
+  // Recommendation chips — toggle the matrix filter.
+  el.querySelectorAll('[data-rec-filter]').forEach(chip => {
+    const handle = (ev) => {
+      if (ev.type === 'keydown' && ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault();
+      const rec = chip.getAttribute('data-rec-filter');
+      _matrixFilter.recommendation = (_matrixFilter.recommendation === rec) ? null : rec;
+      _rerenderMatrixWithFilters();
+    };
+    chip.addEventListener('click', handle);
+    chip.addEventListener('keydown', handle);
+  });
+
+  // Per-row recommendation cell — click filters to that recommendation.
+  el.querySelectorAll('[data-rec-row-filter]').forEach(td => {
+    td.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const rec = td.getAttribute('data-rec-row-filter');
+      _matrixFilter.recommendation = (_matrixFilter.recommendation === rec) ? null : rec;
+      _rerenderMatrixWithFilters();
+    });
+  });
+
+  // Filter-pill × buttons + "clear all".
+  el.querySelectorAll('[data-pill-clear]').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      _clearMatrixFilter(btn.getAttribute('data-pill-clear'));
+    });
+  });
+  el.querySelectorAll('[data-pill-clear-all]').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      _clearMatrixFilter('*');
+    });
+  });
+
+  // Per-cell click → open per-item modal.
+  el.querySelectorAll('.matrix-cell').forEach(td => {
+    td.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      _openItemHistory(td.getAttribute('data-cell-item'));
+    });
+  });
+
+  // Row click (anywhere outside a cell that has its own handler) → open per-item modal.
   el.querySelectorAll('tr[data-comp-item]').forEach(tr => {
-    tr.style.cursor = 'pointer';
-    tr.addEventListener('click', () => {
-      const k = tr.getAttribute('data-comp-item');
-      _openItemHistory(k);
+    tr.addEventListener('click', (ev) => {
+      // If a child cell already handled it, our listener still fires due to
+      // bubble — but the cell's handler called stopPropagation, so this
+      // path only runs for clicks on the non-cell row chrome.
+      _openItemHistory(tr.getAttribute('data-comp-item'));
     });
   });
 }
