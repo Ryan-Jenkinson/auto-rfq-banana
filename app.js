@@ -2960,33 +2960,59 @@ function _renderItemHistory(h) {
   const trendLbl = `slope $${t.slope_per_day != null ? (t.slope_per_day * 365).toFixed(2) : '—'}/yr · R² ${t.r2 != null ? t.r2.toFixed(2) : '—'} · ${t.confidence || ''}`;
   document.getElementById('im-trend-label').textContent = trendLbl;
 
-  // Build callout — lead with spike if there is one (most actionable)
+  // Build callout — only render the box when there's something actionable
+  // to say. Once an analyst has cleaned outliers and the spike is resolved
+  // and the trend extrapolation is close to the latest priced line, the
+  // box becomes pure noise ("Latest $X vs median $X (+0%)") so we hide it.
+  // Renders for: confirmed spikes (red), no-spike-but-trend-meaningfully-
+  // diverges-from-latest (amber/neutral), or low-confidence-trend warnings.
   let callout = '';
   const calloutEl = document.getElementById('im-trend-callout');
   calloutEl.style.borderColor = '';
   calloutEl.style.background = 'var(--bg-2)';
+
+  // 1. Spike — most actionable, always renders if real.
   if (t.spike && t.spike.is_spike) {
     const direction = t.spike.pct_diff > 0 ? 'above' : 'below';
     callout = `<strong style="color:var(--red);">⚠ PRICE SPIKE</strong> &nbsp; Latest line $${t.latest_unit_price.toFixed(2)} is <strong style="color:var(--red);">${Math.abs(t.spike.pct_diff).toFixed(0)}% ${direction}</strong> the ${t.median_window_label} ($${t.median_90d.toFixed(2)}). Worth confirming this isn't a one-off price hike before the RFQ goes out.`;
     calloutEl.style.borderColor = 'var(--red)';
     calloutEl.style.background = 'rgba(255,77,109,0.08)';
-  } else if (t.spike) {
-    callout = t.spike.message + '.';
   }
-  if (t.expected_today != null) {
-    const expected = '$' + t.expected_today.toFixed(2);
-    const last = s.last_unit_price != null ? '$' + s.last_unit_price.toFixed(2) : '—';
-    const ago = t.days_since_last_order != null
-      ? (t.days_since_last_order < 30
-          ? `${t.days_since_last_order} days ago`
-          : `${(t.days_since_last_order / 30).toFixed(1)} months ago`)
-      : '—';
-    const trendLine = `<br><br>Last actual order: ${last} · ${ago}. Trend extrapolation to today: <strong style="color:var(--accent);">${expected}</strong>. Confidence: ${t.confidence} (${t.confidence_reason}).`;
-    callout += trendLine;
-  } else if (!callout && t.confidence_reason) {
+  // (No "else if (t.spike)" with the +0% noise message — that's the
+  // banner Ryan wanted gone once the data's clean.)
+
+  // 2. Trend-extrapolation line — only render when the extrapolation
+  // diverges meaningfully from the latest priced line (>15% gap), AND
+  // the trend has at least 'medium' confidence. Anything tighter than
+  // that is just chart-decoration noise; the chart already shows the
+  // EXPECTED marker visually.
+  if (t.expected_today != null && s.last_unit_price != null) {
+    const expected = t.expected_today;
+    const last = s.last_unit_price;
+    const divergencePct = last > 0 ? Math.abs((expected - last) / last) * 100 : 0;
+    const meaningfulDivergence = divergencePct >= 15 && t.confidence !== 'low';
+    if (meaningfulDivergence) {
+      const ago = t.days_since_last_order != null
+        ? (t.days_since_last_order < 30
+            ? `${t.days_since_last_order} days ago`
+            : `${(t.days_since_last_order / 30).toFixed(1)} months ago`)
+        : '—';
+      const trendLine = `${callout ? '<br><br>' : ''}Last actual order: $${last.toFixed(2)} · ${ago}. Trend extrapolation to today: <strong style="color:var(--accent);">$${expected.toFixed(2)}</strong> (${expected > last ? '+' : ''}${(((expected - last) / last) * 100).toFixed(0)}% vs last). Confidence: ${t.confidence} (${t.confidence_reason}).`;
+      callout += trendLine;
+    }
+  } else if (!callout && t.confidence_reason && t.confidence === 'low') {
+    // 3. Low-confidence trend warning — only when nothing else triggered.
     callout = `Trend: ${t.confidence_reason}.`;
   }
-  calloutEl.innerHTML = callout;
+
+  // Hide the box entirely if there's nothing meaningful to show.
+  if (callout) {
+    calloutEl.style.display = '';
+    calloutEl.innerHTML = callout;
+  } else {
+    calloutEl.style.display = 'none';
+    calloutEl.innerHTML = '';
+  }
 
   // Order lines table — checkbox per row drives the outlier-exclusion set.
   const tbody = document.getElementById('im-lines-body');
@@ -3207,6 +3233,26 @@ function _renderItemBidsSection(h) {
     const lockBtnTitle = isLocked
       ? 'Unlock — strategy logic resumes for this item'
       : 'Lock award to this supplier across every scenario. Use after visually auditing this bid.';
+
+    // 🚩 UOM-suspected flag — pre-fills a needs-review row in the UOM
+    // Resolution Queue (step 4) for this (item, supplier) so when the
+    // analyst opens the queue, this pair is already at the top with
+    // "flagged from per-item modal" as the note. Also writes a master
+    // data-quality log entry (event_type="uom_suspected") so the
+    // cross-app audit packet shows the lineage.
+    const isUomFlagged = b.uom_status === 'needs_review';
+    const isUomResolved = b.uom_status === 'resolved';
+    let uomBtnLbl, uomBtnTitle;
+    if (isUomResolved) {
+      uomBtnLbl = `✓ UOM resolved (×${b.uom_factor || '?'})`;
+      uomBtnTitle = `Already resolved in the UOM Resolution Queue (step 4) with factor ×${b.uom_factor}. ${b.uom_note ? 'Note: ' + b.uom_note : ''}`;
+    } else if (isUomFlagged) {
+      uomBtnLbl = '🏳️ UOM FLAGGED — click to clear';
+      uomBtnTitle = 'Currently marked needs-review. Will surface in the UOM Resolution Queue (step 4) for conversion-factor entry. Click to clear the flag.';
+    } else {
+      uomBtnLbl = '🚩 FLAG SUSPECTED UOM ISSUE';
+      uomBtnTitle = 'Pre-fill a needs-review row in the UOM Resolution Queue (step 4) for this supplier + item, so when bids come back / step 4 opens, this pair is already at the top of the queue. Use when an outlier-corrected trend makes a bid only make sense if their UOM is wrong (per-box vs per-each, etc.). Also writes a master data-quality log entry so the audit trail shows the lineage. Doesn\'t commit a conversion factor — that step happens in the queue once you know the right one.';
+    }
     html += `
       <div class="im-bid-card" style="
         border:1px solid ${color};
@@ -3257,6 +3303,28 @@ function _renderItemBidsSection(h) {
             border-radius:3px;
             cursor:pointer;
           ">${lockBtnLbl}</button>
+        <button type="button"
+          class="im-bid-uom-btn"
+          data-supplier="${_escapeHtml(b.supplier)}"
+          data-uom-flagged="${isUomFlagged ? '1' : '0'}"
+          ${isUomResolved ? 'disabled' : ''}
+          title="${uomBtnTitle}"
+          style="
+            margin-top:6px;
+            width:100%;
+            background:${isUomFlagged ? 'rgba(255,183,51,0.18)' : (isUomResolved ? 'rgba(61,220,132,0.10)' : 'transparent')};
+            color:${isUomFlagged ? 'var(--accent)' : (isUomResolved ? 'var(--green)' : 'var(--ink-2)')};
+            border:1px dashed ${isUomFlagged ? 'var(--accent)' : (isUomResolved ? 'var(--green)' : 'var(--line)')};
+            padding:5px 8px;
+            font-family:var(--mono);
+            font-size:9px;
+            text-transform:uppercase;
+            letter-spacing:0.06em;
+            font-weight:600;
+            border-radius:3px;
+            cursor:${isUomResolved ? 'default' : 'pointer'};
+            opacity:${isUomResolved ? '0.7' : '1'};
+          ">${uomBtnLbl}</button>
       </div>
     `;
   }
@@ -3267,6 +3335,47 @@ function _renderItemBidsSection(h) {
       const wasLocked = ev.currentTarget.getAttribute('data-locked') === '1';
       _toggleItemLock(h.item_num, sup, wasLocked);
     });
+  }
+  for (const btn of list.querySelectorAll('.im-bid-uom-btn')) {
+    btn.addEventListener('click', (ev) => {
+      if (ev.currentTarget.disabled) return;
+      const sup = ev.currentTarget.getAttribute('data-supplier');
+      const wasFlagged = ev.currentTarget.getAttribute('data-uom-flagged') === '1';
+      _toggleItemUomFlag(h.item_num, sup, wasFlagged);
+    });
+  }
+}
+
+async function _toggleItemUomFlag(itemNum, supplier, wasFlagged) {
+  // Toggle the per-(item, supplier) UOM-suspected flag from the per-item
+  // modal. Pre-fills a needs-review row in the step 4 UOM Resolution
+  // Queue + writes a master data-quality log entry. Then refreshes the
+  // modal so the button state updates in place.
+  if (!_pyAppLoaded || !_py) return;
+  _showItemModalSavePulse('saving…', 'pending');
+  try {
+    _py.globals.set('_item_num_in', itemNum);
+    _py.globals.set('_supplier_in', supplier);
+    if (wasFlagged) {
+      await _py.runPythonAsync(`
+from app_engine import clear_uom_suspected_flag
+clear_uom_suspected_flag(_item_num_in, _supplier_in)
+`);
+    } else {
+      await _py.runPythonAsync(`
+from app_engine import flag_uom_suspected
+flag_uom_suspected(_item_num_in, _supplier_in)
+`);
+    }
+    if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) {
+      _saveMgr.markDirty();
+    }
+    if (typeof _refreshExclusionLogBanner === 'function') _refreshExclusionLogBanner();
+    await _refreshItemHistoryModal(itemNum);
+    _showItemModalSavePulse(wasFlagged ? '✓ UOM flag cleared' : '✓ Flagged for UOM Resolution Queue', 'ok');
+  } catch (err) {
+    console.error('[uom-flag toggle]', err);
+    _showItemModalSavePulse('✗ Save failed', 'err');
   }
 }
 

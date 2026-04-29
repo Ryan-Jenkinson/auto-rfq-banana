@@ -1358,6 +1358,7 @@ def _build_item_bid_overlay(rfq_key: str, expected_today, latest_price,
     if not rfq_key:
         return out
     reference = expected_today if expected_today is not None else latest_price
+    annotations = _STATE.get("uom_annotations") or {}
     for supplier, parsed in bids_by_supplier.items():
         if not isinstance(parsed, dict):
             continue
@@ -1396,6 +1397,10 @@ def _build_item_bid_overlay(rfq_key: str, expected_today, latest_price,
         ratio = (canonical_price / reference) if (reference and reference > 0) else None
         pct_diff = ((ratio - 1.0) * 100.0) if ratio is not None else None
         possible_typo = (ratio is not None and ratio <= ITEM_OVERLAY_TYPO_RATIO_MAX)
+        # In-effect UOM annotation for this (item, supplier) — drives the
+        # 🚩 flag-UOM button state in the modal. None means unflagged.
+        ann = annotations.get(_annotation_key(rfq_key, supplier))
+        uom_status = ann.get("status") if ann else None
         out.append({
             "supplier": supplier,
             "price": canonical_price,
@@ -1411,6 +1416,9 @@ def _build_item_bid_overlay(rfq_key: str, expected_today, latest_price,
                           else ("latest" if latest_price is not None else None)),
             "is_locked": (locked_supplier is not None
                           and supplier == locked_supplier),
+            "uom_status": uom_status,                    # None / "needs_review" / "resolved" / "skipped"
+            "uom_factor": ann.get("factor") if ann else None,
+            "uom_note": ann.get("note") if ann else "",
             "n_alt_quotes": n_alt,
             "alt_quotes": alt_quotes,
         })
@@ -1743,6 +1751,129 @@ def _append_unexclusion_log_entries(item_num: str, newly_unexcluded_indices: lis
             "pct_diff_avg": None,
             "notes": "re-included after prior exclusion",
         })
+
+
+def flag_uom_suspected(item_num: str, supplier: str, note: str = "") -> dict:
+    """Flag (item, supplier) as a suspected UOM mismatch from the per-item modal.
+
+    Workflow handoff: the analyst spots an outlier in the per-item history
+    chart, excludes it via the USE checkbox, and notices that one or two
+    supplier bids only line up with the cleaned trend if their UOM is off
+    (e.g., supplier quoted "per box of 10" against an "each" history).
+    Hitting the 🚩 button next to that supplier's bid card calls into here:
+
+      1. Writes a `needs_review` UOM annotation via `set_uom_annotation`
+         with factor=None — same place the UOM Resolution Queue surfaces
+         needs-review rows in step 4. So when the analyst opens that
+         queue, this supplier is already pre-filled at the top.
+      2. Appends an entry to the master data-quality event log with
+         event_type="uom_suspected" so the cross-app audit packet shows
+         the lineage from "outlier excluded" → "supplier flagged" →
+         (later) "UOM corrected with factor X" → "NORMALIZED savings".
+
+    Args:
+        item_num: display item number (the same key the modal opens with).
+        supplier: exact supplier name (matches a key in _STATE["bids"]).
+        note:     optional analyst memo. Default mentions the modal source.
+
+    Returns:
+        ``{"item_num", "supplier", "annotation": <full annotation dict>}``
+        — caller refreshes the modal to render the flag-button as set.
+    """
+    if not item_num or not supplier:
+        return {"error": "item_num and supplier required"}
+    items = _STATE.get("items", []) or []
+    item = next((it for it in items if it.get("item_num") == item_num), None)
+    item_key = item.get("key") if item else norm_pn(item_num)
+    hist_uom = (item.get("uom") if item else "") or ""
+    bid_uom = ""
+    parsed = (_STATE.get("bids", {}) or {}).get(supplier) or {}
+    for b in parsed.get("bids", []) or []:
+        if b.get("rfq_key") == item_key:
+            bid_uom = b.get("uom") or ""
+            break
+    note_full = note or "flagged from per-item modal — suspect UOM mismatch with cleaned history"
+    annotation = set_uom_annotation(
+        item_key=item_key,
+        supplier=supplier,
+        factor=None,
+        hist_uom=hist_uom,
+        bid_uom=bid_uom,
+        note=note_full,
+        status="needs_review",
+        set_by="per_item_modal",
+        direction="auto_detect",
+    )
+    # Master data-quality log entry — cross-app audit packet sees it.
+    log = _STATE.setdefault("exclusion_log", [])
+    log.append({
+        "timestamp": datetime.now().isoformat(),
+        "app_source": "auto-rfq-banana",
+        "event_type": "uom_suspected",
+        "rfq_id": _STATE.get("rfq_id") or "",
+        "supplier_name": supplier,
+        "item_num": item_num,
+        "description": (item.get("description") if item else "") or "",
+        "mfg_name": (item.get("mfg_name") if item else "") or "",
+        "mfg_pn": (item.get("mfg_pn") if item else "") or "",
+        "uom": hist_uom,
+        "line_idx": None,
+        "line_date": "",
+        "line_qty": None,
+        "line_unit_price": None,
+        "line_total": None,
+        "line_po": "",
+        "line_uom": bid_uom,
+        "median_before": None,
+        "avg_before": None,
+        "n_other_lines_before": None,
+        "ratio_to_median": None,
+        "pct_diff_median": None,
+        "pct_diff_avg": None,
+        "notes": note_full,
+    })
+    return {"item_num": item_num, "supplier": supplier, "annotation": annotation}
+
+
+def clear_uom_suspected_flag(item_num: str, supplier: str) -> dict:
+    """Clear the per-item-modal-set UOM suspected flag for (item, supplier).
+
+    Calls `clear_uom_annotation` and appends an event_type="uom_unflagged"
+    entry to the master log so the trail shows the analyst changed their
+    mind. Doesn't touch annotations that are status="resolved" or
+    "skipped" — only the ones flagged from the modal as needs_review.
+    """
+    if not item_num or not supplier:
+        return {"error": "item_num and supplier required"}
+    items = _STATE.get("items", []) or []
+    item = next((it for it in items if it.get("item_num") == item_num), None)
+    item_key = item.get("key") if item else norm_pn(item_num)
+    existing = get_uom_annotation(item_key, supplier) if "get_uom_annotation" in globals() else (_STATE.get("uom_annotations") or {}).get(_annotation_key(item_key, supplier))
+    cleared = False
+    if existing and existing.get("status") == "needs_review":
+        ann_map = _STATE.get("uom_annotations") or {}
+        ann_map.pop(_annotation_key(item_key, supplier), None)
+        cleared = True
+    log_event("uom_annotation_cleared", f"per-item modal cleared UOM flag for {supplier}", related=item_num)
+    if cleared:
+        _STATE.setdefault("exclusion_log", []).append({
+            "timestamp": datetime.now().isoformat(),
+            "app_source": "auto-rfq-banana",
+            "event_type": "uom_unflagged",
+            "rfq_id": _STATE.get("rfq_id") or "",
+            "supplier_name": supplier,
+            "item_num": item_num,
+            "description": (item.get("description") if item else "") or "",
+            "mfg_name": (item.get("mfg_name") if item else "") or "",
+            "mfg_pn": (item.get("mfg_pn") if item else "") or "",
+            "uom": (item.get("uom") if item else "") or "",
+            "line_idx": None, "line_date": "", "line_qty": None,
+            "line_unit_price": None, "line_total": None, "line_po": "", "line_uom": "",
+            "median_before": None, "avg_before": None, "n_other_lines_before": None,
+            "ratio_to_median": None, "pct_diff_median": None, "pct_diff_avg": None,
+            "notes": "UOM-suspected flag cleared from per-item modal",
+        })
+    return {"item_num": item_num, "supplier": supplier, "cleared": cleared}
 
 
 def list_exclusion_log() -> list:
