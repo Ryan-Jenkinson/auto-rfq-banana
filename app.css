@@ -227,17 +227,44 @@ table.rfq-table tbody tr.excluded td { text-decoration: line-through; }
 }
 
 /* "Last viewed" row trail — after closing the per-item modal we leave a
-   subtle accent stripe on the row that opened it, so the user can tell
-   where they were in the list. Drops back to neutral after ~12s, but stays
-   visible long enough that scrolling-and-scanning doesn't lose the place. */
+   neon-green stripe on the row that opened it, so the user can spot it
+   instantly against the navy ground. Hard to miss for the first ~6 s,
+   then fades back to a subtle pulse over the next 8 s. The stripe color
+   is the green from the Bloomberg-terminal palette (#3ddc84) — looks
+   right at home on #0a0e1a/#131a2c. */
 tr.last-viewed-row {
-  background: rgba(255,183,51,0.12) !important;
-  box-shadow: inset 3px 0 0 var(--accent);
-  transition: background 8s ease-out 4s, box-shadow 8s ease-out 4s;
+  background: rgba(61,220,132,0.22) !important;
+  box-shadow: inset 4px 0 0 var(--green), 0 0 14px rgba(61,220,132,0.30);
+  outline: 1px solid rgba(61,220,132,0.55);
+  outline-offset: -1px;
+  transition: background 8s ease-out 6s, box-shadow 8s ease-out 6s, outline 8s ease-out 6s;
+  animation: last-viewed-pulse 2.4s ease-in-out 3;
 }
 tr.last-viewed-row.fade {
   background: transparent !important;
-  box-shadow: inset 3px 0 0 transparent;
+  box-shadow: inset 4px 0 0 transparent, 0 0 0 transparent;
+  outline-color: transparent;
+  animation: none;
+}
+@keyframes last-viewed-pulse {
+  0%, 100% { box-shadow: inset 4px 0 0 var(--green), 0 0 14px rgba(61,220,132,0.30); }
+  50%      { box-shadow: inset 4px 0 0 var(--green), 0 0 22px rgba(61,220,132,0.55); }
+}
+
+/* Keyboard-navigation focus state on table rows — distinct from the
+   "last viewed" trail (which uses green) so the user can tell at a
+   glance which row will respond to Enter. Cyan accent on the right
+   side balances the green left stripe. */
+tr.kbd-focus {
+  outline: 1px dashed var(--cyan);
+  outline-offset: -1px;
+  box-shadow: inset -3px 0 0 var(--cyan);
+}
+tr.kbd-focus.last-viewed-row {
+  /* When you Esc out of a modal, the originating row gets BOTH the green
+     last-viewed trail AND keyboard focus. Combine cues, don't fight. */
+  outline: 1px solid var(--green);
+  box-shadow: inset 4px 0 0 var(--green), inset -3px 0 0 var(--cyan), 0 0 14px rgba(61,220,132,0.30);
 }
 
 /* Click-targets audit (2026-04-29): every clickable-looking element gets

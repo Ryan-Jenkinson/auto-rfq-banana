@@ -852,17 +852,105 @@ function _renderRfqTable() {
     });
   });
 
-  // Click row (anywhere except the include checkbox) → open per-item history modal
+  // Click row (anywhere except the include checkbox) → open per-item history modal.
+  // tabindex="0" makes the row focusable so arrow-key nav (below) can move
+  // focus across rows and Enter opens the modal.
   $('rfq-table').querySelectorAll('tbody tr[data-item]').forEach(tr => {
     tr.style.cursor = 'pointer';
+    tr.setAttribute('tabindex', '0');
     tr.addEventListener('click', (e) => {
       // Ignore clicks on the checkbox cell
       if (e.target.closest('.cell-include')) return;
       const itemNum = tr.getAttribute('data-item');
       _openItemHistory(itemNum);
     });
+    tr.addEventListener('focus', () => _setKbFocusRow(tr));
   });
+
+  // After re-render, if there's a remembered keyboard-focused item_num,
+  // restore focus + the kbd-focus class so arrow nav resumes seamlessly.
+  if (_kbFocusedItemNum) {
+    const target = $('rfq-table').querySelector(`tbody tr[data-item="${CSS.escape(_kbFocusedItemNum)}"]`);
+    if (target) {
+      _setKbFocusRow(target, /*scrollIntoView=*/false);
+    } else {
+      _kbFocusedItemNum = null;
+    }
+  }
 }
+
+// ----------------------------------------------------------------------------
+// Keyboard navigation across the RFQ-list table + comparison-matrix table.
+//
+// ↑ / ↓     move focus to prev/next row in the same tbody (wraps)
+// Home / End jump to first / last row in the visible tbody
+// Enter      open the per-item modal for the focused row
+// Esc        close the per-item modal (if open) — handled in _ensureItemModal
+//
+// Module state: _kbFocusedItemNum tracks the last-focused item_num so a
+// re-render (filter change, sort) can restore focus to the same row when
+// it's still in the visible set.
+// ----------------------------------------------------------------------------
+let _kbFocusedItemNum = null;
+
+function _setKbFocusRow(tr, scrollIntoView = true) {
+  if (!tr) return;
+  // Strip prior focus indicators
+  for (const old of document.querySelectorAll('tr.kbd-focus')) {
+    old.classList.remove('kbd-focus');
+  }
+  tr.classList.add('kbd-focus');
+  _kbFocusedItemNum = tr.getAttribute('data-item') || tr.getAttribute('data-comp-item') || null;
+  if (scrollIntoView) {
+    try { tr.scrollIntoView({ block: 'nearest', behavior: 'auto' }); } catch (_) {}
+  }
+}
+
+function _kbNavRows(direction, fromTr) {
+  // direction: -1 (up), +1 (down), 'home', 'end'
+  const tbody = fromTr ? fromTr.parentElement : null;
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr[tabindex="0"]'));
+  if (!rows.length) return;
+  const idx = rows.indexOf(fromTr);
+  let next;
+  if (direction === 'home') next = rows[0];
+  else if (direction === 'end') next = rows[rows.length - 1];
+  else if (direction === -1) next = rows[(idx - 1 + rows.length) % rows.length];
+  else next = rows[(idx + 1) % rows.length];
+  next.focus();
+}
+
+document.addEventListener('keydown', (ev) => {
+  // Ignore when the user is typing in an input / select / textarea.
+  const tag = (ev.target && ev.target.tagName) || '';
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+  // Ignore when the per-item modal is open — its own keyboard handler
+  // catches Esc; arrow keys inside it would just scroll the modal.
+  const modal = document.getElementById('item-modal');
+  if (modal && modal.style.display === 'flex') return;
+
+  const tr = ev.target.closest && ev.target.closest('tr[tabindex="0"]');
+  if (!tr) return;
+
+  if (ev.key === 'ArrowDown') {
+    ev.preventDefault();
+    _kbNavRows(+1, tr);
+  } else if (ev.key === 'ArrowUp') {
+    ev.preventDefault();
+    _kbNavRows(-1, tr);
+  } else if (ev.key === 'Home') {
+    ev.preventDefault();
+    _kbNavRows('home', tr);
+  } else if (ev.key === 'End') {
+    ev.preventDefault();
+    _kbNavRows('end', tr);
+  } else if (ev.key === 'Enter') {
+    ev.preventDefault();
+    const itemNum = tr.getAttribute('data-item') || tr.getAttribute('data-comp-item');
+    if (itemNum) _openItemHistory(itemNum);
+  }
+});
 
 ['active-window', 'min-spend', 'rfq-search', 'tier-filter', 'include-filter'].forEach(id => {
   const el = $(id);
@@ -2754,13 +2842,16 @@ function _renderComparisonMatrix(matrix) {
   });
 
   // Row click (anywhere outside a cell that has its own handler) → open per-item modal.
+  // tabindex="0" enables arrow-key navigation across the matrix rows too.
   el.querySelectorAll('tr[data-comp-item]').forEach(tr => {
+    tr.setAttribute('tabindex', '0');
     tr.addEventListener('click', (ev) => {
       // If a child cell already handled it, our listener still fires due to
       // bubble — but the cell's handler called stopPropagation, so this
       // path only runs for clicks on the non-cell row chrome.
       _openItemHistory(tr.getAttribute('data-comp-item'));
     });
+    tr.addEventListener('focus', () => _setKbFocusRow(tr));
   });
 }
 
@@ -2882,7 +2973,17 @@ function _closeItemModal() {
   const m = document.getElementById('item-modal');
   if (m) m.style.display = 'none';
   _currentItemHistory = null;
-  if (_lastViewedItemNum) _markLastViewedRow(_lastViewedItemNum);
+  if (_lastViewedItemNum) {
+    _markLastViewedRow(_lastViewedItemNum);
+    // Return keyboard focus to the originating row so arrow keys
+    // immediately navigate from where the user left off — no clicking
+    // back into the table to re-acquire focus.
+    const sel = `tr[data-item="${CSS.escape(_lastViewedItemNum)}"], tr[data-comp-item="${CSS.escape(_lastViewedItemNum)}"]`;
+    const target = document.querySelector(sel);
+    if (target) {
+      try { target.focus({ preventScroll: false }); } catch (_) { target.focus(); }
+    }
+  }
 }
 
 async function _openItemHistory(itemNum) {
