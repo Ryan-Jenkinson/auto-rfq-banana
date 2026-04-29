@@ -1438,8 +1438,13 @@ def _our_format_columns(header_row: tuple) -> dict:
 
 def parse_supplier_bid(file_bytes, supplier_name: str = "") -> dict:
     """Parse one supplier's returned-bid xlsx. Auto-detects 'our format'
-    (banner + headers around row 7). Returns:
+    (banner + headers around row 7) by checking the row signatures.
 
+    If auto-detect fails (format='unknown'), the caller can fall back to
+    inspect_bid_workbook + parse_supplier_bid_with_mapping for a manual
+    column-mapping flow.
+
+    Returns:
         {
           "supplier": str,
           "bids": [{rfq_key, item_num, part_number, mfg_name, description,
@@ -1460,16 +1465,178 @@ def parse_supplier_bid(file_bytes, supplier_name: str = "") -> dict:
 
     header_row_idx = _detect_our_format(ws)
     if not header_row_idx:
+        # Capture headers from every plausible row for the caller's UI to use
+        # when offering manual column mapping. Probe rows 1-15.
+        candidate_rows = []
+        for r_idx in range(1, 16):
+            try:
+                row = next(ws.iter_rows(min_row=r_idx, max_row=r_idx, values_only=True), None)
+            except Exception:
+                break
+            if row is None:
+                continue
+            non_blank = sum(1 for c in row if c is not None and str(c).strip())
+            if non_blank >= 3:  # row has enough content to plausibly be headers
+                candidate_rows.append({
+                    "row_idx": r_idx,
+                    "headers": [(str(c) if c is not None else "") for c in row],
+                    "non_blank": non_blank,
+                })
         wb.close()
         return {"supplier": supplier_name, "bids": [], "format": "unknown",
                 "summary": {"n_lines": 0, "n_priced": 0, "n_no_bid": 0,
                             "n_need_info": 0, "n_uom_disc": 0, "n_substitute": 0,
                             "total_quoted_value": 0.0},
+                "candidate_header_rows": candidate_rows,
                 "error": "Could not auto-detect header row. Use manual column mapping."}
 
     header_row = next(ws.iter_rows(min_row=header_row_idx, max_row=header_row_idx, values_only=True))
     cols = _our_format_columns(header_row)
 
+    return _parse_bid_rows(ws, file_bytes, header_row_idx, cols, supplier_name, format_label="our_format")
+
+
+def parse_supplier_bid_with_mapping(file_bytes, supplier_name: str,
+                                     header_row_idx: int,
+                                     col_map: dict) -> dict:
+    """Parse a supplier-bid xlsx using a user-supplied column mapping.
+
+    Use this when parse_supplier_bid returned format='unknown' — the caller
+    presents a column-mapping UI that lets the user pick which column in the
+    file holds each canonical field, then passes the mapping back here.
+
+    Args:
+        file_bytes:     the xlsx bytes
+        supplier_name:  display name for the supplier
+        header_row_idx: 1-indexed row number of the headers (from
+                        candidate_header_rows in the parse_supplier_bid output)
+        col_map:        {canonical_field_name: column_index_zero_based}
+                        Required keys: at least one of (item_num, part_number,
+                        eam_pn) AND quoted_price (or verified_price). Optional
+                        keys: qty, uom, mfg_name, description, commodity, notes,
+                        sub_part, sub_desc, sub_price, exact_part, exact_desc,
+                        notes_2, verified_price.
+
+    Returns the same shape as parse_supplier_bid.
+    """
+    if not isinstance(file_bytes, (bytes, bytearray)):
+        file_bytes = bytes(file_bytes)
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+    return _parse_bid_rows(ws, file_bytes, header_row_idx, col_map,
+                            supplier_name, format_label="manual_mapping")
+
+
+def inspect_bid_workbook(file_bytes) -> dict:
+    """Quick structural inspection of a bid file — used by the manual column
+    mapping UI to populate the dropdowns BEFORE the user commits to a mapping.
+
+    Returns:
+        {"sheet_name": str, "candidate_rows": [{row_idx, headers, sample_data}, ...]}
+
+    Each candidate row is a row that LOOKS like it could be the header row
+    (has 3+ non-blank cells). The UI typically shows the user the first
+    candidate by default but lets them pick a different row if the auto-pick
+    is wrong (e.g., when the file has multiple banner rows).
+    """
+    if not isinstance(file_bytes, (bytes, bytearray)):
+        file_bytes = bytes(file_bytes)
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+    candidate_rows = []
+    for r_idx in range(1, 16):
+        try:
+            row = next(ws.iter_rows(min_row=r_idx, max_row=r_idx, values_only=True), None)
+        except Exception:
+            break
+        if row is None:
+            continue
+        non_blank = sum(1 for c in row if c is not None and str(c).strip())
+        if non_blank >= 3:
+            # Also grab a sample data row (the next non-empty row after this one)
+            sample = None
+            for sr_idx in range(r_idx + 1, min(r_idx + 6, 50)):
+                try:
+                    s_row = next(ws.iter_rows(min_row=sr_idx, max_row=sr_idx, values_only=True), None)
+                    if s_row and any(c is not None and str(c).strip() for c in s_row):
+                        sample = [(str(c) if c is not None else "")[:60] for c in s_row]
+                        break
+                except Exception:
+                    break
+            candidate_rows.append({
+                "row_idx": r_idx,
+                "headers": [(str(c) if c is not None else "") for c in row],
+                "non_blank": non_blank,
+                "sample_data": sample,
+            })
+    wb.close()
+    return {
+        "sheet_name": ws.title if hasattr(ws, "title") else "(unknown)",
+        "candidate_rows": candidate_rows,
+    }
+
+
+def auto_suggest_bid_mapping(headers: list) -> dict:
+    """Given a list of header strings, fuzzy-match to canonical bid fields.
+
+    Returns {canonical_field: column_index} — the same shape parse_supplier_bid_with_mapping
+    expects. The UI uses this to pre-populate the dropdowns before the user confirms.
+
+    Matching strategy: case-insensitive substring + alias matching against a
+    table of common variants. First match wins (left-to-right header scan).
+    """
+    aliases = {
+        "item_num":      ["item #", "item number", "item num", "andersen item", "internal item", "sku"],
+        "eam_pn":        ["eam part number", "eam part #", "eam pn", "eam"],
+        "mfg_pn":        ["manufacturer part number", "mfg part number", "mfr part number", "mfg pn", "manufacturer pn"],
+        "part_number":   ["part number", "partnumber", "part#", "mcmaster part", "mcmaster part number", "mcmaster #"],
+        "description":   ["description", "item description", "item name", "item", "detailed item"],
+        "mfg_name":      ["manufacturer name", "manufacturer", "mfr", "mfg", "brand"],
+        "commodity":     ["commodity", "commodity code", "commodity name", "category"],
+        "qty":           ["qty", "quantity", "annual qty", "order qty", "ordered qty"],
+        "uom":           ["uom", "unit of measure", "u/m", "unit", "buy uom"],
+        "quoted_price":  ["quoted price", "your unit price", "unit price", "quote price", "vendor price", "supplier price", "cost each", "price"],
+        "verified_price":["verified pricing", "verified price", "confirmed price", "final price", "updated price"],
+        "notes":         ["notes", "comments", "supplier notes", "remarks", "memo"],
+        "exact_part":    ["exact fastenal part", "exact part", "supplier part", "your part", "your part #", "vendor part", "vendor part #"],
+        "exact_desc":    ["exact description", "supplier description", "your description", "vendor description"],
+        "sub_part":      ["sub part", "substitute part", "alternate part", "alt part"],
+        "sub_desc":      ["sub description", "substitute description", "alternate description"],
+        "sub_price":     ["sub price", "substitute price", "alternate price", "sell price/uom"],
+    }
+    headers_lower = [str(h or "").strip().lower() for h in headers]
+    out = {}
+    for field, alias_list in aliases.items():
+        # Pass 1: exact equality
+        for alias in alias_list:
+            for i, h in enumerate(headers_lower):
+                if h == alias and field not in out:
+                    out[field] = i
+                    break
+            if field in out:
+                break
+        # Pass 2: substring (alias inside header OR header inside alias)
+        if field not in out:
+            for alias in alias_list:
+                for i, h in enumerate(headers_lower):
+                    if h and (alias in h or (len(h) >= 3 and h in alias)) and field not in out:
+                        # Don't reuse a column already mapped to a different field
+                        if i in out.values(): continue
+                        out[field] = i
+                        break
+                if field in out:
+                    break
+    return out
+
+
+def _parse_bid_rows(ws, file_bytes, header_row_idx: int, cols: dict,
+                    supplier_name: str, format_label: str) -> dict:
+    """Shared row-parsing implementation used by both parse_supplier_bid
+    (auto-detected format) and parse_supplier_bid_with_mapping (manual).
+
+    Iterates each row from header_row_idx + 1, applies the column mapping,
+    classifies status, builds the bid dict.
+    """
     def g(row, field):
         i = cols.get(field)
         return None if (i is None or i >= len(row)) else row[i]
@@ -1563,11 +1730,9 @@ def parse_supplier_bid(file_bytes, supplier_name: str = "") -> dict:
             "has_substitute": has_substitute_offered,
         })
 
-    wb.close()
-
     return {
         "supplier": supplier_name or "(unnamed)",
-        "format": "our_format",
+        "format": format_label,
         "header_row": header_row_idx,
         "columns_detected": cols,
         "bids": bids,

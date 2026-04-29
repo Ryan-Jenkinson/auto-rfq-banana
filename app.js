@@ -1291,6 +1291,22 @@ async function _onAddBidClick() {
   input.click();
 }
 
+// Per-supplier saved column mapping templates for non-template bid files.
+// Keyed by normalized supplier name. Lets the analyst map a supplier's
+// native-format file once and reuse the mapping next time.
+const BID_MAPPING_TEMPLATES_KEY = 'autorfqbanana:bid_mapping_templates';
+function _listBidMappingTemplates() {
+  try { return JSON.parse(localStorage.getItem(BID_MAPPING_TEMPLATES_KEY) || '{}'); }
+  catch (e) { return {}; }
+}
+function _writeBidMappingTemplates(t) {
+  try { localStorage.setItem(BID_MAPPING_TEMPLATES_KEY, JSON.stringify(t)); }
+  catch (e) { console.warn('bid mapping templates write failed', e); }
+}
+function _bidTemplateKey(supplierName) {
+  return (supplierName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+}
+
 async function _onBidFileSelected(file) {
   if (!file) return;
   // Suggest supplier name from filename (strip extension + dates + RFQ tags)
@@ -1304,29 +1320,312 @@ async function _onBidFileSelected(file) {
   const name = prompt(`Supplier name for "${file.name}":`, suggest);
   if (!name) return;
 
-  // Read + parse
   $('bid-add-btn').disabled = true;
   $('bid-add-btn').textContent = 'Parsing…';
   try {
     const buf = await file.arrayBuffer();
     const bytes = new Uint8Array(buf);
+
+    // Step 1: try auto-detect via parse_supplier_bid
     _py.globals.set('_bid_bytes', bytes);
     _py.globals.set('_bid_supplier', name);
     const out = await _py.runPythonAsync(`
 import json
-from app_engine import ingest_supplier_bid
-json.dumps(ingest_supplier_bid(_bid_bytes.to_py(), _bid_supplier), default=str)
+from app_engine import parse_supplier_bid
+json.dumps(parse_supplier_bid(_bid_bytes.to_py(), _bid_supplier), default=str)
 `);
     const parsed = JSON.parse(out);
-    _loadedBids[name] = parsed;
-    _saveMgr.markDirty();
-    await _refreshBidViews();
+
+    if (parsed.format === 'our_format') {
+      // Auto-detect succeeded — persist via ingest_supplier_bid (logs the event too)
+      await _py.runPythonAsync(`
+from app_engine import ingest_supplier_bid
+ingest_supplier_bid(_bid_bytes.to_py(), _bid_supplier)
+None
+`);
+      _loadedBids[name] = parsed;
+      _saveMgr.markDirty();
+      await _refreshBidViews();
+      return;
+    }
+
+    // Step 2: format is unknown — route through manual mapping
+    // Try a saved per-supplier template first
+    const templates = _listBidMappingTemplates();
+    const tplKey = _bidTemplateKey(name);
+    const savedTpl = templates[tplKey];
+    if (savedTpl) {
+      const useIt = confirm(
+        `Auto-detect didn't recognize this file's layout, but a saved column mapping for "${name}" exists.\n\n` +
+        `Use the saved mapping (header row ${savedTpl.headerRow + 1}, ${Object.keys(savedTpl.colMap).length} fields)?\n\n` +
+        `Cancel to set up a new mapping manually.`
+      );
+      if (useIt) {
+        await _applyBidMapping(bytes, name, savedTpl.headerRow, savedTpl.colMap, parsed);
+        return;
+      }
+    }
+
+    // No template (or user declined) — show the manual mapping modal
+    await _openBidMappingModal(bytes, name, parsed);
   } catch (err) {
     console.error('[bid intake] failed', err);
     alert('Failed to parse bid file: ' + (err.message || err));
   } finally {
     $('bid-add-btn').disabled = false;
     $('bid-add-btn').textContent = '＋ Add supplier bid xlsx';
+  }
+}
+
+// Apply a column mapping (either user-confirmed or saved template) and
+// persist the resulting bid to _STATE. Used by both the modal Confirm
+// button and the saved-template fast path.
+async function _applyBidMapping(bytes, supplierName, headerRowIdx, colMap, prevParsed) {
+  _py.globals.set('_bid_bytes', bytes);
+  _py.globals.set('_bid_supplier', supplierName);
+  _py.globals.set('_bid_header', headerRowIdx);
+  _py.globals.set('_bid_colmap', colMap);
+  const out = await _py.runPythonAsync([
+    'import json',
+    'from app_engine import parse_supplier_bid_with_mapping, _STATE, log_event',
+    'parsed = parse_supplier_bid_with_mapping(',
+    '    _bid_bytes.to_py(), _bid_supplier, int(_bid_header), _bid_colmap.to_py()',
+    ')',
+    "if 'bids' not in _STATE or not isinstance(_STATE.get('bids'), dict):",
+    "    _STATE['bids'] = {}",
+    "_STATE['bids'][_bid_supplier] = parsed",
+    "s = parsed.get('summary', {})",
+    "_n_lines = s.get('n_lines', 0)",
+    "_n_priced = s.get('n_priced', 0)",
+    "_total = s.get('total_quoted_value', 0)",
+    "_msg = 'manual map · {:,} lines / {:,} priced / ${:,.0f}'.format(_n_lines, _n_priced, _total)",
+    "log_event('ingest_supplier_bid_manual', _msg, related=_bid_supplier)",
+    "json.dumps(parsed, default=str)",
+  ].join('\n'));
+  const parsed = JSON.parse(out);
+  _loadedBids[supplierName] = parsed;
+  _saveMgr.markDirty();
+  await _refreshBidViews();
+}
+
+// Build (lazily) and show the manual column-mapping modal.
+async function _openBidMappingModal(bytes, supplierName, parsedUnknown) {
+  // Get the inspection result (candidate header rows + auto-suggest)
+  _py.globals.set('_bid_bytes', bytes);
+  const out = await _py.runPythonAsync(`
+import json
+from app_engine import inspect_bid_workbook
+json.dumps(inspect_bid_workbook(_bid_bytes.to_py()), default=str)
+`);
+  const inspection = JSON.parse(out);
+  _ensureBidMappingModal();
+  _renderBidMappingModal(bytes, supplierName, inspection);
+  document.getElementById('bid-map-modal').style.display = 'flex';
+}
+
+function _ensureBidMappingModal() {
+  if (document.getElementById('bid-map-modal')) return;
+  const m = document.createElement('div');
+  m.id = 'bid-map-modal';
+  m.style.cssText = [
+    'position:fixed','inset:0','z-index:5500','display:none',
+    'align-items:center','justify-content:center',
+    'background:rgba(8,12,22,0.78)','backdrop-filter:blur(4px)',
+    '-webkit-backdrop-filter:blur(4px)','padding:24px',
+  ].join(';');
+  m.innerHTML = `
+    <div style="
+      background:var(--bg-1);border:1px solid var(--line);border-radius:8px;
+      max-width:1100px;width:100%;max-height:92vh;overflow:auto;
+      box-shadow:0 24px 80px rgba(0,0,0,0.6);
+      font-family:var(--ui, sans-serif);
+      ">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:22px 26px 14px;border-bottom:1px solid var(--line);">
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">FLEXIBLE BID INTAKE</div>
+          <div id="bm-title" style="font-size:22px;font-weight:600;color:var(--ink-0);font-family:var(--mono);"></div>
+          <div id="bm-sub" style="font-size:13px;color:var(--ink-1);margin-top:6px;line-height:1.4;">
+            This file doesn't match the standard outbound RFQ template. Tell the app which row holds the column headers and which column holds each field — then we'll parse it the same way as a standard bid.
+          </div>
+        </div>
+        <button id="bm-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;flex-shrink:0;margin-left:14px;">×</button>
+      </div>
+      <div style="padding:18px 26px 8px;border-bottom:1px solid var(--line);">
+        <div style="font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;font-family:var(--ui);margin-bottom:10px;">STEP 1 — Pick the header row</div>
+        <div id="bm-header-rows" style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:4px;padding:8px;background:var(--bg-2);"></div>
+      </div>
+      <div style="padding:18px 26px 8px;">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;">
+          <div style="font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;font-family:var(--ui);">STEP 2 — Map columns to canonical fields</div>
+          <button id="bm-auto-suggest" class="btn ghost" type="button" style="padding:5px 12px;font-size:11px;">Auto-suggest from headers</button>
+        </div>
+        <div id="bm-fields" style="display:grid;grid-template-columns:160px 1fr 200px;gap:8px;align-items:center;font-size:12px;font-family:var(--ui);"></div>
+      </div>
+      <div style="padding:14px 26px 22px;display:flex;align-items:center;justify-content:space-between;gap:14px;border-top:1px solid var(--line);background:var(--bg-2);">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-1);font-family:var(--ui);cursor:pointer;">
+          <input type="checkbox" id="bm-save-template" checked style="cursor:pointer;">
+          Save this mapping as a template for "<span id="bm-supplier-echo" style="font-weight:600;color:var(--ink-0);"></span>"
+        </label>
+        <div style="display:flex;gap:10px;">
+          <button id="bm-cancel" class="btn ghost" type="button" style="padding:8px 18px;">Cancel</button>
+          <button id="bm-confirm" class="btn primary" type="button" style="padding:8px 22px;">Parse with this mapping</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(m);
+  document.getElementById('bm-close').addEventListener('click', () => { m.style.display = 'none'; });
+  document.getElementById('bm-cancel').addEventListener('click', () => { m.style.display = 'none'; });
+  m.addEventListener('click', (e) => { if (e.target === m) m.style.display = 'none'; });
+}
+
+// Canonical bid fields the user maps. Order = display order in the modal.
+// Required fields are flagged for validation. Aliases used for auto-suggest.
+const BID_CANONICAL_FIELDS = [
+  { key: 'item_num',       label: 'Item #',          required: false, hint: 'Andersen internal item number' },
+  { key: 'part_number',    label: 'Part Number',     required: true,  hint: 'McMaster / MFG part number — primary join key' },
+  { key: 'eam_pn',         label: 'EAM Part #',      required: false, hint: 'EAM identifier' },
+  { key: 'mfg_name',       label: 'Manufacturer',    required: false },
+  { key: 'description',    label: 'Description',     required: false },
+  { key: 'commodity',      label: 'Commodity',       required: false },
+  { key: 'qty',            label: 'Quantity',        required: false },
+  { key: 'uom',            label: 'UOM',             required: false },
+  { key: 'quoted_price',   label: 'Quoted Price',    required: true,  hint: 'Supplier\'s unit price' },
+  { key: 'verified_price', label: 'Verified Price',  required: false, hint: 'Optional: re-confirmed price column' },
+  { key: 'notes',          label: 'Notes',           required: false },
+];
+
+let _bmInspection = null;
+let _bmSelectedHeaderRow = null;  // 1-indexed row idx
+let _bmCurrentBytes = null;
+let _bmCurrentSupplier = null;
+
+function _renderBidMappingModal(bytes, supplierName, inspection) {
+  _bmInspection = inspection;
+  _bmCurrentBytes = bytes;
+  _bmCurrentSupplier = supplierName;
+  _bmSelectedHeaderRow = null;
+
+  document.getElementById('bm-title').textContent = `Map columns for: ${supplierName}`;
+  document.getElementById('bm-supplier-echo').textContent = supplierName;
+
+  const candidates = inspection.candidate_rows || [];
+  const rowsEl = document.getElementById('bm-header-rows');
+  if (!candidates.length) {
+    rowsEl.innerHTML = '<div style="color:var(--ink-2);font-size:12px;font-style:italic;">No candidate header rows found in this sheet. The file may not contain tabular bid data.</div>';
+    document.getElementById('bm-fields').innerHTML = '';
+    return;
+  }
+
+  rowsEl.innerHTML = candidates.map((c, i) => `
+    <label style="display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border-radius:4px;cursor:pointer;border:1px solid transparent;font-size:11px;font-family:var(--mono);" data-bm-row="${c.row_idx}">
+      <input type="radio" name="bm-header" value="${c.row_idx}" ${i === 0 ? 'checked' : ''} style="margin-top:2px;cursor:pointer;">
+      <div style="flex:1;min-width:0;">
+        <div style="font-weight:600;color:var(--ink-0);margin-bottom:2px;">Row ${c.row_idx} <span style="color:var(--ink-2);font-weight:normal;">· ${c.non_blank} non-blank cells</span></div>
+        <div style="color:var(--ink-1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.headers.map(h => _escapeHtml(h || '·')).join(' | ')}</div>
+        ${c.sample_data && c.sample_data.length ? `<div style="color:var(--ink-2);font-style:italic;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">sample: ${c.sample_data[0].map(v => _escapeHtml(String(v == null ? '' : v))).join(' | ')}</div>` : ''}
+      </div>
+    </label>
+  `).join('');
+
+  // Default-select the first candidate (the engine's best guess)
+  _bmSelectedHeaderRow = candidates[0].row_idx;
+  rowsEl.querySelectorAll('input[name="bm-header"]').forEach(r => {
+    r.addEventListener('change', () => {
+      _bmSelectedHeaderRow = parseInt(r.value, 10);
+      _renderBidMappingFields(null);  // refresh dropdowns + auto-suggest
+    });
+  });
+
+  _renderBidMappingFields(null);
+
+  document.getElementById('bm-auto-suggest').onclick = () => _renderBidMappingFields('auto');
+  document.getElementById('bm-confirm').onclick = () => _confirmBidMapping();
+}
+
+async function _renderBidMappingFields(autoMode) {
+  const fieldsEl = document.getElementById('bm-fields');
+  const headerRow = (_bmInspection.candidate_rows || []).find(c => c.row_idx === _bmSelectedHeaderRow);
+  if (!headerRow) {
+    fieldsEl.innerHTML = '<div style="color:var(--ink-2);font-size:12px;">Select a header row above.</div>';
+    return;
+  }
+  const headers = headerRow.headers;
+
+  // Get auto-suggest mapping from Python
+  let suggested = {};
+  try {
+    _py.globals.set('_bm_headers', headers);
+    const out = await _py.runPythonAsync(`
+import json
+from app_engine import auto_suggest_bid_mapping
+json.dumps(auto_suggest_bid_mapping(_bm_headers.to_py()))
+`);
+    suggested = JSON.parse(out);
+  } catch (e) {
+    console.warn('auto-suggest failed', e);
+  }
+
+  let html = `
+    <div style="font-weight:600;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;">Field</div>
+    <div style="font-weight:600;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;">Map to column</div>
+    <div style="font-weight:600;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;">Hint</div>
+  `;
+  for (const f of BID_CANONICAL_FIELDS) {
+    const sug = (autoMode === 'auto' || autoMode === null) ? suggested[f.key] : undefined;
+    html += `
+      <div style="color:var(--ink-0);${f.required ? 'font-weight:600;' : ''}">
+        ${_escapeHtml(f.label)}${f.required ? ' <span style="color:var(--red);">*</span>' : ''}
+      </div>
+      <select data-bm-field="${f.key}" style="background:var(--bg-2);border:1px solid var(--line);color:var(--ink-0);padding:6px 8px;border-radius:3px;font-family:var(--mono);font-size:12px;">
+        <option value="">— skip —</option>
+        ${headers.map((h, i) => `<option value="${i}" ${sug === i ? 'selected' : ''}>${_escapeHtml(h || `(col ${i+1} blank)`)} <span style="color:var(--ink-2);">[col ${i+1}]</span></option>`).join('')}
+      </select>
+      <div style="color:var(--ink-2);font-size:11px;">${_escapeHtml(f.hint || '')}</div>
+    `;
+  }
+  fieldsEl.innerHTML = html;
+}
+
+async function _confirmBidMapping() {
+  const fieldsEl = document.getElementById('bm-fields');
+  const colMap = {};
+  for (const sel of fieldsEl.querySelectorAll('select[data-bm-field]')) {
+    const v = sel.value;
+    if (v !== '') {
+      colMap[sel.getAttribute('data-bm-field')] = parseInt(v, 10);
+    }
+  }
+  // Validation
+  const missing = BID_CANONICAL_FIELDS.filter(f => f.required && !(f.key in colMap));
+  if (missing.length) {
+    alert('Required fields not mapped: ' + missing.map(f => f.label).join(', '));
+    return;
+  }
+
+  document.getElementById('bm-confirm').disabled = true;
+  document.getElementById('bm-confirm').textContent = 'Parsing…';
+  try {
+    await _applyBidMapping(_bmCurrentBytes, _bmCurrentSupplier, _bmSelectedHeaderRow, colMap, null);
+
+    // Save template if checkbox is on
+    if (document.getElementById('bm-save-template').checked) {
+      const templates = _listBidMappingTemplates();
+      templates[_bidTemplateKey(_bmCurrentSupplier)] = {
+        supplier_name: _bmCurrentSupplier,
+        headerRow: _bmSelectedHeaderRow,
+        colMap: colMap,
+        savedAt: new Date().toISOString(),
+      };
+      _writeBidMappingTemplates(templates);
+    }
+    document.getElementById('bid-map-modal').style.display = 'none';
+  } catch (err) {
+    console.error('[bid mapping] confirm failed', err);
+    alert('Failed to parse with mapping: ' + (err.message || err));
+  } finally {
+    document.getElementById('bm-confirm').disabled = false;
+    document.getElementById('bm-confirm').textContent = 'Parse with this mapping';
   }
 }
 
