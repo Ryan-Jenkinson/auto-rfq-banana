@@ -64,7 +64,47 @@ The recommendation engine already surfaces this as ACCEPT items per-supplier:
 
 The carve-out award strategy in the comparison matrix is the right operationalization of this.
 
-### Bug fixes shipped on this branch
+## UOM Resolution Queue workflow (new on this branch)
+
+The dashboard now has a **📐 UOM Resolution Queue** button next to the savings tiers. Click it to open a panel where you can resolve UOM mismatches manually — analyst types in the conversion factor based on offline catalog/stockroom lookups, items move from STRICT-excluded to NORMALIZED savings as you save them.
+
+### Workflow
+
+1. Run analysis as normal — the savings panel shows RAW / CLEAN / STRICT totals
+2. Click **📐 UOM Resolution Queue** in the savings panel header
+3. Panel slides open showing every (item, supplier) pair with a UOM mismatch, sorted by 24-month spend descending
+4. For each item:
+   - **Look up McMaster catalog or stockroom** (this is offline analyst work — the app has no AI in production)
+   - Enter the conversion factor in `1 [hist_uom] = N [bid_uom]` form
+   - Pick direction: `auto-detect` (let the app pick whichever makes more sense), `multiply`, or `divide`
+   - Click **Save** → annotation persists, item leaves the queue, NORMALIZED savings re-compute
+   - Or **Skip** if you don't want to deal with it now (won't show again until you clear it)
+   - Or **Needs review** if you want a tracked TODO that stays in the queue
+5. Annotations persist with the JSON save file — your colleague gets your resolution work when they open your shared backup
+
+### Auto-suggestions
+
+For some Fastenal notes, the app extracts a suggested factor:
+- **HIGH confidence ✓** (green chip): `Pack of N`, `(N Pack)`, `(N/Pack)`, `Bag/Box/Carton of N` — explicit count, factor is reliable
+- **LOW confidence ?** (amber chip): `(N' Spool)`, `(N' Roll)`, `(N' Reel)` — N is the supplier's spool length but might NOT be the conversion factor (depends on McMaster's spool size, which we don't know from the notes alone)
+- **Unit-only**: `(Per Inch / Per Foot / Per Each)` — tells us the supplier's unit but factor must come from analyst
+
+The factor field auto-fills with the suggested value but the analyst still has to click **Save** to commit. **Don't blindly accept low-confidence suggestions** — verify against the actual catalog first.
+
+### Direction handling
+
+- **multiply** — supplier quoted in smaller units than McMaster. Adjusted bid = bid_price × factor. Use when McMaster sells in PK and Fastenal quoted per EA.
+- **divide** — supplier quoted in larger units. Adjusted bid = bid_price ÷ factor. Use when McMaster sells per EA and Fastenal quoted per case-of-N.
+- **auto-detect** — at apply-time, the app computes both candidates and picks whichever puts the adjusted bid closer to McMaster's anchor. Useful when you're not sure of direction; risky for cases where both directions are wildly off (the app picks "less wrong" but still wrong).
+
+### What gets saved
+
+Annotations live in `_STATE["uom_annotations"]` keyed by `<item_key>|<supplier>`. They ride through `serialize_state()` / `restore_state()` so:
+- Your in-progress work survives 60-second autosave + browser refresh
+- A manual save file you email to your director includes all your resolutions
+- They can re-open the same file later and you'll see what you'd done before
+
+## Bug fixes shipped on this branch
 
 1. **`_matches_no_bid` word-boundary fix** — `"na"` was a no-bid marker that matched `"fasteNAl"` via substring search. Result: every Fastenal note containing the word "Fastenal" got mis-classified as NO_BID. Fixed with regex word boundaries on the short markers (`na`, `tbd`, `n/a`). Multi-word markers stay as substring (no risk of accidental match). Caught 1,896 priced bids vs 1,815 before the fix (+81 correctly recovered).
 

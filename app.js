@@ -1510,12 +1510,28 @@ function _renderCleanSavingsPanel(clean) {
     `;
   }
 
+  // Count items still needing resolution for the toggle-button label
+  const totalRecovered = (clean.by_supplier || []).reduce((a, s) => a + (s.n_resolved_by_annotation || 0), 0);
+  const hasNormalized = (clean.totals || {}).normalized != null && Math.abs(clean.totals.normalized - clean.totals.strict) > 0.01;
+
   const html = `
     <div id="clean-savings-panel" style="margin-top:18px;padding:18px 20px;background:rgba(138,124,255,0.04);border:1px solid var(--line);border-radius:6px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:10px;">
+        <div style="font-size:13px;color:var(--ink-2);">
+          Savings tiers · totals:
+          <span style="font-family:var(--mono);color:${colorOf(t.raw)};margin:0 6px;">RAW ${fmt$(t.raw)}</span>·
+          <span style="font-family:var(--mono);color:${colorOf(t.clean)};margin:0 6px;">CLEAN ${fmt$(t.clean)}</span>·
+          <span style="font-family:var(--mono);color:${colorOf(t.strict)};margin:0 6px;font-weight:700;">STRICT ${fmt$(t.strict)}</span>
+          ${hasNormalized ? `· <span style="font-family:var(--mono);color:${colorOf(t.normalized)};margin:0 6px;font-weight:700;">NORMALIZED ${fmt$(t.normalized)}</span> <span style="color:var(--ink-2);font-size:11px;">(${totalRecovered} items recovered)</span>` : ''}
+        </div>
+        <button class="btn" id="uom-queue-open-btn" style="background:var(--warn);color:#000;font-weight:600;border:none;padding:8px 14px;font-size:12px;cursor:pointer;border-radius:4px;">
+          📐 UOM Resolution Queue
+        </button>
+      </div>
       <details>
         <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--ink-0);user-select:none;">
-          Savings comparison — RAW vs CLEAN vs STRICT
-          <span style="color:var(--ink-2);font-size:11px;font-weight:400;margin-left:8px;">(click to expand · the STRICT figure is the most defensible for director conversations)</span>
+          Savings comparison — full per-supplier breakdown
+          <span style="color:var(--ink-2);font-size:11px;font-weight:400;margin-left:8px;">(click to expand · STRICT is the most defensible figure; NORMALIZED includes UOM-resolved items)</span>
         </summary>
         <div style="margin-top:14px;font-size:12px;color:var(--ink-2);line-height:1.5;">
           <strong style="color:var(--ink-0);">RAW</strong> = every priced bid (current behavior, polluted by UOM mismatches).
@@ -1550,6 +1566,247 @@ function _renderCleanSavingsPanel(clean) {
     </div>
   `;
   wrap.insertAdjacentHTML('afterend', html);
+  // Wire up the UOM queue button
+  const openBtn = document.getElementById('uom-queue-open-btn');
+  if (openBtn) openBtn.addEventListener('click', _renderUomResolutionPanel);
+}
+
+
+// ============================================================================
+// UOM Resolution Queue panel
+// ----------------------------------------------------------------------------
+// Renders an interactive table of items where the bid UOM doesn't match the
+// history UOM. Per-row inline editor lets the analyst enter a conversion
+// factor + direction, save / skip / mark needs-review. Saved annotations
+// trigger a re-render of the clean-savings panel so the NORMALIZED total
+// updates live.
+//
+// Built on the demo-existing-rfq branch to support the Fastenal+Grainger+MSC
+// real-bid demo where UOM mismatches dominate the discrepancy bucket. The
+// underlying Python helpers (set_uom_annotation, list_items_needing_uom_resolution,
+// _extract_pack_size_from_notes, etc.) work without AI and are safe for the
+// live deployed app — analysts type in factors based on offline catalog
+// lookups.
+// ============================================================================
+
+async function _renderUomResolutionPanel() {
+  const panel = document.getElementById('uom-resolution-panel');
+  if (!panel) return;
+  panel.style.display = 'block';
+  panel.innerHTML = '<div style="padding:24px;color:var(--ink-2);font-family:var(--mono);font-size:12px;">Loading UOM resolution queue…</div>';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  const out = await _py.runPythonAsync(`
+import json
+from app_engine import list_items_needing_uom_resolution, get_uom_resolution_summary
+result = {
+  "queue": list_items_needing_uom_resolution(),
+  "summary": get_uom_resolution_summary(),
+}
+json.dumps(result, default=str)
+`);
+  const data = JSON.parse(out);
+  _renderUomQueueTable(data, panel);
+}
+
+function _renderUomQueueTable(data, panel) {
+  const queue = data.queue || [];
+  const sm = data.summary || {};
+  _uomQueueCache = queue;  // cache for _findQueueEntryFromRow lookups
+  const fmt$ = (n) => n == null ? '—' : '$' + (n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  let rowsHtml = '';
+  for (const q of queue) {
+    const auto = q.auto_suggestion;
+    const autoFactor = auto && auto.factor ? auto.factor : '';
+    const autoConf = auto ? auto.confidence : '';
+    const autoChip = auto ? (
+      autoConf === 'high'
+        ? `<span style="display:inline-block;padding:2px 6px;background:rgba(45,212,168,0.15);color:var(--green);border-radius:3px;font-size:10px;font-weight:600;margin-left:6px;">AUTO ✓ ${auto.factor || '?'}</span>`
+        : `<span style="display:inline-block;padding:2px 6px;background:rgba(255,183,51,0.15);color:var(--warn);border-radius:3px;font-size:10px;font-weight:600;margin-left:6px;" title="Pattern matched but factor uncertain — confirm before applying">AUTO ? ${auto.raw_match}</span>`
+    ) : '';
+    const safeKey = (q.item_key + '|' + q.supplier).replace(/[^a-zA-Z0-9_-]/g, '_');
+    rowsHtml += `
+      <tr data-row-key="${safeKey}" style="border-bottom:1px solid var(--line);">
+        <td style="padding:8px 10px;vertical-align:top;">
+          <div style="font-family:var(--mono);font-size:12px;color:var(--ink-0);font-weight:600;">${q.item_num || '—'}</div>
+          <div style="color:var(--ink-2);font-size:11px;margin-top:2px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${(q.description || '').replace(/"/g,'&quot;')}">${(q.description || '').slice(0, 60)}</div>
+        </td>
+        <td style="padding:8px 10px;vertical-align:top;font-family:var(--mono);font-size:12px;">${q.supplier}</td>
+        <td style="padding:8px 10px;vertical-align:top;font-family:var(--mono);font-size:11px;text-align:center;">
+          <span style="color:var(--ink-1);">${q.hist_uom || '—'}</span>
+          <span style="color:var(--ink-2);">≠</span>
+          <span style="color:var(--warn);">${q.bid_uom || '—'}</span>
+        </td>
+        <td style="padding:8px 10px;vertical-align:top;font-family:var(--mono);font-size:12px;text-align:right;">
+          <div style="color:var(--ink-1);">hist ${fmt$(q.hist_price)}</div>
+          <div style="color:var(--warn);font-size:11px;margin-top:2px;">bid ${fmt$(q.bid_price)}</div>
+        </td>
+        <td style="padding:8px 10px;vertical-align:top;font-family:var(--mono);font-size:12px;text-align:right;">
+          <div style="color:var(--ink-1);">${(q.qty_24mo || 0).toLocaleString()}</div>
+          <div style="color:var(--ink-2);font-size:11px;margin-top:2px;">${fmt$(q.spend_24mo)}</div>
+        </td>
+        <td style="padding:8px 10px;vertical-align:top;max-width:240px;font-size:11px;color:var(--ink-2);">
+          ${(q.notes || '').slice(0, 120)}${autoChip}
+        </td>
+        <td style="padding:8px 10px;vertical-align:top;">
+          <div style="display:flex;flex-direction:column;gap:4px;">
+            <div style="display:flex;gap:4px;align-items:center;">
+              <span style="color:var(--ink-2);font-size:10px;">1 ${q.hist_uom || 'hist'} =</span>
+              <input type="number" step="any" min="0" placeholder="${autoFactor || 'N'}" data-factor-input="${safeKey}" value="${autoFactor || ''}" style="width:70px;padding:4px 6px;background:var(--bg-1);color:var(--ink-0);border:1px solid var(--line);border-radius:3px;font-family:var(--mono);font-size:12px;">
+              <span style="color:var(--ink-2);font-size:10px;">${q.bid_uom || 'bid'}</span>
+            </div>
+            <select data-direction-select="${safeKey}" style="padding:3px 5px;background:var(--bg-1);color:var(--ink-1);border:1px solid var(--line);border-radius:3px;font-size:11px;font-family:var(--mono);">
+              <option value="auto_detect">auto-detect direction</option>
+              <option value="multiply">multiply (supplier in smaller units)</option>
+              <option value="divide">divide (supplier in larger units)</option>
+            </select>
+          </div>
+        </td>
+        <td style="padding:8px 10px;vertical-align:top;">
+          <div style="display:flex;flex-direction:column;gap:4px;">
+            <button class="btn" data-uom-save="${safeKey}" style="background:var(--green);color:#000;border:none;padding:5px 10px;font-size:11px;font-weight:600;cursor:pointer;border-radius:3px;">Save</button>
+            <button class="btn ghost" data-uom-skip="${safeKey}" style="padding:4px 10px;font-size:11px;cursor:pointer;">Skip</button>
+            <button class="btn ghost" data-uom-needs="${safeKey}" style="padding:4px 10px;font-size:11px;color:var(--warn);cursor:pointer;">Needs review</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }
+
+  panel.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:14px;">
+      <div>
+        <div style="font-size:14px;font-weight:600;color:var(--ink-0);">📐 UOM Resolution Queue</div>
+        <div style="font-size:11px;color:var(--ink-2);margin-top:4px;">
+          Items where the bid's unit-of-measure differs from your history. Look up the McMaster catalog (or stockroom) to find the conversion factor, type it in below, hit Save. Item moves out of the queue and into the NORMALIZED savings tier. State persists with the save file — your colleague sees your resolutions when they open your shared backup.
+        </div>
+      </div>
+      <button class="btn ghost" id="uom-queue-close-btn" style="padding:6px 12px;font-size:12px;">✕ Close panel</button>
+    </div>
+    <div style="display:flex;gap:18px;align-items:center;margin-bottom:14px;padding:10px 14px;background:rgba(0,0,0,0.15);border-radius:4px;font-family:var(--mono);font-size:12px;color:var(--ink-1);">
+      <span><strong style="color:var(--green);">${sm.n_resolved || 0}</strong> resolved</span>
+      <span><strong style="color:var(--ink-2);">${sm.n_skipped || 0}</strong> skipped</span>
+      <span><strong style="color:var(--warn);">${sm.n_needs_review || 0}</strong> needs review</span>
+      <span style="margin-left:auto;"><strong style="color:var(--ink-0);">${sm.n_remaining || 0}</strong> remaining in queue</span>
+      <span><strong style="color:var(--accent);">${sm.n_auto_resolvable || 0}</strong> have auto-suggestion</span>
+    </div>
+    ${queue.length === 0 ? `
+      <div style="padding:32px;text-align:center;color:var(--ink-2);font-size:13px;">
+        No items need UOM resolution right now. Either everything has been resolved/skipped, or your bid + history files don't have any UOM mismatches.
+      </div>
+    ` : `
+      <div style="max-height:600px;overflow-y:auto;border:1px solid var(--line);border-radius:4px;">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead style="position:sticky;top:0;background:var(--bg-1);border-bottom:2px solid var(--line);z-index:1;">
+            <tr style="color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;">
+              <th style="padding:8px 10px;text-align:left;">Item</th>
+              <th style="padding:8px 10px;text-align:left;">Supplier</th>
+              <th style="padding:8px 10px;text-align:center;">UOMs</th>
+              <th style="padding:8px 10px;text-align:right;">Prices</th>
+              <th style="padding:8px 10px;text-align:right;">24mo Qty / Spend</th>
+              <th style="padding:8px 10px;text-align:left;">Notes</th>
+              <th style="padding:8px 10px;text-align:left;">Conversion</th>
+              <th style="padding:8px 10px;text-align:left;">Action</th>
+            </tr>
+          </thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+    `}
+  `;
+
+  // Wire close button
+  document.getElementById('uom-queue-close-btn')?.addEventListener('click', () => {
+    panel.style.display = 'none';
+  });
+
+  // Wire per-row buttons
+  for (const btn of panel.querySelectorAll('[data-uom-save]')) {
+    btn.addEventListener('click', () => _saveUomAnnotation(btn.dataset.uomSave, 'resolved'));
+  }
+  for (const btn of panel.querySelectorAll('[data-uom-skip]')) {
+    btn.addEventListener('click', () => _saveUomAnnotation(btn.dataset.uomSkip, 'skipped'));
+  }
+  for (const btn of panel.querySelectorAll('[data-uom-needs]')) {
+    btn.addEventListener('click', () => _saveUomAnnotation(btn.dataset.uomNeeds, 'needs_review'));
+  }
+}
+
+async function _saveUomAnnotation(rowKey, status) {
+  // Find the input + select for this row
+  const factorInput = document.querySelector(`[data-factor-input="${rowKey}"]`);
+  const dirSelect = document.querySelector(`[data-direction-select="${rowKey}"]`);
+  if (!factorInput) return;
+  const row = factorInput.closest('tr');
+  if (!row) return;
+  const queueEntry = _findQueueEntryFromRow(row);
+  if (!queueEntry) {
+    console.warn('Could not resolve queue entry from row', rowKey);
+    return;
+  }
+  const rawFactor = factorInput.value;
+  const factor = (status === 'resolved' && rawFactor) ? parseFloat(rawFactor) : null;
+  if (status === 'resolved' && (!factor || factor <= 0)) {
+    alert('Enter a positive conversion factor before saving as resolved. Or use Skip / Needs review.');
+    return;
+  }
+  const direction = dirSelect ? dirSelect.value : 'auto_detect';
+
+  _py.globals.set('_uom_args', {
+    item_key: queueEntry.item_key,
+    supplier: queueEntry.supplier,
+    factor: factor,
+    direction: direction,
+    hist_uom: queueEntry.hist_uom || '',
+    bid_uom: queueEntry.bid_uom || '',
+    note: '',
+    status: status,
+    set_by: '',
+  });
+  await _py.runPythonAsync(`
+from app_engine import set_uom_annotation
+a = _uom_args.to_py()
+set_uom_annotation(
+  item_key=a['item_key'], supplier=a['supplier'],
+  factor=a['factor'], direction=a['direction'],
+  hist_uom=a['hist_uom'], bid_uom=a['bid_uom'],
+  note=a['note'], status=a['status'], set_by=a['set_by'],
+)
+`);
+  // Visual: fade the row out
+  row.style.transition = 'opacity 250ms';
+  row.style.opacity = '0.3';
+  // Re-render the panel + the savings panel after a beat
+  setTimeout(async () => {
+    await _renderUomResolutionPanel();
+    // Also recompute + re-render the clean savings panel above
+    if (window._lastClean) {  // best-effort cache
+      // Easiest: trigger a full re-fetch via the runComparisonAndScenarios pathway
+    }
+    // The cleanest re-render is to trigger _runComparisonAndScenarios — but that's
+    // expensive. For now, just re-fetch the clean_savings and re-render the panel.
+    const out = await _py.runPythonAsync(`
+import json; from app_engine import compute_clean_savings_summary
+json.dumps(compute_clean_savings_summary(), default=str)
+`);
+    _renderCleanSavingsPanel(JSON.parse(out));
+  }, 280);
+}
+
+// In-memory cache of the last queue fetch — used to look up item_key + supplier
+// from a row's data-row-key attribute when the user clicks Save.
+let _uomQueueCache = [];
+function _findQueueEntryFromRow(row) {
+  // The row carries data-row-key="<item_key>|<supplier>" with non-alphanum
+  // chars replaced by underscore. Fall back to scanning the cache.
+  const safeKey = row.getAttribute('data-row-key');
+  if (!safeKey) return null;
+  for (const q of _uomQueueCache) {
+    const candidate = (q.item_key + '|' + q.supplier).replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (candidate === safeKey) return q;
+  }
+  return null;
 }
 
 // ----- Award scenarios block -----
