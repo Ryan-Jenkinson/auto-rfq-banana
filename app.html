@@ -190,9 +190,12 @@
 
     <div id="charts-stage" class="charts-stage"></div>
 
+    <div id="exclusion-log-banner" style="display:none;margin-top:14px;padding:12px 16px;background:rgba(86,210,255,0.06);border:1px solid var(--cyan);border-radius:6px;font-family:var(--ui);font-size:13px;color:var(--ink-1);"></div>
+
     <div class="actions">
       <button class="btn ghost" id="back-to-2" title="Back to column mapping — useful if you need to re-map a column and re-extract.">← Back</button>
       <button class="btn ghost" id="export-rfq-list" title="Export the FULL candidate list as an internal-audience xlsx (includes historical paid prices, scoring, demand flags). Don't send to suppliers — supplier-bound files are generated separately and exclude internal-only fields.">⬇ Export candidate list (xlsx)</button>
+      <button class="btn ghost" id="export-exclusion-log" title="Export every per-item line you've unticked as a 'data quality event log' xlsx. Cross-app schema (app_source / event_type / item_num / line snapshot / before-baseline) so it can be concatenated with the supplier-pricing and tariff-impact equivalents into one master audit packet. Internal-only — never forward.">📋 Export exclusion log…</button>
       <button class="btn ghost" id="gen-outbound-rfq" title="Build per-supplier outbound RFQ workbooks for the items currently ticked. Each is a 5-tab xlsx with locked cells, dropdown validation, hidden round-trip keys, and NO internal-only fields (no historical paid prices). One file per supplier — what actually goes to the bidder.">📤 Generate outbound RFQ files…</button>
       <button class="btn primary" id="to-bids" title="Move to step 4 — drop returned bid xlsx files from each supplier, see the comparison matrix, run consolidation analysis, save award scenarios, and generate award letters.">Compare supplier bids →</button>
     </div>

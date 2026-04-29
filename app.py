@@ -372,6 +372,14 @@ _STATE: dict = {
     # scenario the user runs. A lock with no matching priced bid is
     # remembered but does not force an award (recorded as a warning).
     "item_locks": {},
+    # Excluded-line review log — every time the analyst unticks a
+    # suspicious priced line in the per-item modal, an entry is appended
+    # with the line's full data PLUS the pre-exclusion median + avg of
+    # the OTHER priced lines for that item, so a downstream "show me what
+    # I removed and why" review (or auditor request) can reconstruct the
+    # decision. Persisted via serialize_state / restore_state.
+    # Schema per entry: see _append_exclusion_log_entries.
+    "exclusion_log": [],
 }
 
 
@@ -1530,10 +1538,23 @@ def set_item_exclusions(item_num: str, excluded_indices) -> dict:
         cleaned.append(iv)
     cleaned.sort()
     excl_map = _STATE.setdefault("item_exclusions", {})
+    prior = list(excl_map.get(item_num, []))
+    prior_set = set(prior)
+    cleaned_set = set(cleaned)
+    newly_excluded = sorted(cleaned_set - prior_set)
+    newly_unexcluded = sorted(prior_set - cleaned_set)
     if cleaned:
         excl_map[item_num] = cleaned
     else:
         excl_map.pop(item_num, None)
+
+    # Append to the exclusion review log BEFORE we recompute aggregates —
+    # the "before" metrics (median + avg of the other priced lines) need
+    # the pre-change snapshot to be meaningful.
+    if newly_excluded:
+        _append_exclusion_log_entries(item_num, newly_excluded, prior_set)
+    if newly_unexcluded:
+        _append_unexclusion_log_entries(item_num, newly_unexcluded)
 
     # Propagate to the canonical item aggregates + the file-level KPIs.
     updated_item = _recompute_item_aggregates_for(item_num)
@@ -1552,6 +1573,283 @@ def set_item_exclusions(item_num: str, excluded_indices) -> dict:
         "item": updated_item,
         "kpis": rebuilt_kpis,
     }
+
+
+def _append_exclusion_log_entries(item_num: str, newly_excluded_indices: list,
+                                   prior_excluded_set: set) -> None:
+    """Snapshot each newly-excluded line + the pre-exclusion baseline.
+
+    Called from ``set_item_exclusions`` BEFORE the aggregates are recomputed
+    so the "before" median + avg are computed from the line set as it
+    looked just before this exclusion was applied. Entry shape is shared
+    across the auto-rfq-banana / supplier-pricing / tariff-impact data-
+    quality logs — a downstream tool can `concat` all three apps' logs
+    into one audit packet for review (cross-app master record).
+
+    Per-entry fields:
+        timestamp        ISO datetime when the analyst unticked it
+        app_source       "auto-rfq-banana"  (constant — for cross-app concat)
+        event_type       "exclusion"        (constant; "unexclusion" path
+                                              is in _append_unexclusion_log_entries)
+        rfq_id           the in-flight RFQ session id (the save manager's
+                          stable per-session id), for grouping
+        supplier_name    incumbent supplier on this multi-year export
+        item_num         the display item number
+        description, mfg_name, mfg_pn, uom — full item context
+        line_idx         0-based position in the ASCENDING-date-sorted
+                          po_lines for the item
+        line_date        the excluded order date
+        line_qty         the excluded order qty
+        line_unit_price  the excluded $/ea (the suspicious one)
+        line_total       qty × unit_price for that line
+        line_po          PO# carrying this line
+        line_uom         per-line UOM (may differ from item-canonical UOM)
+        median_before    median of OTHER priced lines for this item BEFORE
+                          this exclusion was applied (incl. older exclusions)
+        avg_before       same but mean
+        n_other_lines_before  count of those other priced lines
+        ratio_to_median  unit_price / median_before (1.0 = on the line;
+                          values >1 = above; values <1 = below)
+        pct_diff_median  (ratio - 1) * 100, signed
+        pct_diff_avg     same vs avg_before, signed
+        notes            free-form (default empty; UI may expand later
+                          to capture analyst rationale)
+    """
+    log = _STATE.setdefault("exclusion_log", [])
+    items = _STATE.get("items", []) or []
+    item = next((it for it in items if it.get("item_num") == item_num), None)
+    description = (item.get("description") if item else "") or ""
+    mfg_name    = (item.get("mfg_name")    if item else "") or ""
+    mfg_pn      = (item.get("mfg_pn")      if item else "") or ""
+    item_uom    = (item.get("uom")         if item else "") or ""
+
+    key = item.get("key") if item else norm_pn(item_num)
+    raw_lines = _STATE.get("po_lines_by_key", {}).get(key, [])
+    if not raw_lines:
+        return
+    sorted_lines = sorted(raw_lines, key=lambda r: r[0] or "")
+
+    # "Before" baseline = OTHER priced lines that weren't already excluded
+    # ahead of this batch. Excludes the lines being newly excluded so the
+    # baseline isn't polluted by them.
+    other_priced = []
+    for idx, ln in enumerate(sorted_lines):
+        if idx in prior_excluded_set:
+            continue
+        if idx in newly_excluded_indices:
+            continue
+        if ln[2] is None:  # unit_price
+            continue
+        other_priced.append(float(ln[2]))
+    if other_priced:
+        median_before = _median(other_priced)
+        avg_before = sum(other_priced) / len(other_priced)
+    else:
+        median_before = None
+        avg_before = None
+
+    rfq_id = _STATE.get("rfq_id") or ""
+    supplier_name = _STATE.get("supplier_name", "") or ""
+    ts = datetime.now().isoformat()
+
+    for idx in newly_excluded_indices:
+        if idx >= len(sorted_lines):
+            continue
+        date_iso, qty, unit_price, line_total, po, uom = sorted_lines[idx]
+        if unit_price is None:
+            continue
+        ratio = (unit_price / median_before) if (median_before and median_before > 0) else None
+        pct_med = ((ratio - 1.0) * 100.0) if ratio is not None else None
+        pct_avg = (((unit_price / avg_before) - 1.0) * 100.0) if (avg_before and avg_before > 0) else None
+        log.append({
+            "timestamp": ts,
+            "app_source": "auto-rfq-banana",
+            "event_type": "exclusion",
+            "rfq_id": rfq_id,
+            "supplier_name": supplier_name,
+            "item_num": item_num,
+            "description": description,
+            "mfg_name": mfg_name,
+            "mfg_pn": mfg_pn,
+            "uom": item_uom,
+            "line_idx": idx,
+            "line_date": date_iso or "",
+            "line_qty": qty,
+            "line_unit_price": float(unit_price),
+            "line_total": float(line_total) if line_total is not None else None,
+            "line_po": po or "",
+            "line_uom": uom or "",
+            "median_before": median_before,
+            "avg_before": avg_before,
+            "n_other_lines_before": len(other_priced),
+            "ratio_to_median": ratio,
+            "pct_diff_median": pct_med,
+            "pct_diff_avg": pct_avg,
+            "notes": "",
+        })
+
+
+def _append_unexclusion_log_entries(item_num: str, newly_unexcluded_indices: list) -> None:
+    """Mirror of _append_exclusion_log_entries for re-included lines.
+
+    Records that the analyst changed their mind about a previously-excluded
+    line. Same schema as exclusion entries (so downstream filters can group
+    by event_type) but only fills the line snapshot — "before" baselines
+    aren't meaningful for an unexclusion (the line is going BACK into the
+    set, not coming OUT of it).
+    """
+    log = _STATE.setdefault("exclusion_log", [])
+    items = _STATE.get("items", []) or []
+    item = next((it for it in items if it.get("item_num") == item_num), None)
+    description = (item.get("description") if item else "") or ""
+    mfg_name    = (item.get("mfg_name")    if item else "") or ""
+    mfg_pn      = (item.get("mfg_pn")      if item else "") or ""
+    item_uom    = (item.get("uom")         if item else "") or ""
+    key = item.get("key") if item else norm_pn(item_num)
+    raw_lines = _STATE.get("po_lines_by_key", {}).get(key, [])
+    if not raw_lines:
+        return
+    sorted_lines = sorted(raw_lines, key=lambda r: r[0] or "")
+    rfq_id = _STATE.get("rfq_id") or ""
+    supplier_name = _STATE.get("supplier_name", "") or ""
+    ts = datetime.now().isoformat()
+    for idx in newly_unexcluded_indices:
+        if idx >= len(sorted_lines):
+            continue
+        date_iso, qty, unit_price, line_total, po, uom = sorted_lines[idx]
+        log.append({
+            "timestamp": ts,
+            "app_source": "auto-rfq-banana",
+            "event_type": "unexclusion",
+            "rfq_id": rfq_id,
+            "supplier_name": supplier_name,
+            "item_num": item_num,
+            "description": description,
+            "mfg_name": mfg_name,
+            "mfg_pn": mfg_pn,
+            "uom": item_uom,
+            "line_idx": idx,
+            "line_date": date_iso or "",
+            "line_qty": qty,
+            "line_unit_price": float(unit_price) if unit_price is not None else None,
+            "line_total": float(line_total) if line_total is not None else None,
+            "line_po": po or "",
+            "line_uom": uom or "",
+            "median_before": None,
+            "avg_before": None,
+            "n_other_lines_before": None,
+            "ratio_to_median": None,
+            "pct_diff_median": None,
+            "pct_diff_avg": None,
+            "notes": "re-included after prior exclusion",
+        })
+
+
+def list_exclusion_log() -> list:
+    """Return the exclusion review log (newest entries first)."""
+    return list(reversed(_STATE.get("exclusion_log", []) or []))
+
+
+def get_exclusion_log_summary() -> dict:
+    """Headline counts for the dashboard banner — drives the 'X excluded
+    lines this session — review/export?' reminder shown above the
+    Generate-outbound and Compare-bids actions."""
+    log = _STATE.get("exclusion_log", []) or []
+    n_excl = sum(1 for e in log if e.get("event_type") == "exclusion")
+    n_unexcl = sum(1 for e in log if e.get("event_type") == "unexclusion")
+    distinct_items = sorted({e.get("item_num") for e in log if e.get("event_type") == "exclusion" and e.get("item_num")})
+    total_dollars_removed = 0.0
+    for e in log:
+        if e.get("event_type") != "exclusion":
+            continue
+        lt = e.get("line_total")
+        if lt is not None:
+            total_dollars_removed += float(lt)
+    return {
+        "n_exclusions": n_excl,
+        "n_unexclusions": n_unexcl,
+        "n_distinct_items": len(distinct_items),
+        "total_dollars_removed": total_dollars_removed,
+    }
+
+
+def gen_exclusion_log_xlsx() -> bytes:
+    """Build a master-record xlsx of every exclusion / unexclusion event.
+
+    Format is intentionally cross-app: an ``app_source`` column tags every
+    row so this xlsx can be `pd.concat`'d with the equivalent log from
+    supplier-pricing and tariff-impact (when those apps grow the same
+    feature) to produce one audit packet for a colleague / auditor to
+    review across all the data-quality calls made this period.
+
+    Banner row 1: 'INTERNAL — DATA QUALITY EVENT LOG'.
+    Header row 2: every field documented in _append_exclusion_log_entries.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Exclusion Log"
+
+    # Banner — same convention as internal-only summary xlsx
+    ws.append(["INTERNAL — DATA QUALITY EVENT LOG · NEVER FORWARD"])
+    ws.append([
+        f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"App: auto-rfq-banana",
+        f"Supplier: {_STATE.get('supplier_name', '')}",
+        f"Anchor date: {_STATE.get('data_anchor_date', '')}",
+    ])
+    ws.append([])  # spacer
+
+    headers = [
+        "timestamp", "app_source", "event_type", "rfq_id",
+        "supplier_name", "item_num", "description", "mfg_name", "mfg_pn", "uom",
+        "line_idx", "line_date", "line_qty", "line_unit_price", "line_total",
+        "line_po", "line_uom",
+        "median_before", "avg_before", "n_other_lines_before",
+        "ratio_to_median", "pct_diff_median", "pct_diff_avg",
+        "notes",
+    ]
+    ws.append(headers)
+    header_row_idx = ws.max_row
+    for c in ws[header_row_idx]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="3A2917")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # Banner row formatting
+    ws["A1"].font = Font(bold=True, color="FF6B6B", size=14)
+
+    log = _STATE.get("exclusion_log", []) or []
+    for e in log:
+        ws.append([e.get(k) for k in headers])
+
+    # Number formats on the numeric columns
+    money_cols = {"line_unit_price": "N", "line_total": "O",
+                  "median_before": "R", "avg_before": "S"}
+    for fld, col in money_cols.items():
+        for row in range(header_row_idx + 1, ws.max_row + 1):
+            cell = ws[f"{col}{row}"]
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = '"$"#,##0.0000'
+
+    pct_cols = {"pct_diff_median": "V", "pct_diff_avg": "W"}
+    for fld, col in pct_cols.items():
+        for row in range(header_row_idx + 1, ws.max_row + 1):
+            cell = ws[f"{col}{row}"]
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = '+0.0"%";-0.0"%";0.0"%"'
+
+    autosize(ws, min_w=10, max_w=40)
+    ws.freeze_panes = f"A{header_row_idx + 1}"
+
+    log_event(
+        "exclusion_log_export",
+        f"{len(log)} entries exported to xlsx",
+        related=_STATE.get("supplier_name", ""),
+    )
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 def _recompute_item_aggregates_for(item_num: str) -> dict:
@@ -4354,6 +4652,11 @@ def serialize_state() -> dict:
         # Per-item supplier locks — analyst-confirmed pins of an item's
         # award to a specific supplier. Apply across every scenario.
         "item_locks":           _STATE.get("item_locks", {}),
+        # Excluded-line review log — every per-item modal exclusion +
+        # un-exclusion event with the line snapshot + before-baseline.
+        # Survives save/load AND a JSON colleague-share so the master
+        # audit record stays intact across sessions.
+        "exclusion_log":        _STATE.get("exclusion_log", []),
     }
 
 
@@ -4567,6 +4870,11 @@ def restore_state(payload: dict) -> None:
                 "locked_at": rec.get("locked_at") or "",
             }
         _STATE["item_locks"] = cleaned_locks
+    if "exclusion_log" in payload and isinstance(payload["exclusion_log"], list):
+        # Pass-through with light validation — entries are authored by this
+        # module so we trust shape, but cap to a defensive max so a hand-
+        # edited save can't blow memory.
+        _STATE["exclusion_log"] = list(payload["exclusion_log"])[:10000]
 
 
 # ---------------------------------------------------------------------------

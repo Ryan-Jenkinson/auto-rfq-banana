@@ -518,6 +518,7 @@ json.dumps(_rfq, default=str)
   _renderRfqTable();
   _renderCharts();
   _renderConflictsBanner();
+  _refreshExclusionLogBanner();
   // Boot the save manager — this run is now a recoverable session
   _saveMgr.init();
   _saveMgr.autosaveLocal();
@@ -1086,6 +1087,87 @@ base64.b64encode(_b).decode('ascii')
     btn.disabled = false;
   }
 });
+
+// ----------------------------------------------------------------------------
+// Exclusion log (master data-quality record) — export + reminder banner.
+//
+// Every per-item modal exclusion / unexclusion appends an entry to a
+// Python-side log with the line snapshot + pre-exclusion median + avg of
+// the OTHER priced lines. The xlsx export uses a cross-app-friendly schema
+// (app_source / event_type / item_num / line snapshot / before metrics) so
+// downstream this can be concatenated with the supplier-pricing and
+// tariff-impact data-quality logs into one audit packet.
+// ----------------------------------------------------------------------------
+async function _refreshExclusionLogBanner() {
+  const banner = document.getElementById('exclusion-log-banner');
+  if (!banner) return;
+  if (!_pyAppLoaded || !_py) { banner.style.display = 'none'; return; }
+  try {
+    const out = _py.runPython(`
+import json
+from app_engine import get_exclusion_log_summary
+json.dumps(get_exclusion_log_summary())
+`);
+    const s = JSON.parse(out || '{}');
+    const n = s.n_exclusions || 0;
+    if (!n) { banner.style.display = 'none'; banner.innerHTML = ''; return; }
+    const fmt$ = (v) => '$' + (v || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+    const dollars = s.total_dollars_removed ? ` (${fmt$(s.total_dollars_removed)} of removed line totals)` : '';
+    const reverted = s.n_unexclusions ? ` · ${s.n_unexclusions} re-included` : '';
+    banner.style.display = '';
+    banner.innerHTML = `
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+        <span style="color:var(--cyan);font-weight:700;font-family:var(--mono);letter-spacing:0.06em;">📋 ${n} EXCLUSIONS THIS SESSION</span>
+        <span>across ${s.n_distinct_items || 0} item${(s.n_distinct_items||0) === 1 ? '' : 's'}${dollars}${reverted}.</span>
+        <span style="color:var(--ink-2);font-size:11px;">Reminder: export the log before you close — it's part of the master data-quality record (cross-app concat with supplier-pricing + tariff-impact).</span>
+        <button type="button" class="btn ghost" id="exclusion-log-banner-export" title="Same as the toolbar button — export the cross-app data-quality event log xlsx." style="padding:4px 10px;font-size:11px;margin-left:auto;">📋 Export now</button>
+      </div>
+    `;
+    const b = document.getElementById('exclusion-log-banner-export');
+    if (b) b.addEventListener('click', _exportExclusionLog);
+  } catch (err) {
+    banner.style.display = 'none';
+  }
+}
+
+async function _exportExclusionLog() {
+  if (!_pyAppLoaded || !_py) { alert('Python runtime still booting — wait a moment and try again.'); return; }
+  const btn = $('export-exclusion-log');
+  if (btn) { btn.disabled = true; btn.textContent = 'Building xlsx…'; }
+  try {
+    const out = await _py.runPythonAsync(`
+import base64
+from app_engine import gen_exclusion_log_xlsx, get_exclusion_log_summary
+_b = gen_exclusion_log_xlsx()
+_s = get_exclusion_log_summary()
+import json
+json.dumps({"xlsx_b64": base64.b64encode(_b).decode('ascii'), "summary": _s})
+`);
+    const result = JSON.parse(out);
+    if ((result.summary && result.summary.n_exclusions === 0) && (result.summary.n_unexclusions === 0)) {
+      alert('No exclusions yet — nothing to export. Untick a suspicious row in the per-item modal first.');
+      return;
+    }
+    const bytes = Uint8Array.from(atob(result.xlsx_b64), c => c.charCodeAt(0));
+    const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().slice(0, 10);
+    const stem = (_exportFile && _exportFile.name) ? _exportFile.name.replace(/\.xlsx$/i, '') : 'rfq';
+    a.href = url; a.download = `DataQualityLog_auto-rfq-banana_${stem}_${ts}.xlsx`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  } catch (err) {
+    console.error('[exclusion-log export]', err);
+    alert('Exclusion-log export failed: ' + (err.message || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '📋 Export exclusion log…'; }
+  }
+}
+
+if ($('export-exclusion-log')) {
+  $('export-exclusion-log').addEventListener('click', _exportExclusionLog);
+}
 
 $('export-rfq-list').addEventListener('click', async () => {
   if (!_rfqResult) return;
@@ -3018,6 +3100,7 @@ json.dumps(set_item_exclusions(_item_num_in, list(_excluded_in)), default=str)
     // spend, and active-items counts all update in place.
     if (typeof _renderRfqTable === 'function') _renderRfqTable();
     if (typeof _renderKpis === 'function') _renderKpis();
+    if (typeof _refreshExclusionLogBanner === 'function') _refreshExclusionLogBanner();
     if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) {
       _saveMgr.markDirty();
     }
