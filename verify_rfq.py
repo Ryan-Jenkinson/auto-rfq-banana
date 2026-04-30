@@ -46,7 +46,7 @@ ALIASES = {
     "item":  ["item #", "item number", "andersen item", "item num"],
     "eam":   ["eam part number", "eam part", "eam pn", "eam #"],
     # Supplier's own catalog SKU — fallback dedup key when item / eam are blank
-    # (McMaster cXML orders typically leave the Andersen-side fields empty).
+    # (Supplier-X cXML orders typically leave the buyer-side fields empty).
     # Must NOT match "Manufacturer Part Number" — auto_map runs in dict order
     # so we don't include "manufacturer part" in this list.
     "part":  ["part number", "supplier part", "supplier sku", "supplier auxiliary part number"],
@@ -58,7 +58,7 @@ ALIASES = {
 
 
 def _is_blanky(s):
-    """Treat 'N/A' and friends as effectively blank (McMaster pattern)."""
+    """Treat 'N/A' and friends as effectively blank (Supplier-X pattern)."""
     if s is None:
         return True
     t = str(s).strip().upper()
@@ -68,7 +68,7 @@ def _is_blanky(s):
 def auto_map(headers):
     """Two-pass: exact-equality first, then substring fallback. Without exact-
     first, 'part number' substring-matches 'Supplier Auxiliary Part Number'
-    before reaching the literal 'Part Number' column. McMaster bug 2026-04-26."""
+    before reaching the literal 'Part Number' column. Supplier-X bug 2026-04-26."""
     out = {}
     norm = [(h or "").strip().lower() for h in headers]
 

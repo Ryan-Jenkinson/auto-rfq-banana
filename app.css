@@ -104,7 +104,7 @@ button.btn.big { padding: 12px 22px; font-size: 14px; }
 .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-bottom: 32px; }
 .kpi { background: var(--bg-1); border: 1px solid var(--line); border-radius: 6px; padding: 20px 22px 18px; position: relative; display: flex; flex-direction: column; min-height: 130px; }
 .kpi-label { font-family: var(--ui); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--ink-2); font-weight: 600; margin-bottom: 12px; }
-/* KPI value is the hero. Exact pennies (no rounding/abbreviation) per ryan,
+/* KPI value is the hero. Exact pennies (no rounding/abbreviation) per the analyst,
    so values can be ~13 chars ($X,XXX,XXX.XX). 28px keeps them on one line
    inside a 260px tile. nowrap is a hard belt-and-suspenders. */
 .kpi-value {

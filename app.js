@@ -363,8 +363,8 @@ $('to-bids').addEventListener('click', async () => {
 // Step 2: column mapping (auto-detect via aliases + manual override)
 // ==========================================================================
 const RFQ_FIELDS = [
-  { key: 'item_num',    label: 'Item #',                hint: 'Andersen Item Number — usually populated; blank for some cXML / PunchOut supplier exports (where the supplier\'s own SKU lives in the Part Number column instead)' },
-  { key: 'eam_pn',      label: 'EAM Part Number',       hint: 'Andersen-side fallback if Item # missing' },
+  { key: 'item_num',    label: 'Item #',                hint: 'buyer Item Number — usually populated; blank for some cXML / PunchOut supplier exports (where the supplier\'s own SKU lives in the Part Number column instead)' },
+  { key: 'eam_pn',      label: 'EAM Part Number',       hint: 'buyer-side fallback if Item # missing' },
   { key: 'part_number', label: 'Supplier Part Number',  hint: 'Supplier\'s own catalog SKU (e.g. Red Team\'s "RT-5709A45"). Used as fallback dedup key when Item # / EAM are blank' },
   { key: 'description', label: 'Description',           hint: 'Item / part description', required: true },
   { key: 'mfg_name',    label: 'Manufacturer',          hint: 'Manufacturer name (often blank or "N/A" for distributor-branded items — that\'s OK)' },
@@ -799,7 +799,7 @@ function _renderRfqTable() {
 
   $('rfq-count').textContent = `${filtered.length.toLocaleString()} of ${items.length.toLocaleString()} items shown`;
 
-  // Exact pennies on every $ value, no rounding — per ryan: RFQs need precision
+  // Exact pennies on every $ value, no rounding — per the analyst: RFQs need precision
   const fmt = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const fmtQty = (n) => n == null ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 
@@ -807,9 +807,9 @@ function _renderRfqTable() {
   // procurement person reads first time they look at the table.
   let head = `<tr>
     <th class="cell-include" title="Untick to drop an item from the RFQ. Default tick = had qty in the last 24 months. The 'Smart trim' button bulk-unticks WEAK/SKIP rows + risky description patterns.">RFQ</th>
-    <th title="Andersen item number (or supplier Part Number when EAM is blank — common in cXML / PunchOut supplier exports). The dedup key the engine matched on across the multi-year export.">Item #</th>
+    <th title="buyer item number (or supplier Part Number when EAM is blank — common in cXML / PunchOut supplier exports). The dedup key the engine matched on across the multi-year export.">Item #</th>
     <th title="Engine score 0-100 + tier. STRONG = order frequency + recent activity + clean data. MODERATE = some flags. WEAK = thin/dormant history. SKIP = almost certainly not RFQ-worthy. Hover any tier chip for the per-item reason list.">Tier</th>
-    <th title="The description Andersen has on file for this item. Chips next to it: red = service / freight / tariff / obsolete / rental (usually don't belong in an RFQ); amber = custom / repair / misc (caution); UOM mixed / MFG blank flags surface data hygiene issues.">Description</th>
+    <th title="The description The buyer has on file for this item. Chips next to it: red = service / freight / tariff / obsolete / rental (usually don't belong in an RFQ); amber = custom / repair / misc (caution); UOM mixed / MFG blank flags surface data hygiene issues.">Description</th>
     <th title="Manufacturer name. Often the strongest signal an RFQ has — suppliers price by manufacturer first, item number second. 'MFG blank' chip means the export didn't carry one for this item.">MFG</th>
     <th title="Manufacturer's part number. The supplier-side anchor key — what the bidder uses to look up their cost. Blank means the export didn't carry one (common in cXML / PunchOut supplier data).">MFG PN</th>
     <th class="num" title="Quantity ordered in the last 12 months (anchored to the dataset's most recent order date, not today's date — exports are often weeks stale).">12mo qty</th>
@@ -1283,7 +1283,7 @@ if ($('st-apply')) $('st-apply').addEventListener('click', _smartTrimApply);
 if ($('st-undo')) $('st-undo').addEventListener('click', _smartTrimUndo);
 
 // ==========================================================================
-// Charts (table-first; charts live below the table per ryan's rule)
+// Charts (table-first; charts live below the table per the analyst's rule)
 // ==========================================================================
 function _renderCharts() {
   if (!_rfqResult) return;
@@ -1773,7 +1773,7 @@ json.dumps(get_user_profile())
         ${fld('Your name', 'name', 'How you appear to suppliers — e.g. "Jane Doe"')}
         ${fld('Your email', 'email', 'Where suppliers should send responses')}
         ${fld('Your title', 'title', 'Optional — e.g. "Procurement Analyst"')}
-        ${fld('Company', 'company', 'Default: Andersen')}
+        ${fld('Company', 'company', 'Default: Buyer')}
       </div>
       <div style="display:flex;justify-content:flex-end;gap:10px;padding:14px 26px;border-top:1px solid var(--line);">
         <button class="btn ghost" id="prof-cancel" type="button">Cancel</button>
@@ -1866,7 +1866,7 @@ async function _onBidFileSelected(file) {
   // Suggest supplier name from filename (strip extension + dates + RFQ tags)
   const stem = file.name.replace(/\.xlsx$/i, '');
   const suggest = stem
-    .replace(/^Andersen[\s_-]*/i, '')
+    .replace(/^Buyer[\s_-]*/i, '')
     .replace(/[\s_-]*RFQ.*/i, '')
     .replace(/[\s_-]*Round[\s_]*\d+.*/i, '')
     .replace(/[\s_-]*R\d+.*/i, '')
@@ -2081,7 +2081,7 @@ function _renderBidSummary() {
 // Step-4 redesign — module-level state.
 //
 // _activeChip:  which strategy chip is currently selected in the headline.
-//   Defaults to 'consolidate_to' when bids loaded (Ryan's standard playbook),
+//   Defaults to 'consolidate_to' when bids loaded (the standard playbook),
 //   or 'lowest_qualified' when no consolidation candidate exists.
 // _consolidateSupplier: the supplier the user picked from the consolidate-to
 //   dropdown (null = use system default = top consolidation candidate).
@@ -2345,7 +2345,7 @@ function _renderHeadlineCard(headline, consolidation) {
     strategyExplainer = `<div class="strategy-explainer" title="Incumbent Preferred only differs from Lowest Price when the historical supplier has a bid you'd consider keeping. Since they don't, this strategy degrades to Lowest Price for every item." style="margin-top:10px;padding:6px 12px;background:rgba(255,183,51,0.08);border:1px solid var(--accent-deep);border-radius:3px;font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:0.04em;">ⓘ ${_escapeHtml(incumbentName) || 'The incumbent'} isn't bidding — this strategy is identical to Lowest Price for every item.</div>`;
   }
 
-  // Snapshot strip — combined with the chip strip per Ryan's request to
+  // Snapshot strip — combined with the chip strip per user request to
   // collapse the two surfaces into one. "📌 Save snapshot" is always
   // present when bids are loaded; saved snapshots appear as inline pills.
   const scenariosList = (_lastHeadline && _lastHeadline.scenarios_list) || [];
@@ -3038,7 +3038,7 @@ function _renderScenariosBlock(scenarios, consol) {
   // The Saved Scenarios drawer was deleted — its capability is now an inline
   // snapshot strip that lives directly under the chip strip in the headline
   // card. The drawer was redundant with the chip strip's live exploration
-  // (Ryan: "i dont really even understand why we have both"). Capability
+  // (Note: "i dont really even understand why we have both"). Capability
   // preserved: 📌 Save current snapshot · saved snapshots as inline pills
   // (click to load · × to delete) · Compare appears when ≥2 saved · letters
   // and Decision Log read from a clicked snapshot or the active state.
@@ -3288,7 +3288,7 @@ base64.b64encode(_b).decode('ascii')
     document.body.appendChild(xa); xa.click(); xa.remove();
     setTimeout(() => URL.revokeObjectURL(xurl), 1500);
 
-    // Markdown (for Copilot)
+    // Markdown (for an internal tool)
     await new Promise(r => setTimeout(r, 400));
     const md = await _py.runPythonAsync(`
 from app_engine import gen_decision_log_markdown
@@ -3304,8 +3304,8 @@ gen_decision_log_markdown(_dl_scenario, rfq_id=_dl_rfq_id)
     alert(
       `Decision log generated:\n\n` +
       `  • DecisionLog_${safeName}_${rfqId}.xlsx — full immutable record (legal-hold)\n` +
-      `  • DecisionLog_${safeName}_${rfqId}.md — markdown version you can paste into M365 Copilot\n\n` +
-      `Retain the xlsx for at least 7 years per the legal-hold convention. The markdown is for your own follow-up — paste a section into Copilot and ask for an executive summary, supplier reply draft, or push-back checklist.`
+      `  • DecisionLog_${safeName}_${rfqId}.md — markdown version you can paste into an internal documentation tool\n\n` +
+      `Retain the xlsx for at least 7 years per the legal-hold convention. The markdown is for your own follow-up — paste a section into an internal tool and ask for an executive summary, supplier reply draft, or push-back checklist.`
     );
   } catch (err) {
     console.error('[decision log]', err);
@@ -3801,7 +3801,7 @@ function _renderComparisonMatrix(matrix) {
   html += `<thead style="background:var(--bg-2);position:sticky;top:0;z-index:1;"><tr>
     <th title="Tick to select this item for the next Round 2 / Rn focused-RFQ batch. Use to push back on items where bids look uncompetitive." style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;width:36px;">R2</th>
     <th data-sort-key="desc" data-sort-type="str" title="Item description (Coupa 'Item' field). Click to sort A-Z / Z-A." class="sortable" style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item</th>
-    <th data-sort-key="part" data-sort-type="str" title="Andersen item number — dedup key. Click to sort." class="sortable" style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Part #</th>
+    <th data-sort-key="part" data-sort-type="str" title="buyer item number — dedup key. Click to sort." class="sortable" style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Part #</th>
     <th data-sort-key="lastdate" data-sort-type="date" title="Most recent order date for this item. Click to sort by recency." class="sortable" style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Last order</th>
     <th data-sort-key="qty" data-sort-type="num" title="Quantity ordered in the last 24 months. Click to sort." class="sortable" style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty 24mo</th>
     <th data-sort-key="lastprice" data-sort-type="num" title="Last priced unit price — historical baseline. The price block (Last $/ea + supplier bids) is bracketed by amber separators to read as one grouped section." class="sortable" style="padding:10px;text-align:right;color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;border-left:2px solid var(--accent-deep);background:rgba(255,183,51,0.06);">Last $/ea</th>`;
@@ -4144,7 +4144,7 @@ function _round2OpenGenerateDialog() {
           <h2 style="margin:0;font-size:20px;color:var(--ink-0);">Generate per-supplier Round 2 files</h2>
           <p style="margin:8px 0 0;color:var(--ink-1);font-size:13px;line-height:1.55;">
             ${_round2Selection.size} item${_round2Selection.size === 1 ? '' : 's'} selected.
-            Each supplier you tick gets a focused xlsx with their R1 echo + the Andersen-projected reference price + 8 supplier-input fields. Strict isolation: no cross-supplier data leaks into any file.
+            Each supplier you tick gets a focused xlsx with their R1 echo + the trend-projected reference price + 8 supplier-input fields. Strict isolation: no cross-supplier data leaks into any file.
           </p>
         </div>
         <button id="r2-modal-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;">×</button>
@@ -4160,7 +4160,7 @@ function _round2OpenGenerateDialog() {
         </label>
         <label style="display:block;color:var(--ink-0);font-family:var(--mono);font-size:12px;">
           <input type="checkbox" id="r2-include-reference" checked style="vertical-align:middle;margin-right:8px;accent-color:var(--accent);">
-          Include Reference Price column (Andersen-projected from cleaned trend, with explanatory banner)
+          Include Reference Price column (trend-projected from cleaned trend, with explanatory banner)
         </label>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:baseline;margin-bottom:14px;">
@@ -4498,7 +4498,7 @@ function _renderItemHistory(h) {
     calloutEl.style.background = 'rgba(255,77,109,0.08)';
   }
   // (No "else if (t.spike)" with the +0% noise message — that's the
-  // banner Ryan wanted gone once the data's clean.)
+  // banner the analyst wanted gone once the data's clean.)
 
   // 2. Trend-extrapolation line — only render when the extrapolation
   // diverges meaningfully from the latest priced line (>15% gap), AND

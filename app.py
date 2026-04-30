@@ -121,10 +121,10 @@ EXPORT_ALIASES = {
     "description": ["item name", "detailed item", "description", "item description", "long description", "desc"],
     "mfg_name":    ["manufacturer name", "manufacturer", "mfg name", "mfr name", "make"],
     "mfg_pn":      ["manufacturer part #", "manufacturer part number", "mfg part #", "mfr part", "mpn", "manufacturer pn", "mfg pn"],
-    # part_number = supplier's own catalog SKU (e.g. McMaster's "5709A45").
+    # part_number = supplier's own catalog SKU (e.g. Supplier-X's "5709A45").
     # MUST come AFTER mfg_pn so "Manufacturer Part Number" gets claimed first.
     # Used as a fallback dedup key when item_num + eam_pn are both blank
-    # (McMaster orders via cXML mostly leave those Andersen-side fields empty).
+    # (Supplier-X orders via cXML mostly leave those buyer-side fields empty).
     "part_number": ["part number", "supplier part number", "supplier sku", "supplier auxiliary part number", "catalog number", "catalog #"],
     "order_date":  ["order date", "po date", "transaction date", "date ordered", "po creation date"],
     "qty":         ["quantity", "qty ordered", "qty received", "order qty", "qty"],
@@ -138,7 +138,7 @@ EXPORT_ALIASES = {
 
 def _is_blanky(s) -> bool:
     """Treat 'N/A', '#N/A', '-', '—', '(blank)', etc. as effectively blank.
-    McMaster orders set Manufacturer / MFG Part Number to literal 'N/A'."""
+    Supplier-X orders set Manufacturer / MFG Part Number to literal 'N/A'."""
     if s is None:
         return True
     t = str(s).strip().upper()
@@ -283,7 +283,7 @@ def auto_map_export(headers: list) -> dict:
     substring fallback for fields that didn't get an exact hit. Without this,
     a substring like "part number" matching "Supplier Auxiliary Part Number"
     (mostly empty col) wins over the literal "Part Number" column that's
-    actually populated. McMaster bug 2026-04-26."""
+    actually populated. Supplier-X bug 2026-04-26."""
     out = {}
     norm_headers = [norm_text(h).lower() if h else "" for h in headers]
 
@@ -435,10 +435,10 @@ def _extract_rows(file_bytes, mapping: dict) -> list:
         item = _clean(g(c_item)) if c_item is not None else ""
         eam = _clean(g(c_eam)) if c_eam is not None else ""
         part = _clean(g(c_part)) if c_part is not None else ""
-        # Dedup-key fallback: Andersen Item # → EAM Part # → supplier Part Number.
-        # Distributors that order via cXML (McMaster, Grainger PunchOut, etc.)
-        # often leave the Andersen-side fields blank because the part lives in
-        # the supplier's catalog, not Andersen's item-master.
+        # Dedup-key fallback: Item # → EAM Part # → supplier Part Number.
+        # Distributors that order via cXML (Supplier-X, Supplier-A PunchOut, etc.)
+        # often leave the buyer-side fields blank because the part lives in
+        # the supplier's catalog, not the buyer's item-master.
         key_raw = item or eam or part
         if not key_raw:
             continue
@@ -1046,7 +1046,7 @@ def get_item_history(item_num: str) -> dict:
         outliers in the modal table and watch the trend redraw cleanly.
       * An "expected price today" extrapolation of that cleaned trend at the
         dataset's anchor date — the "we last ordered 11 months ago at $12.40
-        / trend says ~$13.10 today" reference Ryan asked for.
+        / trend says ~$13.10 today" reference the analyst asked for.
       * 90-day-median spike detection (same recency-tiebreak rule as the
         table's LAST $/ea) — also computed against the cleaned line set.
       * A per-supplier ``bids`` overlay listing every priced quote we have
@@ -1054,7 +1054,7 @@ def get_item_history(item_num: str) -> dict:
         scored for distance from the cleaned trend's expected-today value:
             - ``ratio`` = bid_price / expected_today  (1.0 = on the line)
             - ``possible_typo`` = True when the bid is ≥60% below the trend
-              (ratio ≤ 0.4) — the "way below the line" pattern Ryan flagged
+              (ratio ≤ 0.4) — the "way below the line" pattern the analyst flagged
               as the canonical typo signature.
 
     The shape is JSON-safe (numbers, strings, bools) so the JS renderer can
@@ -1077,7 +1077,7 @@ def get_item_history(item_num: str) -> dict:
           None and the chart shows raw points only (no trend line).
         * ``latest_unit_price`` here is the cleaned-set's latest priced line.
           The to-the-penny LAST $/ea used by the RFQ-list table elsewhere is
-          unrelated — Ryan's "no rounding/medians" rule is for that table,
+          unrelated — the analyst's "no rounding/medians" rule is for that table,
           not for this analytical modal.
     """
     if not item_num:
@@ -1451,7 +1451,7 @@ def set_item_lock(item_num: str, supplier: str, reason: str = "") -> dict:
         item_num: Display item number (the same key the per-item modal opens with).
         supplier: Exact supplier name (must match a key in _STATE["bids"]
             for the lock to actually steer scenario evaluation).
-        reason: Free-form analyst note (e.g., "audited 4/29 — Grainger
+        reason: Free-form analyst note (e.g., "audited 4/29 — Supplier-A
             confirmed UOM is each, not box").
 
     Returns:
@@ -2284,13 +2284,13 @@ def gen_candidate_rfq_list_xlsx(included_keys=None) -> bytes:
 # ---------------------------------------------------------------------------
 # Returned-bid intake — parses each supplier's response file.
 #
-# Three observed file shapes in the McMaster RFQ:
-#   1. "Our format" (Grainger primary, MSC, Fastenal): banner row at top,
+# Three observed file shapes in the Supplier-X RFQ:
+#   1. "Our format" (Supplier-A primary, Supplier-C, Supplier-B): banner row at top,
 #      real headers at row 7 (1-indexed). Cols 1-10:
-#        1=Commodity 2=Item 3=EAM Part # 4=Part Number (= McMaster anchor)
+#        1=Commodity 2=Item 3=EAM Part # 4=Part Number (= Supplier-X anchor)
 #        5=Item # 6=Manufacturer Name 7=Qty 8=UOM 9=Quoted Price 10=Notes
-#      Fastenal extends to 20 cols with substitute-part / verified-pricing data.
-#   2. "Their format" (Grainger secondary): completely restructured. NOT
+#      Supplier-B extends to 20 cols with substitute-part / verified-pricing data.
+#   2. "Their format" (Supplier-A secondary): completely restructured. NOT
 #      auto-handled in v1 — falls back to manual mapping (TODO).
 #
 # No-bid signals (treat as not quoted, not a real $0 line):
@@ -2316,7 +2316,7 @@ NO_BID_LONG_MARKERS = (
 # Short markers ("na", "tbd", "n/a") that need WORD-BOUNDARY matching to avoid
 # false positives — "na" was matching "fasteNAl" in supplier notes, causing
 # every UOM-discrepancy line to be misclassified as NO_BID. Discovered during
-# the demo-existing-rfq workflow on the real Fastenal bid file (2026-04-29).
+# the demo-existing-rfq workflow on the real Supplier-B bid file (2026-04-29).
 import re as _re
 _NO_BID_SHORT_RE = _re.compile(r"\b(?:n/?a|tbd)\b", _re.IGNORECASE)
 
@@ -2372,7 +2372,7 @@ def _detect_our_format(ws) -> int:
 
 def _our_format_columns(header_row: tuple) -> dict:
     """Map the 'our format' headers to logical fields.
-    Handles the 11-col primary layout AND the 20-col Fastenal extension."""
+    Handles the 11-col primary layout AND the 20-col Supplier-B extension."""
     cols = {}
     for i, raw in enumerate(header_row):
         if raw is None:
@@ -2388,7 +2388,7 @@ def _our_format_columns(header_row: tuple) -> dict:
         elif h == "eam part number" and "eam_pn" not in cols:
             cols["eam_pn"] = i
         elif h in ("part number", "partnumber") and "part_number" not in cols:
-            cols["part_number"] = i        # = McMaster anchor
+            cols["part_number"] = i        # = Supplier-X anchor
         elif h == "item #" and "item_num" not in cols:
             cols["item_num"] = i
         elif h == "manufacturer name" and "mfg_name" not in cols:
@@ -2402,19 +2402,19 @@ def _our_format_columns(header_row: tuple) -> dict:
         elif h == "notes" and "notes" not in cols:
             cols["notes"] = i
         elif h == "verified pricing" and "verified_price" not in cols:
-            cols["verified_price"] = i     # Fastenal extension
+            cols["verified_price"] = i     # Supplier-B extension
         elif h.startswith("exact ") and "part" in h and "exact_part" not in cols:
-            cols["exact_part"] = i         # Fastenal: their exact catalog part
+            cols["exact_part"] = i         # Supplier-B: their exact catalog part
         elif h.startswith("exact ") and "description" in h and "exact_desc" not in cols:
             cols["exact_desc"] = i
         elif h.startswith("sub ") and "part" in h and "sub_part" not in cols:
-            cols["sub_part"] = i           # Fastenal: substitute offered
+            cols["sub_part"] = i           # Supplier-B: substitute offered
         elif h.startswith("sub ") and "description" in h and "sub_desc" not in cols:
             cols["sub_desc"] = i
         elif h == "sell price/uom" and "sub_price" not in cols:
             cols["sub_price"] = i
         elif h == "notes" and "notes_2" not in cols:
-            cols["notes_2"] = i            # Fastenal's second notes col
+            cols["notes_2"] = i            # Supplier-B's second notes col
     return cols
 
 
@@ -2463,7 +2463,7 @@ def parse_supplier_bid(file_bytes, supplier_name: str = "") -> dict:
     for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
         if row is None:
             continue
-        # Anchor key: McMaster Part Number (the column we sent — same anchor
+        # Anchor key: Supplier-X Part Number (the column we sent — same anchor
         # the supplier filled prices against). Fall back to Item # then EAM.
         part = norm_text(g(row, "part_number"))
         item = norm_text(g(row, "item_num"))
@@ -2516,7 +2516,7 @@ def parse_supplier_bid(file_bytes, supplier_name: str = "") -> dict:
             n_priced += 1
 
         # Effective price — verified takes precedence (it's the "we re-confirmed"
-        # value Fastenal added) but we keep the raw quoted value for transparency
+        # value Supplier-B added) but we keep the raw quoted value for transparency
         effective_price = verified if (verified is not None and verified > 0) else quoted
         if effective_price is not None and qty is not None and effective_price > 0:
             total_value += effective_price * qty
@@ -2536,7 +2536,7 @@ def parse_supplier_bid(file_bytes, supplier_name: str = "") -> dict:
             "effective_price": effective_price,
             "notes": notes,
             "status": status,
-            # Fastenal-style extensions (empty for other suppliers)
+            # Supplier-B-style extensions (empty for other suppliers)
             "exact_part": exact_part,
             "exact_desc": exact_desc,
             "sub_part": sub_part,
@@ -2617,13 +2617,13 @@ def compute_clean_savings_summary_DEPRECATED_BIDLINE_BASED() -> dict:
 
     - **raw**: every bid with a price > 0, including UOM_DISC and SUBSTITUTE
       statuses. This is what the current dashboard shows, but it's polluted
-      when supplier UOM differs from history UOM (per-each Fastenal price
-      compared against per-package McMaster anchor inflates apparent savings
+      when supplier UOM differs from history UOM (per-each Supplier-B price
+      compared against per-package Supplier-X anchor inflates apparent savings
       to absurd values).
 
     - **clean**: bids with status == PRICED only. Excludes UOM_DISC,
       NO_BID, NEED_INFO, SUBSTITUTE. Catches the explicitly-flagged UOM
-      mismatches but misses implicit ones (Grainger / MSC don't always note
+      mismatches but misses implicit ones (Supplier-A / Supplier-C don't always note
       UOM in the response — they just quote in their own units).
 
     - **strict**: clean + the bid's UOM matches the history's UOM (after
@@ -2734,9 +2734,9 @@ def compute_clean_savings_summary() -> dict:
     - NORMALIZED — STRICT + UOM-mismatched items where a "resolved" annotation
                    exists in _STATE["uom_annotations"]. Bid price is adjusted
                    by the annotation's factor before computing savings, so a
-                   per-each Fastenal bid of $0.0123 with factor=50 contributes
+                   per-each Supplier-B bid of $0.0123 with factor=50 contributes
                    $0.615 (the per-package equivalent) for comparison against
-                   a per-package McMaster anchor of e.g. $0.620.
+                   a per-package Supplier-X anchor of e.g. $0.620.
 
     Returns:
         {
@@ -2855,8 +2855,8 @@ def compute_clean_savings_summary() -> dict:
 # UOM resolution — manual annotations + auto-fill from supplier notes
 # ---------------------------------------------------------------------------
 #
-# The problem: when a bid's UOM doesn't match the history's UOM (e.g., Fastenal
-# quotes per-each $0.0123, McMaster anchor is per-package $1.23), comparing them
+# The problem: when a bid's UOM doesn't match the history's UOM (e.g., Supplier-B
+# quotes per-each $0.0123, Supplier-X anchor is per-package $1.23), comparing them
 # directly produces nonsense savings. The STRICT savings tier in
 # compute_clean_savings_summary excludes these from headline math.
 #
@@ -2867,7 +2867,7 @@ def compute_clean_savings_summary() -> dict:
 # Two ways an annotation gets set:
 #   1. AUTO — extracted from a parseable supplier note (e.g., "(50' Spool)"
 #      tells us 1 spool = 50 ft, so per-foot bid × 50 = per-spool comparable)
-#   2. MANUAL — analyst looks up McMaster catalog (or stockroom) offline and
+#   2. MANUAL — analyst looks up Supplier-X catalog (or stockroom) offline and
 #      types in the conversion factor via the UOM Resolution Queue UI
 #
 # Persists in _STATE["uom_annotations"] keyed by (item_key, supplier). Rides
@@ -2968,7 +2968,7 @@ def set_uom_annotation(item_key: str, supplier: str, factor, hist_uom: str = "",
                    Pass None to mark needs-review without committing a factor.
         hist_uom:  the history's UOM string (snapshot, for sanity-check)
         bid_uom:   the bid's UOM string (snapshot)
-        note:      optional analyst memo (e.g., "McMaster pkg/50 per catalog")
+        note:      optional analyst memo (e.g., "Supplier-X pkg/50 per catalog")
         status:    "resolved" | "skipped" | "needs_review"
         set_by:    optional user name for audit trail
         direction: see factor docstring above
@@ -3574,7 +3574,7 @@ def recommend_for_item(matrix_row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Consolidation analysis — Ryan's actual award strategy.
+# Consolidation analysis — the standard award strategy.
 #
 # Default: consolidate to ONE supplier (operational simplicity beats per-line
 # lowest pricing when the savings are small). Then carve out a limited set
@@ -3648,7 +3648,7 @@ DEFAULT_USER_PROFILE = {
     "name": "",
     "email": "",
     "title": "Procurement Analyst",
-    "company": "Andersen",
+    "company": "Buyer",
 }
 
 
@@ -3844,8 +3844,8 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
                         # UOM-discrepancy guard — if EITHER side has a UOM
                         # warning OR the price ratio is extreme (>20×), flag
                         # the carve-out as needing UOM verification before
-                        # being trusted as real savings. Fastenal's "per each
-                        # vs McMaster per package" notes are the canonical case.
+                        # being trusted as real savings. Supplier-B's "per each
+                        # vs Supplier-X per package" notes are the canonical case.
                         carve_bid_record = bid_lookup.get((cheapest_other_sup, it["key"]))
                         winner_bid_record = bid_lookup.get((winner_sup, it["key"]))
                         carve_status = (carve_bid_record or {}).get("status")
@@ -4321,7 +4321,7 @@ def gen_supplier_followup_xlsx(supplier_name: str, included_keys=None) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Outbound RFQ generator — multi-tab Andersen-branded supplier xlsx.
+# Outbound RFQ generator — multi-tab buyer-branded supplier xlsx.
 #
 # Per the brief's recommended structure:
 #   1. Instructions
@@ -4330,15 +4330,15 @@ def gen_supplier_followup_xlsx(supplier_name: str, included_keys=None) -> bytes:
 #   4. Data Dictionary
 #   5. Supplier Response Template
 #
-# Strict isolation: no historical paid price, no Andersen target / cost /
+# Strict isolation: no historical paid price, no Buyer target / cost /
 # margin. Each supplier file contains ONLY this supplier's identification
-# and the items being asked. McMaster-style anchor: Part Number column is
+# and the items being asked. Supplier-X-style anchor: Part Number column is
 # the unique join key for round-trip ingest.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Visual style palette for supplier-bound xlsx files. Inspired by polished
-# supplier-side templates (e.g. Grainger's "Data Spreadsheet" with bright-
+# supplier-side templates (e.g. Supplier-A's "Data Spreadsheet" with bright-
 # green response columns + bold compact headers).
 # ---------------------------------------------------------------------------
 COLOR_BRAND_DARK   = "0a0e1a"   # deep navy ground (header bands)
@@ -4426,7 +4426,7 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
         contact_name = profile.get("name") or "(operator name not set)"
     if not contact_email:
         contact_email = profile.get("email") or "(operator email not set)"
-    contact_company = profile.get("company") or "Andersen"
+    contact_company = profile.get("company") or "Buyer"
     """Generate one supplier's outbound RFQ workbook.
 
     Strict isolation rules baked in:
@@ -4491,7 +4491,7 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
         "6. Lead time should be in calendar days from PO receipt.",
         "7. Quote validity: please indicate how long your prices are firm in the 'Valid Through Date' column.",
         "8. All prices should be NET (excluding freight unless 'Freight Included' = Yes).",
-        "9. Please return the completed workbook to the Andersen contact above by the response-due date.",
+        "9. Please return the completed workbook to the contact above by the response-due date.",
         "10. Any item without a response will be treated as a no-bid.",
     ]
     for line in instructions:
@@ -4524,7 +4524,7 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
 
     # ---- TAB 2: RFQ Lines (read-only summary) ----
     ws2 = wb.create_sheet("RFQ Lines")
-    headers = ["Line #", "Andersen Item #", "EAM Part #", "Manufacturer Part #",
+    headers = ["Line #", "Item #", "EAM Part #", "Manufacturer Part #",
                "Manufacturer", "Description", "Commodity", "Annual Qty", "UOM"]
     _write_banner_row(ws2, 1, f"RFQ LINES  ·  {len(items):,} items requested", span_cols=len(headers))
     _write_subbanner(ws2, 2, "Read-only summary — for your reference. Quote in the 'Supplier Response Template' tab.", span_cols=len(headers), font_size=10, height=22)
@@ -4566,8 +4566,8 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
         ("Quantity basis", "Annual quantities are estimates based on 24-month order history. Actual orders may vary."),
         ("Award terms", "This RFQ is not a commitment to purchase. Awards will be issued by separate purchase order."),
         ("Substitutes", "Alternate parts will be evaluated for form/fit/function equivalence. Quote the OEM part as primary; alternates are secondary."),
-        ("Pricing audit", "Andersen reserves the right to request manufacturer cost documentation for items priced significantly above market."),
-        ("Confidentiality", "Pricing in this RFQ and your responses are confidential between Andersen and your company."),
+        ("Pricing audit", "Buyer reserves the right to request manufacturer cost documentation for items priced significantly above market."),
+        ("Confidentiality", "Pricing in this RFQ and your responses are confidential between buyer and your company."),
         ("Validity", "Quotes should remain firm for at least 90 days unless otherwise noted in the 'Valid Through' field."),
         ("Tariffs", "If tariffs apply, indicate whether they're included in your quoted price ('Tariff Included' field)."),
         ("Round-trip data", "Hidden columns in the response template (item_key, rfq_line_id) are used for matching your response back to our items. Do not delete or modify these columns."),
@@ -4598,7 +4598,7 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
     _style_table_header(ws4, ws4.max_row, 3)
     data_start_4 = ws4.max_row + 1
     dictionary = [
-        ("Andersen Item #", "Reference", "Our internal item identifier."),
+        ("Item #", "Reference", "Our internal item identifier."),
         ("EAM Part #", "Reference", "Our EAM/maintenance system part number (primary key for most suppliers)."),
         ("Manufacturer Part #", "Reference", "OEM manufacturer part number, when known."),
         ("Annual Qty", "Reference", "Estimated annual consumption based on 24-month history."),
@@ -4659,7 +4659,7 @@ def gen_outbound_rfq_xlsx(supplier_name: str, rfq_id: str = "",
     ws5.append([])
     template_headers = [
         # Reference (read-only) cols
-        "Andersen Item #",   # A
+        "Item #",   # A
         "EAM Part #",        # B
         "Manufacturer Part #",  # C
         "Manufacturer",      # D
@@ -4865,7 +4865,7 @@ def serialize_state() -> dict:
 # Audit log — discrete action-level event trail.
 #
 # Per the brief: every important action gets a row. Useful for:
-#   - "What did I do last Tuesday on the McMaster RFQ?" (period-end recap)
+#   - "What did I do last Tuesday on the Supplier-X RFQ?" (period-end recap)
 #   - Director conversations: "show me the trail for this award decision"
 #   - Debugging: "why is the difficulty score 64 — when did it change?"
 # ---------------------------------------------------------------------------
@@ -5210,7 +5210,7 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
         hist_price = it.get("last_unit_price") or 0
         # Note: incumbent supplier from historical data; may be the same
         # supplier name as one of the bidders, OR a different name (e.g.
-        # "MCMASTER-CARR") that doesn't match any bidder
+        # "SUPPLIER-X") that doesn't match any bidder
         incumbent = (it.get("supplier") if "supplier" in it else None) or _STATE.get("supplier_name", "")
 
         # Manual override beats everything
@@ -5443,7 +5443,7 @@ def _summarize_eval_for_headline(evaluated: dict, consolidate_supplier: str = No
 
     Picks `supplier_primary` as the supplier with the largest awarded $.
     Also reports `supplier_primary_items` (item count to that supplier) so
-    the headline can show "1,500 items going to Grainger" instead of
+    the headline can show "1,500 items going to Supplier-A" instead of
     "11,169 items" (the latter included unquoted items as if they were
     awarded).
 
@@ -5746,7 +5746,7 @@ def gen_award_letter_xlsx(scenario_name: str, supplier_name: str,
         contact_name = profile.get("name") or "(operator name not set)"
     if not contact_email:
         contact_email = profile.get("email") or "(operator email not set)"
-    contact_company = profile.get("company") or "Andersen"
+    contact_company = profile.get("company") or "Buyer"
     """Build the award-letter xlsx for one awarded supplier from a saved
     scenario. Strict isolation enforced both during row collection and
     via a defensive re-scan before write."""
@@ -5824,7 +5824,7 @@ def gen_award_letter_xlsx(scenario_name: str, supplier_name: str,
     # ---- TAB 2: Awarded Items ----
     ws2 = wb.create_sheet("Awarded Items")
     headers = [
-        "Line #", "Andersen Item #", "Description",
+        "Line #", "Item #", "Description",
         "Estimated Annual Qty", "Awarded Unit Price", "Estimated Annual Value",
         "Decision basis",
     ]
@@ -5873,8 +5873,8 @@ def gen_award_letter_xlsx(scenario_name: str, supplier_name: str,
         ("Tariff and freight", "As noted on your quote. Notify us before any change."),
         ("Substitutes", "If you offered an alternate part on a quoted line, the alternate is awarded. Form/fit/function equivalence applies."),
         ("Quality", "All items must meet the specifications described in our RFQ documentation."),
-        ("Payment terms", "Per the Andersen master supplier agreement currently in effect with your company."),
-        ("Confidentiality", "Pricing in this award is confidential between Andersen and your company."),
+        ("Payment terms", "Per the master supplier agreement currently in effect with your company."),
+        ("Confidentiality", "Pricing in this award is confidential between buyer and your company."),
     ]
     ws3.append(["Topic", "Detail"])
     for c in ws3[3]:
@@ -6114,7 +6114,7 @@ OUTCOME_TEMPLATES = {
 RISK_TEMPLATES = {
     "SINGLE_SOURCE_AWARD": (
         "Risk: This item received only one qualified bid, from {supplier}. "
-        "Until the next RFQ cycle, Andersen has no competitive backup for this item. "
+        "Until the next RFQ cycle, The buyer has no competitive backup for this item. "
         "Operator should monitor lead times and pricing closely."
     ),
     "UOM_VERIFICATION_REQUIRED": (
@@ -6336,7 +6336,7 @@ def generate_award_rationale(award_record: dict, comparison_row: dict, scenario:
                 savings_text_vs_history=savings_text_vs_history,
             )
         elif decision_basis.startswith("CARVE"):
-            # Decision basis like "CARVE: MSC saves 30% vs Grainger"
+            # Decision basis like "CARVE: Supplier-C saves 30% vs Supplier-A"
             consol_supplier = (scenario.get("parameters") or {}).get("supplier") if scenario else "the consolidation winner"
             consol_bid = _bid_for(consol_supplier)
             consol_price = consol_bid.get("price") or 0
@@ -6815,12 +6815,12 @@ def gen_decision_log_xlsx(scenario_name: str, rfq_id: str = "",
     ws6["A1"].font = SECTION_FONT
     ws6.append([])
     methodology_paragraphs = [
-        "Item identity: Items are identified by an internal key derived from the Andersen Item Number, falling back to EAM Part Number, then to the supplier's catalog Part Number. For most Andersen suppliers EAM is the primary identifier; cXML / PunchOut suppliers (e.g. McMaster) frequently leave Item # and EAM blank, in which case the supplier's own catalog SKU is used as the join key.",
+        "Item identity: Items are identified by an internal key derived from the buyer-side item number, falling back to EAM Part Number, then to the supplier's catalog Part Number. For most distributor suppliers EAM is the primary identifier; cXML / PunchOut suppliers frequently leave Item # and EAM blank, in which case the supplier's own catalog SKU is used as the join key.",
         "Window aggregations: Quantities and spend are aggregated across rolling 12-month, 24-month, and 36-month windows anchored to the most recent order date in the source data. The annualized quantity used for award value calculations is the trailing 24-month quantity divided by 2.",
         "Last paid price: The unit price of the most recent priced order line. No medians, smoothing, or rolling averages are used in displayed RFQ pricing — to-the-penny precision is preserved throughout. Where this may obscure a price spike, a separate analytical reference (90-day median) is shown on the per-item drill-down chart but is not used in award math.",
         "Recommendation engine: Each item with bids receives a deterministic recommendation in one of five categories: ACCEPT, PUSH_BACK, ASK_CLARIFICATION, EXCLUDE, or MANUAL_REVIEW. The decision rules are evaluated in priority order: no-bid → EXCLUDE; all-need-info → ASK_CLARIFICATION; UOM discrepancy on lowest bid → ASK_CLARIFICATION; substitute on lowest bid → ASK_CLARIFICATION; lowest bid above the historical baseline by more than the pushback threshold → PUSH_BACK; statistical outlier → MANUAL_REVIEW; savings exceed the switch threshold → ACCEPT; otherwise MANUAL_REVIEW.",
         "Award scenarios: The actual awards in this decision log were generated under a named scenario with one of five strategies — lowest_price, lowest_qualified, consolidate_to (with a named consolidation supplier), incumbent_preferred, or manual. Manual overrides at the per-item level take precedence over scenario logic.",
-        "Consolidation with carve-outs: The default award strategy at Andersen for this category is to consolidate the bulk of items to a single supplier and to carve out individual items where another supplier saves significantly more. The carve-out threshold (the per-item savings vs the consolidation winner that triggers a carve-out) is recorded in the Threshold Snapshot tab.",
+        "Consolidation with carve-outs: The default award strategy  for this category is to consolidate the bulk of items to a single supplier and to carve out individual items where another supplier saves significantly more. The carve-out threshold (the per-item savings vs the consolidation winner that triggers a carve-out) is recorded in the Threshold Snapshot tab.",
         "UOM-discrepancy guard: Carve-outs where the alternative supplier flagged a unit-of-measure mismatch (or where the price ratio versus the consolidation winner is extreme) are flagged separately and excluded from counted savings until the supplier confirms the UOM. This prevents false-positive savings from per-each vs per-package pricing mismatches.",
         "Cross-supplier isolation: Every supplier-bound output (RFQ files, award letters, follow-up packets) is filtered at write time to a single supplier's data. A defensive cell-level scan refuses the export if any other supplier's name appears in the workbook. The verify_isolation.py sibling script provides a third-party cross-check on a folder of outputs.",
     ]
@@ -6842,7 +6842,7 @@ def gen_decision_log_markdown(scenario_name: str, rfq_id: str = "",
                               decided_by: str = "",
                               retention_years: int = 7) -> str:
     """Markdown version of the decision log. Designed to be pasted into
-    Microsoft 365 Copilot (which is IT-approved at Andersen) to ask
+    an internal documentation tool (which is IT-approved ) to ask
     follow-up questions, generate executive summaries, draft email replies
     to suppliers, etc. — without ever putting the data through a
     third-party AI from inside this app."""
@@ -6863,13 +6863,13 @@ def gen_decision_log_markdown(scenario_name: str, rfq_id: str = "",
     out = []
     out.append(f"# Decision Log — {rfq_id}")
     out.append("")
-    out.append("> **How to use this file with Copilot**")
+    out.append("> **How to use this file with an internal tool**")
     out.append(">")
     out.append("> This markdown file mirrors the contents of the decision log xlsx. ")
-    out.append("> M365 Copilot is approved at Andersen, so you can paste the relevant section ")
-    out.append("> into Copilot Chat to ask follow-up questions, draft an email summary for a ")
+    out.append("> an internal documentation tool is approved , so you can paste the relevant section ")
+    out.append("> into an internal tool Chat to ask follow-up questions, draft an email summary for a ")
     out.append("> supplier, generate an executive briefing, or stress-test the rationale. ")
-    out.append("> Examples of useful Copilot prompts:")
+    out.append("> Examples of useful an internal tool prompts:")
     out.append("> - *\"Summarize this decision log into a 5-bullet executive briefing.\"*")
     out.append("> - *\"Draft a polite reply to {supplier} explaining why they were not awarded.\"*")
     out.append("> - *\"List any items where the rationale relies on a single bid — these need follow-up.\"*")
@@ -6940,7 +6940,7 @@ def gen_decision_log_markdown(scenario_name: str, rfq_id: str = "",
     out.append("## Methodology")
     out.append("")
     methodology_paragraphs = [
-        "Item identity: Items are identified by an internal key derived from the Andersen Item Number, falling back to EAM Part Number, then to the supplier's catalog Part Number.",
+        "Item identity: Items are identified by an internal key derived from the buyer-side item number, falling back to EAM Part Number, then to the supplier's catalog Part Number.",
         "Window aggregations: Quantities and spend are aggregated across rolling 12-month, 24-month, and 36-month windows anchored to the most recent order date in the source data.",
         "Last paid price: The unit price of the most recent priced order line. No medians or smoothing in displayed RFQ pricing.",
         "Recommendation engine: Each item with bids gets a deterministic 5-tier recommendation (ACCEPT / PUSH_BACK / ASK_CLARIFICATION / EXCLUDE / MANUAL_REVIEW) with a concrete reason string.",
@@ -7189,8 +7189,8 @@ def gen_round2_rfq_xlsx(
     """Build a focused R2/R3/Rn xlsx for one supplier.
 
     Strict isolation: the file contains only this supplier's prior bid data
-    (R1 echo) + Andersen's own historical-trend reference. NO cross-supplier
-    bid data leaks. The Reference Price is per-item Andersen-internal
+    (R1 echo) + the buyer's own historical-trend reference. NO cross-supplier
+    bid data leaks. The Reference Price is per-item buyer-internal
     analytics, safe to share with every bidder participating in this round
     (the banner makes that explicit so the supplier isn't confused).
 
@@ -7258,10 +7258,10 @@ def gen_round2_rfq_xlsx(
         ("Supplier",          supplier_name),
         ("Round",             f"{round_num} (focused list — {len(selected_items)} item(s))"),
         ("Response due",      response_due_date or "—"),
-        ("Contact (Andersen)",contact_name or "—"),
+        ("Contact (Buyer)",contact_name or "—"),
         ("Contact email",     contact_email or "—"),
         ("Round-trip data",   "Hidden columns 'item_key' + 'rfq_line_id' + 'round' on the response template are used to match your file back to our items. Do not modify or delete these columns."),
-        ("Confidentiality",   "Pricing in this RFQ and your responses are confidential between Andersen and your company."),
+        ("Confidentiality",   "Pricing in this RFQ and your responses are confidential between buyer and your company."),
         ("Validity",          "Quotes should remain firm for at least 90 days unless otherwise noted in the Valid Through column."),
     ]
     for label, value in rows:
@@ -7292,7 +7292,7 @@ def gen_round2_rfq_xlsx(
 
     # Build the headers dynamically based on toggles.
     ref_cols = [
-        "Andersen Item #",          # A
+        "Item #",          # A
         "EAM Part #",               # B
         "Manufacturer Part #",      # C
         "Manufacturer",             # D
@@ -7310,7 +7310,7 @@ def gen_round2_rfq_xlsx(
     ref_price_cols = []
     if include_reference_price:
         ref_price_cols = [
-            "Reference Price (Andersen-projected)",  # K
+            "Reference Price (trend-projected)",  # K
             "Reference confidence",                  # L
         ]
     response_cols = [
@@ -7539,7 +7539,7 @@ def parse_round2_supplier_bid(file_bytes, supplier_name: str = None) -> dict:
     if target_ws is None:
         target_ws = wb[wb.sheetnames[0]]
 
-    # Find the header row — it has "Andersen Item #" in the first cell of a row.
+    # Find the header row — it has "Item #" in the first cell of a row.
     header_row_idx = None
     headers = None
     for r_idx in range(1, 25):
@@ -7835,7 +7835,7 @@ def ingest_round2_supplier_bid(file_bytes, supplier_name: str) -> dict:
 # award letters and the audit / exclusion / data-quality logs.
 #
 # What this file is for:
-#   The user / Ryan asked for a single document that captures, for any RFQ:
+#   The user / the analyst asked for a single document that captures, for any RFQ:
 #     1. A written prose narrative of what was done and what was decided
 #     2. Every threshold + setting active when the decision was made
 #     3. Every analyst action (locks, exclusions, UOM resolutions, scenario
@@ -7898,7 +7898,7 @@ def compute_decision_summary_metrics(scenario_name: str = None) -> dict:
 
       {
         "rfq_id":                str,
-        "supplier_name":         str,    # the source-data supplier (e.g. McMaster)
+        "supplier_name":         str,    # the source-data supplier (e.g. Supplier-X)
         "n_items":               int,
         "historical_baseline":   float,  # qty × last_unit_price across all items
         "auto_recommendation": {

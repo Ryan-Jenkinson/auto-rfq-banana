@@ -29,7 +29,7 @@ echo.
 echo IMPORTANT:
 echo   - Keep THIS window open while using the app.
 echo   - Close this window when finished to stop the server.
-echo   - Each Andersen workapp uses its own port, so you can
+echo   - Each Buyer workapp uses its own port, so you can
 echo     run multiple apps at the same time:
 echo       supplier-pricing   8000
 echo       supplier-recon     8001
