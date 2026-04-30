@@ -24,16 +24,18 @@ Pyodide + openpyxl in the browser. All-local. No AI, no CDN at runtime, no telem
 
 ---
 
-## Run locally (Mac / Linux dev)
+## How to launch
 
-```bash
-python3 -m http.server 8801
-# open http://localhost:8801/app.html
-```
+The app runs in an embedded WebView window (Edge WebView2 on Windows, WebKit on macOS) via pywebview. **No HTTP port is opened. No system browser is launched.** Everything runs locally inside the embedded window.
 
-## Run on Windows
+### Windows
+Double-click `start.bat`. First run installs `pywebview` into your user Python (no admin needed). Subsequent runs go straight to the app.
 
-Double-click `start.bat`.
+### macOS
+Double-click `start.command` (or run `./start.command` from Terminal). First run installs `pywebview` plus the PyObjC bindings WebKit needs. Subsequent runs go straight to the app.
+
+### Important
+**Do not open `app.html` directly in a browser.** Saves and exports use a native OS save dialog that's only available when the app runs through the launcher. Opening the HTML directly will bypass the save bridge and exports will silently fail under most corporate browser policies.
 
 ---
 
@@ -45,9 +47,11 @@ Double-click `start.bat`.
 | `app.css` | Styling |
 | `app.js` | UI logic, save manager, scenario UI, download glue |
 | `app.py` | All Python — extraction, scoring, bid parsing, comparison, scenarios, generators |
+| `launcher.py` | Embedded-WebView launcher with the native save-dialog bridge |
+| `start.bat` | Windows launcher (calls `launcher.py`) |
+| `start.command` | macOS launcher (calls `launcher.py`) |
 | `verify_rfq.py` | Independent recompute of headline KPIs from a fresh export |
 | `verify_isolation.py` | Walks a folder of award letter xlsx files and flags any cross-supplier name leaks |
-| `start.bat` | Windows launcher |
 | `pyodide/`, `wheels/` | Local Pyodide runtime + openpyxl + et_xmlfile (no PyPI/CDN at runtime) |
 
 ---

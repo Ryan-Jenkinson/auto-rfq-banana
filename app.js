@@ -357,12 +357,7 @@ b = gen_decision_summary_xlsx(scenario_name=None, rfq_id=${rfqIdLit})
 base64.b64encode(b).decode("ascii")
 `);
       const bytes = Uint8Array.from(atob(out), c => c.charCodeAt(0));
-      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = `DecisionSummary_auto-rfq-banana_${stem}_${ts}.xlsx`;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      await _saveFile(`DecisionSummary_auto-rfq-banana_${stem}_${ts}.xlsx`, bytes);
     } catch (err) {
       console.error('[decision-summary]', err);
       alert('Decision Summary export failed: ' + (err.message || err));
@@ -1456,14 +1451,8 @@ _b = gen_outbound_rfq_xlsx(_outbound_supplier, rfq_id=_outbound_rfq_id,
 base64.b64encode(_b).decode('ascii')
 `);
       const bytes = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
-      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
       const safeSup = sup.replace(/[^a-zA-Z0-9_-]/g, '_');
-      a.href = url;
-      a.download = `${rfqId}_${safeSup}.xlsx`;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      await _saveFile(`${rfqId}_${safeSup}.xlsx`, bytes);
       // Stagger downloads slightly so the browser doesn't choke
       await new Promise(r => setTimeout(r, 300));
     }
@@ -1538,14 +1527,9 @@ json.dumps({"xlsx_b64": base64.b64encode(_b).decode('ascii'), "summary": _s})
       return;
     }
     const bytes = Uint8Array.from(atob(result.xlsx_b64), c => c.charCodeAt(0));
-    const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
     const ts = new Date().toISOString().slice(0, 10);
     const stem = (_exportFile && _exportFile.name) ? _exportFile.name.replace(/\.xlsx$/i, '') : 'rfq';
-    a.href = url; a.download = `DataQualityLog_auto-rfq-banana_${stem}_${ts}.xlsx`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    await _saveFile(`DataQualityLog_auto-rfq-banana_${stem}_${ts}.xlsx`, bytes);
   } catch (err) {
     console.error('[exclusion-log export]', err);
     alert('Exclusion-log export failed: ' + (err.message || err));
@@ -1574,13 +1558,8 @@ _b = gen_candidate_rfq_list_xlsx(_incl_ids.to_py())
 base64.b64encode(_b).decode('ascii')
 `);
     const bytes = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
-    const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
     const stem = (_exportFile && _exportFile.name) ? _exportFile.name.replace(/\.xlsx$/i, '') : 'rfq';
-    a.href = url; a.download = `RFQ_candidate_list_${stem}.xlsx`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    await _saveFile(`RFQ_candidate_list_${stem}.xlsx`, bytes);
   } catch (err) {
     console.error('[export rfq list] failed', err);
     alert('Export failed: ' + (err.message || err));
@@ -2073,15 +2052,9 @@ _b = gen_supplier_followup_xlsx(_followup_supplier)
 base64.b64encode(_b).decode('ascii')
 `);
         const bytes = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
-        const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
         const safeSup = sup.replace(/[^a-zA-Z0-9_-]/g, '_');
         const ts = new Date().toISOString().slice(0, 10);
-        a.href = url;
-        a.download = `Followup_${safeSup}_${ts}.xlsx`;
-        document.body.appendChild(a); a.click(); a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 1500);
+        await _saveFile(`Followup_${safeSup}_${ts}.xlsx`, bytes);
       } catch (err) {
         console.error('[followup xlsx]', err);
         alert('Follow-up xlsx generation failed: ' + (err.message || err));
@@ -3239,13 +3212,8 @@ base64.b64encode(b).decode("ascii") if isinstance(b, (bytes, bytearray)) else ""
 `);
     if (!out) return;
     const bytes = Uint8Array.from(atob(out), c => c.charCodeAt(0));
-    const blob = new Blob([bytes], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
     const ts = new Date().toISOString().slice(0, 10);
-    a.href = url; a.download = `${filenamePart}_${name.replace(/[^a-zA-Z0-9._-]+/g, '_')}_${ts}.xlsx`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    await _saveFile(`${filenamePart}_${name.replace(/[^a-zA-Z0-9._-]+/g, '_')}_${ts}.xlsx`, bytes);
   } catch (err) {
     console.error('[scenario-action]', kind, err);
     alert(`${kind} failed: ` + (err.message || err));
@@ -3302,13 +3270,8 @@ _b = gen_decision_log_xlsx(_dl_scenario, rfq_id=_dl_rfq_id)
 base64.b64encode(_b).decode('ascii')
 `);
     const xb = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
-    const xblob = new Blob([xb], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    const xurl = URL.createObjectURL(xblob);
-    const xa = document.createElement('a');
     const safeName = scenarioName.replace(/[^a-zA-Z0-9_-]/g, '_');
-    xa.href = xurl; xa.download = `DecisionLog_${safeName}_${rfqId}.xlsx`;
-    document.body.appendChild(xa); xa.click(); xa.remove();
-    setTimeout(() => URL.revokeObjectURL(xurl), 1500);
+    await _saveFile(`DecisionLog_${safeName}_${rfqId}.xlsx`, xb);
 
     // Markdown (for an internal tool)
     await new Promise(r => setTimeout(r, 400));
@@ -3316,12 +3279,8 @@ base64.b64encode(_b).decode('ascii')
 from app_engine import gen_decision_log_markdown
 gen_decision_log_markdown(_dl_scenario, rfq_id=_dl_rfq_id)
 `);
-    const mblob = new Blob([md], { type: 'text/markdown' });
-    const murl = URL.createObjectURL(mblob);
-    const ma = document.createElement('a');
-    ma.href = murl; ma.download = `DecisionLog_${safeName}_${rfqId}.md`;
-    document.body.appendChild(ma); ma.click(); ma.remove();
-    setTimeout(() => URL.revokeObjectURL(murl), 1500);
+    const mdBytes = new TextEncoder().encode(md);
+    await _saveFile(`DecisionLog_${safeName}_${rfqId}.md`, mdBytes);
 
     alert(
       `Decision log generated:\n\n` +
@@ -3358,14 +3317,8 @@ json.dumps(_encoded)
     for (const [supplier, b64] of Object.entries(letters)) {
       if (b64 === null) { skip++; continue; }
       const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
       const safeSup = supplier.replace(/[^a-zA-Z0-9_-]/g, '_');
-      a.href = url;
-      a.download = `AwardLetter_${safeSup}_${rfqId}.xlsx`;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      await _saveFile(`AwardLetter_${safeSup}_${rfqId}.xlsx`, bytes);
       dl++;
       await new Promise(r => setTimeout(r, 300));
     }
@@ -3392,14 +3345,8 @@ _b = gen_internal_award_summary_xlsx(_summary_scenario, rfq_id=_summary_rfq_id)
 base64.b64encode(_b).decode('ascii')
 `);
     const bytes = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
-    const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
     const safeName = scenarioName.replace(/[^a-zA-Z0-9_-]/g, '_');
-    a.href = url;
-    a.download = `INTERNAL_${safeName}_${rfqId}.xlsx`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    await _saveFile(`INTERNAL_${safeName}_${rfqId}.xlsx`, bytes);
   } catch (err) {
     console.error('[internal summary]', err);
     alert('Internal summary generation failed: ' + (err.message || err));
@@ -4251,15 +4198,10 @@ json.dumps({"files": encoded, "errors": result.get("errors", {}), "n_items": res
     // Trigger one download per supplier.
     for (const [sup, b64] of Object.entries(result.files || {})) {
       const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
       const safeSup = sup.replace(/[^a-zA-Z0-9_-]/g, '_');
       const ts = new Date().toISOString().slice(0, 10);
-      a.href = url;
-      a.download = `Round${roundNum}_RFQ_${safeSup}_${ts}.xlsx`;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      await _saveFile(`Round${roundNum}_RFQ_${safeSup}_${ts}.xlsx`, bytes);
+      await new Promise(r => setTimeout(r, 200));
     }
     let msg = `Generated ${successCount} Round ${roundNum} file${successCount === 1 ? '' : 's'} (${result.n_items || 0} items each).`;
     if (Object.keys(errs).length) {
@@ -5686,13 +5628,9 @@ restore_state(_restore_payload.to_py())
         console.warn('[saveMgr] folder save failed; falling back to download:', err);
       }
     }
-    // Fallback: trigger a download
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = fname;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    // Fallback: route through _saveFile (native dialog in pywebview, browser download elsewhere)
+    const jsonBytes = new TextEncoder().encode(json);
+    await _saveFile(fname, jsonBytes);
     _lastSavedAt = new Date();
     _lastSaveMethod = 'download';
     _dirty = false;
@@ -6654,6 +6592,73 @@ function _flashStatus(msg) {
 // ==========================================================================
 // Helpers
 // ==========================================================================
+
+// _saveFile — single point of truth for saving generated bytes to disk.
+//
+// In the standalone WebView2 launcher (Edge WebView2 on Windows via
+// pywebview) the browser's built-in download mechanism is unreliable
+// because file:// origin pages are blocked from triggering downloads
+// under most corporate Edge policies. So when running inside pywebview,
+// we send the bytes back to Python through the bridge and let Python
+// open a native Save-As dialog and write the file itself. Same UX as
+// Excel "Save As".
+//
+// In a regular browser (e.g. Mac dev), pywebview isn't there — fall
+// back to the classic createObjectURL + anchor click pattern.
+//
+// Args:
+//   filename — suggested filename (used to derive file type hint)
+//   bytes    — Uint8Array of the file contents
+async function _saveFile(filename, bytes) {
+  // Path 1 — pywebview + native save dialog (Windows / production).
+  // The launcher.py Api class exposes save_file(filename, b64). We
+  // base64-encode in chunks (large xlsx files would blow the call stack
+  // if we passed the whole Uint8Array to fromCharCode in one shot).
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.save_file) {
+    try {
+      let binary = '';
+      const chunk = 8192;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      const b64 = btoa(binary);
+      const result = await window.pywebview.api.save_file(filename, b64);
+      return result; // null if user canceled, path string if saved
+    } catch (e) {
+      console.warn('[saveFile] pywebview path failed:', e);
+      alert(`Save failed (pywebview): ${e && e.message ? e.message : e}\n\nFile: ${filename}\n\nIf this keeps happening, contact support.`);
+      return null;
+    }
+  }
+  // Path 2 — Mac / Linux dev OR a browser running against the local
+  // http.server. createObjectURL + anchor click works there. Under the
+  // production Windows + WebView2 + file:// configuration this path is
+  // typically blocked by Edge corporate policy — but in dev contexts
+  // (Mac dev server, Chrome, Firefox) it works fine. We surface a clear
+  // error if download triggering fails so the analyst knows whether the
+  // file is actually written.
+  const ext = (filename.split('.').pop() || '').toLowerCase();
+  const mime = ext === 'xlsx' ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+             : ext === 'md'   ? 'text/markdown'
+             : ext === 'json' ? 'application/json'
+             : 'application/octet-stream';
+  try {
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    return filename;
+  } catch (e) {
+    console.error('[saveFile] browser-download fallback failed:', e);
+    alert(`Save failed (browser-download fallback): ${e && e.message ? e.message : e}\n\nFile: ${filename}\n\nIf running on Windows, ensure the app was launched via start.bat (not by opening app.html directly in a browser).`);
+    return null;
+  }
+}
+// Backwards-compat alias
+const _saveXlsx = _saveFile;
+
 function _escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
