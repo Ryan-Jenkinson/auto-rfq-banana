@@ -249,14 +249,14 @@
       <button class="btn ghost" id="export-rfq-list" title="Export the FULL candidate list as an internal-audience xlsx (includes historical paid prices, scoring, demand flags). Don't send to suppliers — supplier-bound files are generated separately and exclude internal-only fields.">⬇ Export candidate list (xlsx)</button>
       <button class="btn ghost" id="export-exclusion-log" title="Export every per-item line you've unticked as a 'data quality event log' xlsx. Cross-app schema (app_source / event_type / item_num / line snapshot / before-baseline) so it can be concatenated with the supplier-pricing and tariff-impact equivalents into one master audit packet. Internal-only — never forward.">📋 Export exclusion log…</button>
       <button class="btn ghost" id="gen-outbound-rfq" title="Build per-supplier outbound RFQ workbooks for the items currently ticked. Each is a 5-tab xlsx with locked cells, dropdown validation, hidden round-trip keys, and NO internal-only fields (no historical paid prices). One file per supplier — what actually goes to the bidder.">📤 Generate outbound RFQ files…</button>
-      <button class="btn primary" id="to-bids" title="Move to step 4 — drop returned bid xlsx files from each supplier, see the comparison matrix, run consolidation analysis, save award scenarios, and generate award letters.">Compare supplier bids →</button>
+      <button class="btn primary" id="to-bids" title="Move to step 4 — drop returned bid xlsx files from each supplier (the first time you arrive here, intake comes before comparison). After bids load, the page builds the comparison matrix, consolidation analysis, saved award scenarios, and award letters.">Manage bids →</button>
     </div>
   </section>
 
   <!-- STEP 4: Returned-bid intake + comparison + consolidation -->
   <section id="step-4" class="step" hidden>
-    <h1>Compare supplier bids</h1>
-    <p class="subtitle">Drop each supplier's returned bid xlsx (any number of suppliers — typically 2-5). The app auto-detects the response template, matches each bid line back to the RFQ via the Part Number column, and surfaces consolidation winner + carve-out exceptions + outliers.</p>
+    <h1>Manage supplier bids</h1>
+    <p class="subtitle">Drop each supplier's returned bid xlsx (any number of suppliers — typically 2-5). The app auto-detects the response template, matches each bid line back to the RFQ via the Part Number column, and surfaces the system recommendation + carve-outs + outliers as bids arrive.</p>
 
     <div id="bid-intake-row" class="bid-intake-row"></div>
 
@@ -286,8 +286,11 @@
          → Advanced. -->
     <div id="drawer-stack" hidden style="margin-top:32px;">
       <details class="rfq-drawer" id="drawer-hybrid">
-        <summary class="rfq-drawer-summary"><span class="rfq-drawer-label">Hybrid with carve-outs</span><span class="rfq-drawer-teaser" id="drawer-hybrid-teaser">—</span></summary>
+        <summary class="rfq-drawer-summary"><span class="rfq-drawer-label">Carve-out details</span><span class="rfq-drawer-teaser" id="drawer-hybrid-teaser">—</span></summary>
         <div class="rfq-drawer-body">
+          <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2);letter-spacing:0.02em;margin-bottom:14px;padding:8px 12px;background:rgba(86,210,255,0.04);border-left:2px solid var(--cyan);border-radius:3px;">
+            ⓘ The carve-outs below are AUTOMATIC under the active <span style="color:var(--cyan);">Consolidate to</span> chip. Pick a different consolidate target via the chip dropdown to recompute. To "do" the hybrid award, you've already done it by picking the chip — the next step is to bookmark via Saved Scenarios + generate award letters.
+          </div>
           <div id="consolidation-block"></div>
         </div>
       </details>

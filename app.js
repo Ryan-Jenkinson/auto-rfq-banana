@@ -2224,7 +2224,16 @@ function _renderHeadlineCard(headline, consolidation) {
     if (c.key === 'consolidate_to') {
       const sup = active && _activeChip === 'consolidate_to' && active.consolidate_supplier
         ? active.consolidate_supplier : (headline.default_consolidate_supplier || '—');
-      label = `Consolidate to: ${sup} <span class="chip-caret">▾</span>`;
+      // Show carve count inline so the chip name carries the truth: this
+      // strategy includes carve-outs as part of its math, not as a separate
+      // option. (Backlog #19c — make the hybrid-vs-consolidate vocabulary
+      // obviously be one thing.)
+      const consolSummary = strategies && strategies.consolidate_to;
+      const ncarves = consolSummary ? (consolSummary.n_carved || 0) : 0;
+      const carveSuffix = ncarves > 0
+        ? ` <span style="color:var(--ink-2);font-weight:400;">+${ncarves} carve</span>`
+        : '';
+      label = `Consolidate to: ${sup}${carveSuffix} <span class="chip-caret">▾</span>`;
     }
     return `<button class="chip${isActive?' active':''}" data-chip="${c.key}" type="button" title="${c.tip.replace(/"/g,'&quot;')}">${label}${savings}</button>`;
   }).join('');
@@ -2458,14 +2467,19 @@ json.dumps(_STATE.get("items", []))
 function _updateDrawerTeasers(data) {
   const fmt$ = (n) => n == null ? '—' : (n < 0 ? '−$' : '$') + Math.abs(n).toLocaleString('en-US', {maximumFractionDigits: 0});
 
-  // Hybrid drawer: carve-out savings from consolidation analysis
+  // Hybrid drawer teaser — frames the carves as part of the active
+  // consolidate strategy, not a separate option. "+ $X / N carved off
+  // <target>" reads as a refinement of the chip's verdict.
   const hybridT = $('drawer-hybrid-teaser');
   if (hybridT) {
     const w = (data.consolidation && data.consolidation.winner) || null;
     const carves = (w && w.carve_outs) || [];
     const carveSavings = (w && w.carve_out_savings_total) || 0;
+    const target = w ? w.supplier : null;
     if (carves.length === 0) {
       hybridT.innerHTML = '<span class="empty">no carve-outs at current thresholds</span>';
+    } else if (target) {
+      hybridT.innerHTML = `<span class="savings">+${fmt$(carveSavings)}</span> &nbsp;<span class="count">${carves.length} item${carves.length===1?'':'s'} carved off ${_escapeHtml(target)}</span>`;
     } else {
       hybridT.innerHTML = `<span class="savings">+${fmt$(carveSavings)}</span> &nbsp;<span class="count">${carves.length} item${carves.length===1?'':'s'} carved</span>`;
     }
@@ -2853,28 +2867,32 @@ function _renderScenariosBlock(scenarios, consol) {
   const fmt$ = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const fmtPct = (n) => n == null ? '—' : (n).toFixed(1) + '%';
 
-  let html = '<h2 style="margin-top:0;">Award scenarios</h2>';
-  html += '<p class="subtitle" style="margin-bottom:18px;">Save named what-ifs (lowest-price / consolidate to one supplier / incumbent-preferred / qualified-only). Compare two side-by-side to see where the awards differ.</p>';
-
-  // Quick-create row — each strategy button carries an ELI5 explanation of
-  // what the engine does when you pick it, so the analyst can tell which
-  // award philosophy matches the situation without re-reading the docs.
-  html += `<div style="display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap;">
-    <button class="btn ghost" data-scenario-quick="lowest_price" title="Award every item to whichever supplier bid the lowest priced offer — UOM mismatches and substitute parts INCLUDED. Maximizes raw savings on paper; least defensible if a 'lowest' price is actually a UOM error.">＋ Lowest price</button>
-    <button class="btn ghost" data-scenario-quick="lowest_qualified" title="Like 'Lowest price' but EXCLUDES bids flagged UOM_DISC or SUBSTITUTE — picks the lowest 'clean' bid per item. The defensible default — what you'd present in an audit.">＋ Lowest qualified (no UOM/sub)</button>`;
-  // One consolidate-to button per supplier
+  // Headline-card-style visual (Ryan's request — match the system-recommendation
+  // band so the two scenario surfaces use the same vocabulary). Pretitle +
+  // chip-strip row of bookmark buttons + count line + saved list below.
+  const nSaved = (scenarios || []).length;
+  let html = `<div class="headline-card" style="padding:28px 32px 24px;">
+    <div class="headline-pretitle" title="The chip strip in the headline above is for live exploration. The buttons in this section save the current strategy as a named bookmark — so you can compare two side-by-side later, generate award letters from a frozen snapshot, or audit the decision trail.">SCENARIO BOOKMARKS</div>
+    <div class="headline-verdict" style="font-size:22px;margin-bottom:8px;"><span class="award-label">SAVE A STRATEGY</span><span class="placeholder" style="font-size:18px;">— bookmarks freeze at save time</span></div>
+    <div class="headline-counts" style="margin-bottom:18px;">${nSaved.toLocaleString()} bookmark${nSaved===1?'':'s'} saved · pick exactly 2 to compare side-by-side · award letters / Decision Summary read from a saved bookmark</div>
+    <div class="chip-strip" id="scenario-bookmark-strip">
+      <button class="chip" data-scenario-quick="lowest_price" title="Save the Lowest-Price strategy as a bookmark. Award every item to whichever supplier bid the lowest priced offer — UOM mismatches and substitute parts INCLUDED. Maximizes raw savings on paper; least defensible if a 'lowest' price is actually a UOM error." type="button">📌 Lowest price</button>
+      <button class="chip" data-scenario-quick="lowest_qualified" title="Save the Lowest-Qualified strategy. Like 'Lowest price' but EXCLUDES bids flagged UOM_DISC or SUBSTITUTE — picks the lowest 'clean' bid per item. The defensible default." type="button">📌 Lowest qualified</button>`;
   for (const sup of (Object.keys(_loadedBids) || [])) {
-    html += `<button class="btn ghost" data-scenario-consolidate="${_escapeHtml(sup)}" title="Award everything to ${_escapeHtml(sup)} as primary, but carve out items where another supplier saves &gt;30% (the carve_out_min_savings_pct threshold). Models 'one PO, fewer relationships, identified exceptions' — Ryan's actual award strategy.">＋ Consolidate to ${_escapeHtml(sup)}</button>`;
+    html += `<button class="chip" data-scenario-consolidate="${_escapeHtml(sup)}" title="Save the Consolidate-to-${_escapeHtml(sup)} strategy as a bookmark. Award everything to ${_escapeHtml(sup)} as primary, with automatic carve-outs where another supplier saves enough (≥% or ≥$/yr — the dual-threshold OR-rule). The carves are part of this strategy, not separate." type="button">📌 Consolidate → ${_escapeHtml(sup)}</button>`;
   }
-  html += `<button class="btn ghost" data-scenario-quick="incumbent_preferred" title="Stay with the incumbent supplier wherever they bid — unless competition saves at least min_savings_pct_to_switch (threshold setting). Use when relationship continuity matters or switching costs are real.">＋ Incumbent preferred</button>`;
-  html += `</div>`;
+  html += `<button class="chip" data-scenario-quick="incumbent_preferred" title="Save the Incumbent-Preferred strategy. Stay with the incumbent supplier wherever they bid — unless competition saves enough to justify switching." type="button">📌 Incumbent preferred</button>
+    </div>
+  </div>`;
 
   if (!scenarios || !scenarios.length) {
-    html += `<div style="padding:32px;text-align:center;color:var(--ink-2);border:1px dashed var(--line);border-radius:6px;font-family:var(--ui);">No scenarios saved yet. Click one of the buttons above to save your first what-if.</div>`;
+    html += `<div style="padding:32px;text-align:center;color:var(--ink-2);border:1px dashed var(--line);border-radius:6px;font-family:var(--ui);margin-top:18px;">No scenarios bookmarked yet. Click a chip above to save the active strategy.</div>`;
     el.innerHTML = html;
     _wireScenarioButtons();
     return;
   }
+  // Spacer between the headline-style chip strip and the saved list table
+  html += '<div style="margin-top:22px;"></div>';
 
   // Scenarios table
   html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;margin-bottom:18px;"><table style="width:100%;border-collapse:collapse;font-size:13px;font-family:var(--mono);">';
@@ -3222,7 +3240,7 @@ function _renderConsolidation(consol) {
     const rowBg = isFocused ? 'background:rgba(255,183,51,0.12);' : (isWinner ? 'background:rgba(255,183,51,0.06);' : '');
     html += `<tr class="clickable-row" data-consol-supplier="${_escapeHtml(c.supplier)}" title="Click to focus the comparison matrix on ${_escapeHtml(c.supplier)} — see exactly which items they bid and at what price." style="border-bottom:1px solid var(--line);${rowBg}">
       <td style="padding:12px 14px;font-weight:${isWinner ? '700' : '400'};color:${isWinner ? 'var(--accent)' : 'var(--ink-0)'};">
-        ${isWinner ? '★ ' : ''}${_escapeHtml(c.supplier)}${isFocused ? ' <span style="font-size:10px;color:var(--accent);font-family:var(--mono);letter-spacing:0.08em;margin-left:6px;">FOCUSED</span>' : ''}
+        ${isWinner ? '★ ' : ''}${_escapeHtml(c.supplier)}${isFocused ? ` <button type="button" class="consol-focus-clear" data-clear-focus="1" title="Currently filtering the matrix to ${_escapeHtml(c.supplier)} — click to clear focus." style="display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--accent);font-family:var(--mono);letter-spacing:0.08em;margin-left:8px;background:rgba(255,183,51,0.15);border:1px solid var(--accent);padding:2px 6px;border-radius:3px;cursor:pointer;text-transform:uppercase;">FOCUSED ✕</button>` : ''}
       </td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${c.n_items_quoted.toLocaleString()}</td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${c.pct_items_quoted.toFixed(1)}%</td>
@@ -3319,7 +3337,17 @@ function _renderConsolidation(consol) {
   }
 
   el.innerHTML = html;
-  // Wire candidate rows → focus matrix on that supplier.
+  // Wire candidate rows → focus matrix on that supplier. The inline
+  // FOCUSED ✕ button stops propagation and clears focus directly so the
+  // analyst doesn't have to click the row a second time (which is the
+  // toggle-off path but easy to miss).
+  el.querySelectorAll('[data-clear-focus]').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      _matrixFilter.supplier = null;
+      _rerenderMatrixWithFilters();
+    });
+  });
   el.querySelectorAll('[data-consol-supplier]').forEach(tr => {
     tr.addEventListener('click', () => {
       const sup = tr.getAttribute('data-consol-supplier');
