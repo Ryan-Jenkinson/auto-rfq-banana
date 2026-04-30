@@ -3779,9 +3779,23 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
             "missing_value_at_history": missing_at_history,
         })
 
-    # Sort by consolidation_value ASC (cheapest = best consolidation candidate)
-    # Tiebreak: more items quoted (higher coverage) wins
-    candidates.sort(key=lambda c: (c["consolidation_value"], -c["n_items_quoted"]))
+    # Two-tier ranking: COVERAGE FIRST, then aggregate value.
+    # Without the coverage tier, a supplier who only quotes 1 cheap item beats
+    # a supplier who quotes everything (their aggregate is tiny). The realistic
+    # consolidation question is "who can we award the most to?" — that's
+    # bounded by what they actually quoted. Top tier = suppliers with at least
+    # `min_coverage_pct` of items quoted; among them, lowest aggregate wins.
+    # Falls through to the legacy ranking if nobody clears the bar.
+    min_coverage_pct = 50.0   # quote at least half the RFQ to be a serious consolidation candidate
+    high_coverage = [c for c in candidates if c["pct_items_quoted"] >= min_coverage_pct]
+    if high_coverage:
+        # Within the top tier, lowest value wins; tiebreak: more items.
+        high_coverage.sort(key=lambda c: (c["consolidation_value"], -c["n_items_quoted"]))
+        low_coverage = [c for c in candidates if c["pct_items_quoted"] < min_coverage_pct]
+        low_coverage.sort(key=lambda c: (c["consolidation_value"], -c["n_items_quoted"]))
+        candidates = high_coverage + low_coverage
+    else:
+        candidates.sort(key=lambda c: (c["consolidation_value"], -c["n_items_quoted"]))
 
     winner_block = None
     if candidates:
@@ -5345,6 +5359,168 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
         "savings_pct": (historical_total - award_total) / historical_total * 100.0 if historical_total else 0.0,
         "award_by_supplier": by_supplier,
         "awards": awards,
+    }
+
+
+def _summarize_eval_for_headline(evaluated: dict, consolidate_supplier: str = None) -> dict:
+    """Compress a full _evaluate_scenario result into the slim shape the
+    headline card needs: which supplier wins the most $, totals, savings,
+    carve-out count. Used only for the chip-strip pre-compute — never mutates
+    state. Picks `supplier_primary` as the supplier with the largest awarded
+    $ (concentration) so the headline's "AWARD TO X" reads true even when
+    a strategy splits awards across suppliers.
+    """
+    by_sup = evaluated.get("award_by_supplier") or {}
+    award_total = evaluated.get("award_total") or 0.0
+    primary_sup = None
+    primary_value = 0.0
+    if by_sup:
+        primary_sup, primary_value = max(by_sup.items(), key=lambda kv: kv[1] or 0.0)
+    primary_pct = (primary_value / award_total * 100.0) if award_total else 0.0
+    return {
+        "supplier_primary": primary_sup,
+        "supplier_primary_value": primary_value,
+        "supplier_primary_pct": primary_pct,
+        "award_total": award_total,
+        "historical_total": evaluated.get("historical_total") or 0.0,
+        "savings_total": evaluated.get("savings_total") or 0.0,
+        "savings_pct": evaluated.get("savings_pct") or 0.0,
+        "n_items": evaluated.get("n_items") or 0,
+        "n_awarded": evaluated.get("n_awarded") or 0,
+        "n_carved": evaluated.get("n_carved") or 0,
+        "n_locked": evaluated.get("n_locked") or 0,
+        "n_locks_unhonored": evaluated.get("n_locks_unhonored") or 0,
+        "n_no_award": evaluated.get("n_no_award") or 0,
+        "award_by_supplier": dict(by_sup),
+        "consolidate_supplier": consolidate_supplier,
+    }
+
+
+def compute_headline_strategies(consolidate_supplier: str = None) -> dict:
+    """Pre-compute headline numbers for all 5 award strategies so the chip
+    switcher in step 4's headline card can flip between them with no Python
+    round-trip. Each strategy's totals / supplier mix / savings / carve-outs
+    are computed from the current bids + item_locks + item_exclusions state.
+
+    Argument:
+      consolidate_supplier — which supplier to consolidate to. If None, defaults
+        to the top consolidation candidate from compute_consolidation_analysis.
+
+    Returns:
+      {
+        "strategies": {
+          "lowest_price":        {summary},
+          "lowest_qualified":    {summary},
+          "incumbent_preferred": {summary},
+          "consolidate_to":      {summary, "consolidate_supplier": str},
+          "manual":              {summary} | None,   # only present if scenarios named "manual" exist
+        },
+        "default_chip":                  "consolidate_to" if a supplier is available else "lowest_qualified",
+        "default_consolidate_supplier":  str | None,
+        "available_consolidate_suppliers": [str, ...],     # all suppliers with priced bids
+        "manual_overrides": {
+          "n_locks":           int,
+          "n_exclusions":      int,    # number of items with at least one excluded line
+          "n_uom_resolutions": int,    # UOM annotations the analyst has applied
+        },
+        "thresholds": {
+          "carve_out_min_savings_pct":            float,
+          "carve_out_min_savings_annual_dollar":  float,
+        },
+      }
+
+    All five strategies use the SAME item_locks / overrides plumbing in
+    _evaluate_scenario, so a locked item shows up identically in every chip.
+    The carve-out OR-rule (% or $/yr) applies to consolidate_to only.
+    """
+    bids_by_supplier = _STATE.get("bids", {}) or {}
+    suppliers_with_priced = []
+    for sup, parsed in bids_by_supplier.items():
+        for b in parsed.get("bids", []):
+            if b.get("status") == BID_STATUS_PRICED and b.get("effective_price"):
+                suppliers_with_priced.append(sup)
+                break
+
+    consol = compute_consolidation_analysis()
+    candidates = consol.get("candidates") or []
+    default_consolidate = candidates[0]["supplier"] if candidates else None
+    if consolidate_supplier is None:
+        consolidate_supplier = default_consolidate
+
+    strategies = {}
+    for strat in ("lowest_price", "lowest_qualified", "incumbent_preferred"):
+        evaluated = _evaluate_scenario(strat, {}, {})
+        strategies[strat] = _summarize_eval_for_headline(evaluated)
+
+    if consolidate_supplier:
+        evaluated = _evaluate_scenario("consolidate_to", {"supplier": consolidate_supplier}, {})
+        strategies["consolidate_to"] = _summarize_eval_for_headline(evaluated, consolidate_supplier)
+    else:
+        strategies["consolidate_to"] = None
+
+    # Manual is only meaningful if the analyst saved one — not pre-computed
+    # here. The chip is enabled regardless; clicking it surfaces saved manual
+    # scenarios from the drawer.
+    strategies["manual"] = None
+
+    item_locks = _STATE.get("item_locks", {}) or {}
+    item_exclusions = _STATE.get("item_exclusions", {}) or {}
+    uom_annotations = _STATE.get("uom_annotations", {}) or {}
+    manual_overrides = {
+        "n_locks": len(item_locks),
+        "n_exclusions": sum(1 for v in item_exclusions.values() if v),
+        "n_uom_resolutions": len([k for k, v in uom_annotations.items() if v and v.get("factor") is not None]),
+    }
+
+    th = get_thresholds()
+    return {
+        "strategies": strategies,
+        "default_chip": "consolidate_to" if default_consolidate else "lowest_qualified",
+        "default_consolidate_supplier": default_consolidate,
+        "available_consolidate_suppliers": suppliers_with_priced,
+        "manual_overrides": manual_overrides,
+        "thresholds": {
+            "carve_out_min_savings_pct": th["carve_out_min_savings_pct"],
+            "carve_out_min_savings_annual_dollar": th["carve_out_min_savings_annual_dollar"],
+        },
+    }
+
+
+def reset_to_auto() -> dict:
+    """Clear analyst-applied manual overrides — locks, item exclusions, and
+    UOM annotations — so the system returns to its purely-auto recommendation.
+    Audit-logged. Returns the post-reset manual_overrides counts (should all
+    be zero) for the UI to confirm.
+    """
+    n_locks = len(_STATE.get("item_locks") or {})
+    n_excl = sum(1 for v in (_STATE.get("item_exclusions") or {}).values() if v)
+    n_uom = len(_STATE.get("uom_annotations") or {})
+
+    # Recompute aggregates for items we're un-excluding so last_unit_price /
+    # qty_*/spend_* go back to the raw historicals.
+    affected_items = [k for k, v in (_STATE.get("item_exclusions") or {}).items() if v]
+    _STATE["item_exclusions"] = {}
+    _STATE["item_locks"] = {}
+    _STATE["uom_annotations"] = {}
+    for it_num in affected_items:
+        _recompute_item_aggregates_for(it_num)
+    _rebuild_kpis_from_items()
+
+    log_event(
+        "reset_to_auto",
+        f"cleared {n_locks} locks · {n_excl} item exclusions · {n_uom} UOM annotations",
+    )
+    return {
+        "cleared": {
+            "n_locks": n_locks,
+            "n_exclusions": n_excl,
+            "n_uom_resolutions": n_uom,
+        },
+        "manual_overrides": {
+            "n_locks": 0,
+            "n_exclusions": 0,
+            "n_uom_resolutions": 0,
+        },
     }
 
 
