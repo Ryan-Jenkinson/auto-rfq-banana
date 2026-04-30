@@ -261,7 +261,7 @@
     <div id="bid-intake-row" class="bid-intake-row"></div>
 
     <div class="actions" style="margin-top:0;">
-      <button class="btn ghost" id="bid-add-btn" title="Drop or pick a returned-bid xlsx from one supplier. Auto-detects 'our format' (the template you sent in step 3); if the supplier reformatted, you'll get a manual column-mapping prompt. Add as many suppliers as you want — typical RFQs are 2-5.">＋ Add supplier bid xlsx</button>
+      <button class="btn ghost" id="bid-add-btn" title="Drop or pick a returned-bid xlsx from one supplier. Handles BOTH Round 1 bids AND Round 2 / Rn returns — the parser auto-detects which kind by reading the file's sheet names. Round-N returns OVERWRITE the supplier's prior bid for items they re-quoted, leaving items they didn't re-quote untouched. If the supplier reformatted (non-template R1 file), you'll get a manual column-mapping prompt. Add as many suppliers as you want — typical RFQs are 2-5.">＋ Add supplier bid xlsx</button>
       <input type="file" id="bid-file-input" accept=".xlsx" style="display:none">
       <button class="btn ghost" id="bid-clear-btn" title="Remove every loaded bid (does not delete the source xlsx). Use to start step 4 over with a clean slate.">Clear all bids</button>
     </div>

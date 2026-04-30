@@ -1797,41 +1797,31 @@ async function _onBidFileSelected(file) {
   const name = prompt(`Supplier name for "${file.name}":`, suggest);
   if (!name) return;
 
-  // Detect Round-2/Rn vs Round-1 by sheet-name + filename heuristic. Round
-  // files have a "Round N Response" sheet (set by gen_round2_rfq_xlsx)
-  // and/or a "Round" / "R2" / "R3" hint in the filename. We let Python
-  // make the final routing call so a stray filename can't misroute.
-  const looksLikeRoundN = /round[\s_]*[2-9]\d*|^r[2-9]\d*[\s_]/i.test(file.name) || /round[\s_]*[2-9]\d*/i.test(file.name);
-
   $('bid-add-btn').disabled = true;
-  $('bid-add-btn').textContent = looksLikeRoundN ? 'Parsing R2…' : 'Parsing…';
+  $('bid-add-btn').textContent = 'Parsing…';
   try {
     const buf = await file.arrayBuffer();
     const bytes = new Uint8Array(buf);
     _py.globals.set('_bid_bytes', bytes);
     _py.globals.set('_bid_supplier', name);
-    _py.globals.set('_likely_rn', looksLikeRoundN);
-    // Try R2/Rn ingest first if the filename hint is there. The Python
-    // function returns {error: ...} when the file's not actually a Round
-    // file (e.g., user named a R1 file "Round 1" by mistake) and we fall
-    // back to the standard R1 intake. Otherwise we go straight to R1.
+    // Always sniff for Round-N first regardless of filename — the sheet
+    // names (set by gen_round2_rfq_xlsx as "Round N Response") are
+    // intrinsic to the file and survive any rename. parse_round2_supplier_bid
+    // returns {error: ...} for R1 files (no Round-style sheet found,
+    // header pattern doesn't match), so we fall back cleanly. This
+    // prevents a renamed R2 file from being misrouted as R1 (which would
+    // clobber the supplier's R1 bid set).
     const out = await _py.runPythonAsync(`
 import json
 from app_engine import ingest_supplier_bid, ingest_round2_supplier_bid, parse_round2_supplier_bid
-result = None
-routed_via = "round_1"
-if _likely_rn:
-    # Sniff first — only commit to R2 ingest if the parser confirms.
-    sniff = parse_round2_supplier_bid(_bid_bytes.to_py(), supplier_name=_bid_supplier)
-    if not sniff.get("error") and sniff.get("items") and (sniff.get("round") or 0) >= 2:
-        result = ingest_round2_supplier_bid(_bid_bytes.to_py(), _bid_supplier)
-        result["routed_via"] = f"round_{result.get('round', 2)}"
-    else:
-        result = ingest_supplier_bid(_bid_bytes.to_py(), _bid_supplier)
-        result["routed_via"] = "round_1_fallback_after_round_sniff"
+sniff = parse_round2_supplier_bid(_bid_bytes.to_py(), supplier_name=_bid_supplier)
+is_round_n = (not sniff.get("error")) and bool(sniff.get("items")) and (sniff.get("round") or 0) >= 2
+if is_round_n:
+    result = ingest_round2_supplier_bid(_bid_bytes.to_py(), _bid_supplier)
+    result["routed_via"] = f"round_{result.get('round', 2)}"
 else:
     result = ingest_supplier_bid(_bid_bytes.to_py(), _bid_supplier)
-    result["routed_via"] = routed_via
+    result["routed_via"] = "round_1"
 json.dumps(result, default=str)
 `);
     const parsed = JSON.parse(out);
