@@ -311,6 +311,49 @@ $('to-mapping').addEventListener('click', async () => {
 $('back-to-1').addEventListener('click', () => _showStep(1));
 $('back-to-2').addEventListener('click', () => _showStep(2));
 $('back-to-3').addEventListener('click', () => _showStep(3));
+
+// Decision Summary xlsx — the legal-hold narrative companion. Generated on
+// demand from current state; analyst should download once they've finalized
+// the award decision (typically right before generating award letters).
+const _genDecBtn = $('gen-decision-summary');
+if (_genDecBtn) {
+  _genDecBtn.addEventListener('click', async () => {
+    if (!_py) { alert('Engine not loaded yet.'); return; }
+    _genDecBtn.disabled = true;
+    const orig = _genDecBtn.textContent;
+    _genDecBtn.textContent = '⏳ Building Decision Summary…';
+    try {
+      // Use the source-data filename stem if available so the Decision Summary
+      // file lives next to the rest of the RFQ packet (audit log, exclusion
+      // log, award letters) without naming collisions.
+      const stem = (_exportFile && _exportFile.name)
+        ? _exportFile.name.replace(/\.xlsx$/i, '').replace(/[^a-zA-Z0-9._-]+/g, '_')
+        : 'rfq';
+      const ts = new Date().toISOString().slice(0, 10);
+      const rfqId = (window._rfqResult && window._rfqResult.rfq_id) || stem;
+      const rfqIdLit = JSON.stringify(rfqId);
+      const out = await _py.runPythonAsync(`
+import base64
+from app_engine import gen_decision_summary_xlsx
+b = gen_decision_summary_xlsx(scenario_name=None, rfq_id=${rfqIdLit})
+base64.b64encode(b).decode("ascii")
+`);
+      const bytes = Uint8Array.from(atob(out), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `DecisionSummary_auto-rfq-banana_${stem}_${ts}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    } catch (err) {
+      console.error('[decision-summary]', err);
+      alert('Decision Summary export failed: ' + (err.message || err));
+    } finally {
+      _genDecBtn.disabled = false;
+      _genDecBtn.textContent = orig;
+    }
+  });
+}
 $('to-bids').addEventListener('click', async () => {
   _showStep(4);
   await _refreshBidViews();
@@ -3355,8 +3398,8 @@ function _renderComparisonMatrix(matrix) {
   html += '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
   html += `<thead style="background:var(--bg-2);position:sticky;top:0;z-index:1;"><tr>
     <th title="Tick to select this item for the next Round 2 / Rn focused-RFQ batch. Use to push back on items where bids look uncompetitive — selected items get sent to picked suppliers for a re-quote, with the historical-trend reference price shown for context." style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;width:36px;">R2</th>
-    <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item #</th>
-    <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Description</th>
+    <th title="Item description (Coupa exports call this the 'Item' field — it's the mandatory, always-populated long descriptive name). The text most analysts recognize at a glance, leading with this column rather than the bare part number." style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item</th>
+    <th title="Andersen item number — the part-number dedup key (item_num / eam_pn / part_number cascade). Distinct from the descriptive 'Item' column to its left." style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Part #</th>
     <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty 24mo</th>
     <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Last $/ea</th>`;
   for (const sup of suppliers) {
@@ -3439,8 +3482,8 @@ function _renderComparisonMatrix(matrix) {
       <td style="padding:6px 8px;text-align:center;" class="r2-cell">
         <input type="checkbox" class="r2-row-check" data-r2-item="${_escapeHtml(r.item_num)}" ${isSelectedR2 ? 'checked' : ''} title="Tick to include this item in the next Round 2 batch — pushes the supplier(s) for a sharper-pencil re-quote with their R1 echo + reference price shown." style="cursor:pointer;accent-color:var(--accent);">
       </td>
-      <td style="padding:8px 10px;color:var(--ink-0);">${_escapeHtml(r.item_num)}</td>
-      <td style="padding:8px 10px;color:var(--ink-1);max-width:240px;">${_escapeHtml(_truncate(r.description, 50))}</td>
+      <td style="padding:8px 10px;color:var(--ink-0);max-width:340px;" title="${_escapeHtml(r.description || '')}">${_escapeHtml(_truncate(r.description, 70))}</td>
+      <td style="padding:8px 10px;color:var(--ink-2);font-family:var(--mono);font-size:11px;">${_escapeHtml(r.item_num)}</td>
       <td style="padding:8px 10px;text-align:right;color:var(--ink-0);">${(r.qty_24mo||0).toLocaleString()}</td>
       <td style="padding:8px 10px;text-align:right;color:var(--ink-1);">$${(r.last_unit_price||0).toFixed(2)}</td>
       ${cells}
