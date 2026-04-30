@@ -5483,6 +5483,549 @@ window._saveMgr = _saveMgr;
 _setupUniversalTableDelegator();
 
 // ==========================================================================
+// Glossary — searchable reference for every term in the app.
+//
+// The hover tooltips are 1-2 sentence cues; the glossary goes deeper:
+// - 2-4 sentence definitions
+// - Worked examples with concrete numbers where the term is mathematical
+// - Common-confusion notes for terms that are easy to mix up
+// - Cross-references to related entries (clickable to re-search)
+//
+// Data is a single static array (no Python round-trip). Search is plain
+// substring + alias match across term/aliases/definition/example/related.
+// Multiple matches are navigable via Enter / Shift+Enter / nav buttons.
+// ==========================================================================
+
+const _GLOSSARY = [
+  // ----- Tiers and scoring -----
+  {term: "STRONG (tier)", aliases: ["strong"], category: "Tiers and scoring",
+    definition: "Top-tier candidate item. Score 70-100. Strong evidence of repeat demand: multiple recent orders, meaningful spend across at least one window, descriptive enough to send to a supplier without ambiguity. Default-include in RFQs.",
+    example: "An item ordered 14 times across 3 years totaling $18,400, last ordered 22 days ago, with a clear MFG part number — typically scores in the 80s and lands STRONG.",
+    related: ["MODERATE", "WEAK", "SKIP", "Score", "Smart Trim"]},
+  {term: "MODERATE (tier)", aliases: ["moderate"], category: "Tiers and scoring",
+    definition: "Mid-tier candidate. Score 50-69. Some signals of repeat demand but with caveats — older orders, small spend, generic descriptions, or single-source. Worth including in RFQs but worth a glance before sending.",
+    example: "An item ordered 4 times over 3 years, $1,200 total spend, last ordered 8 months ago, MFG blank — likely scores ~58 (MODERATE).",
+    related: ["STRONG", "WEAK", "SKIP", "Score"]},
+  {term: "WEAK (tier)", aliases: ["weak"], category: "Tiers and scoring",
+    definition: "Low-confidence candidate. Score 30-49. Limited demand evidence — 2-3 historical orders, large gaps, low spend, or significant demand drop-off. Typically dropped from RFQs because the historical pattern doesn't justify re-bid effort.",
+    example: "An item ordered twice — once in 2023, once in 2024 — totaling $340, with a generic description ('miscellaneous fastener'). Likely scores ~38 (WEAK).",
+    related: ["SKIP", "MODERATE", "Smart Trim", "Dormancy"]},
+  {term: "SKIP (tier)", aliases: ["skip"], category: "Tiers and scoring",
+    definition: "Bottom-tier item. Score 0-29. Worst signals: dormant for 12+ months, very low spend, generic descriptions, or descriptions matching red flags (service / freight / tariff). Usually dropped from RFQs entirely; sometimes deleted from the working list.",
+    example: "An item ordered once in 2022 for $48, description 'miscellaneous part'. Scores ~12 (SKIP). Smart Trim's 'drop SKIP-only' option removes items like this in bulk.",
+    related: ["WEAK", "Smart Trim", "Dormancy", "Description flags"]},
+  {term: "Score", aliases: ["scoring", "rfq score"], category: "Tiers and scoring",
+    definition: "A 0-100 number the engine assigns to each candidate item, summarizing demand evidence. Built from: spend across 12/24/36-month windows, recency, order count, description quality, MFG completeness, and demand-pattern flags. Higher is better. Score determines tier (STRONG/MODERATE/WEAK/SKIP).",
+    example: "An item with $5,000 of 24-mo spend, last ordered 90 days ago, 8 historical orders, full MFG data scores around 75 (STRONG).",
+    related: ["STRONG", "MODERATE", "WEAK", "SKIP", "Difficulty rating"]},
+  {term: "Difficulty rating", aliases: ["difficulty"], category: "Tiers and scoring",
+    definition: "A file-level 0-100 rating summarizing how hard the source data is to work with. Built from: % items in WEAK/SKIP, % missing MFG, % generic descriptions, UOM-mixed counts. Snapshotted with timestamp for period-end reporting. Higher = more difficult.",
+    example: "A file with 89% WEAK/SKIP, 84% missing MFG, 89% generic descriptions, 22% UOM-mixed scores ~62 (DIFFICULT).",
+    related: ["Score", "Smart Trim"]},
+
+  // ----- Items and identifiers -----
+  {term: "Item (description)", aliases: ["description", "item description"], category: "Items and identifiers",
+    definition: "The mandatory long descriptive name of a part — Coupa exports populate this consistently as the 'Item' field. The matrix and RFQ-list lead with this column because it's what analysts recognize at a glance, more so than a bare part number.",
+    example: "'Bearing 6203 2RS SKF stainless' is an Item description. Compare to the Part # which might be a cryptic '5709A45'.",
+    related: ["Part #", "EAM Part Number", "Description flags"]},
+  {term: "Part # (Item Number)", aliases: ["item #", "item number", "part number"], category: "Items and identifiers",
+    definition: "The internal item-number key for an item — typically the buyer-side identifier from the source system (ERP / Coupa). Used as the primary dedup key. Distinct from the manufacturer's part number (Mfg PN).",
+    example: "An internal Part # of '12345' for an item whose mfg part number is 'SKF-6203-2RS'.",
+    related: ["EAM Part Number", "Mfg PN", "Dedup key cascade"]},
+  {term: "EAM Part Number", aliases: ["eam pn", "eam part #"], category: "Items and identifiers",
+    definition: "The Enterprise Asset Management system's part number — a buyer-side fallback when the primary Item # is missing. Common when items come in via cXML / PunchOut feeds where the supplier's catalog is the system of record.",
+    example: "If Item # is blank but EAM Part # is '78901', the engine uses EAM as the dedup key for that record.",
+    related: ["Part #", "Dedup key cascade", "Mfg PN"]},
+  {term: "Mfg PN", aliases: ["mfg part number", "manufacturer part number", "manufacturer pn"], category: "Items and identifiers",
+    definition: "The manufacturer's catalog part number for the physical part — distinct from the buyer-side Part #. Same physical bearing might have multiple distributor-side Part #s but only one Mfg PN. Critical for cross-supplier item identity.",
+    example: "An SKF 6203 2RS bearing has Mfg PN '6203-2RS' regardless of whether you buy it through Distributor A (their part # 5709A45) or Distributor B (their part # B-6203).",
+    related: ["Mfg name", "Part #"]},
+  {term: "Mfg name", aliases: ["manufacturer", "manufacturer name", "mfg"], category: "Items and identifiers",
+    definition: "The brand / manufacturer of the part. Often blank in cXML / PunchOut feeds where the distributor's own SKU is the only identifier present. The matcher infers Mfg from cross-references when 3+ suppliers carry the same item.",
+    example: "Mfg='SKF' for an SKF 6203 bearing. Mfg='N/A' or blank in cXML records — the matcher backfills these where it can.",
+    related: ["Mfg PN"]},
+  {term: "Dedup key cascade", aliases: ["dedup", "deduplication"], category: "Items and identifiers",
+    definition: "The fallback rule for picking which field is the canonical key when items appear under inconsistent identifiers. Tries Item # first, falls back to EAM Part #, then to the supplier's Part Number. Two records that resolve to the same key are treated as the same item.",
+    example: "Record A has Item #='12345', EAM='', Part#=''. Record B has Item #='', EAM='ABC', Part#='ABC'. They are NOT the same item under cascade rules — A keys on Item #, B keys on EAM. The matcher will identify cross-key clusters separately.",
+    related: ["Part #", "EAM Part Number", "Mfg PN"]},
+  {term: "UOM", aliases: ["unit of measure", "uom"], category: "Items and identifiers",
+    definition: "Unit of measure — EA (each), BX (box), CS (case), PK (pack), FT (foot), etc. UOM mismatches between bid and history are a major source of false savings (a per-each $0.10 bid looks like 10× cheaper than a per-box $1.00 historical price for the same item).",
+    example: "Item bought historically as '$1.20 per BOX of 100'. A supplier bids '$0.012 per EA' — that's the SAME price, not a 99% savings. UOM_DISC catches this.",
+    related: ["UOM_mixed", "UOM_DISC", "UOM annotation"]},
+  {term: "UOM_mixed", aliases: ["uom mixed"], category: "Items and identifiers",
+    definition: "A flag on an item where its historical orders span multiple distinct UOMs (e.g. some POs as EA, some as BX). Indicates messy data — the LAST $/ea may not be representative, since the unit conversion isn't consistent.",
+    example: "An item with 5 historical orders: 3 in EA at $1.20, 2 in BX at $120. The 'last unit price' of $120 isn't the per-each price — UOM_mixed flag warns the analyst.",
+    related: ["UOM", "UOM_DISC"]},
+
+  // ----- Demand windows and historical math -----
+  {term: "12-mo / 24-mo / 36-mo (windows)", aliases: ["12mo", "24mo", "36mo", "demand window"], category: "Demand windows and math",
+    definition: "Rolling demand windows anchored to the dataset's most recent order date (NOT the wall clock — exports are often weeks stale). Quantities and spend are aggregated within each window. The 24-mo window is the default for award-value calculations.",
+    example: "If the dataset's most recent order was on 2026-04-15, the 24-mo window covers 2024-04-15 to 2026-04-15. Items ordered before 2024-04-15 contribute to 36-mo but not 24-mo.",
+    related: ["Anchor date", "Last $/ea", "Dormancy"]},
+  {term: "Anchor date (anchor 'now')", aliases: ["anchor now", "data anchor"], category: "Demand windows and math",
+    definition: "The point-in-time the engine treats as 'now' for all windowed calculations. Set to the most recent order date in the source data — NOT today's wall-clock date. This prevents stale exports from artificially de-aging items.",
+    example: "If the export was generated 6 weeks ago and the latest order in it was 2026-03-01, the engine treats 'now' as 2026-03-01. An item last ordered on 2026-02-15 is 14 days old, not 8 weeks.",
+    related: ["12-mo / 24-mo / 36-mo (windows)", "Dormancy"]},
+  {term: "Last $/ea", aliases: ["last unit price", "last paid price"], category: "Demand windows and math",
+    definition: "The exact unit price of the most recent priced order line for an item. No medians, no averages, no smoothing. RFQ math is to-the-penny: this is the historical baseline that bids are compared against.",
+    example: "An item with 5 historical orders at $1.10, $1.15, $1.20, $1.18, $1.22 has Last $/ea of $1.22 — the most recent. NOT the average ($1.17).",
+    related: ["12-mo / 24-mo / 36-mo (windows)", "Last order date", "Cost avoidance vs historical"]},
+  {term: "Last order date", aliases: ["last order"], category: "Demand windows and math",
+    definition: "The date of the most recent priced order line for an item. Drives the recency component of scoring and the dormancy flags.",
+    example: "An item with last order date 2026-04-12 is 'recent'; one with last order date 2024-08-03 has been dormant for ~20 months under a 2026 anchor.",
+    related: ["Dormancy", "Anchor date"]},
+  {term: "Dormancy", aliases: ["dormant", "dormant 12mo", "dormancy window"], category: "Demand windows and math",
+    definition: "The state of an item with no orders in the past N months. The Smart Trim panel offers 12 / 24 / 36-month dormancy windows — items with no orders in the chosen window are candidates to drop. Longer dormancy = higher confidence the demand is gone.",
+    example: "Smart Trim with a 12-month dormancy window unticks every item whose last order date is more than 12 months before the anchor date.",
+    related: ["Smart Trim", "Anchor date"]},
+  {term: "Annual qty (run rate)", aliases: ["annual qty"], category: "Demand windows and math",
+    definition: "An annualized run-rate computed as 24-mo qty divided by 2. Used in carve-out math (annual savings = price delta × annual qty) so the dollar threshold is comparable across items with different purchase cadences.",
+    example: "An item with 24-mo qty = 10,000 has annual run-rate 5,000. A carve that saves $0.50/unit yields $2,500/yr in annual savings.",
+    related: ["Carve threshold ($)", "Carve-out OR-rule"]},
+
+  // ----- Description flags -----
+  {term: "Description flags", aliases: ["description pattern flags"], category: "Description flags",
+    definition: "Per-item flags raised by pattern-matching the item description against a curated word list. Three severity levels: red (service/freight/tariff/obsolete/rental — usually don't belong in an RFQ), amber (custom/repair/misc — caution), informational (generic — analyst should add a better description).",
+    related: ["RED flag", "AMBER flag", "Generic"]},
+  {term: "RED flag (description)", aliases: ["red flag", "service flag", "freight flag", "tariff flag", "obsolete flag", "rental flag"], category: "Description flags",
+    definition: "A description pattern that almost certainly shouldn't be in an RFQ: the description contains keywords like 'service', 'freight', 'tariff', 'obsolete', 'rental', 'shipping', etc. These are non-material costs or items that don't have stable demand.",
+    example: "An item with description 'FREIGHT — expedited shipping' or 'TARIFF SURCHARGE 2024' lands a RED flag and is typically dropped from the RFQ via Smart Trim.",
+    related: ["Description flags", "Smart Trim"]},
+  {term: "AMBER flag (description)", aliases: ["amber flag", "custom flag", "repair flag"], category: "Description flags",
+    definition: "A caution-level description pattern: contains 'custom', 'repair', 'misc', 'special', etc. Items might be legitimate but warrant a closer look — custom parts often don't bid competitively across multiple suppliers.",
+    example: "An item with description 'CUSTOM HOSE assembly per drawing 12345' is amber-flagged. Worth keeping in the RFQ if you want pricing, but expect a low bid response rate.",
+    related: ["Description flags", "RED flag"]},
+  {term: "Generic (description flag)", aliases: ["generic flag"], category: "Description flags",
+    definition: "An informational flag for descriptions that are too vague to be useful — 'miscellaneous part', 'unspecified', 'see drawing', etc. Suppliers can't bid intelligently against a generic description; these items often need a description rewrite before going to RFQ.",
+    related: ["Description flags"]},
+
+  // ----- Smart Trim -----
+  {term: "Smart Trim", aliases: ["smart trim", "trim panel"], category: "Smart Trim",
+    definition: "A panel that bulk-unticks RFQ candidates based on configurable rules: dormancy window (12 / 24 / 36 mo), drop red description flags, drop by tier (WEAK+SKIP or SKIP-only), drop below a 24-mo $ minimum. Live preview shows what will be unticked before commit; 30-second Undo button is visible after apply.",
+    example: "Configure: 24-mo dormancy + drop SKIP-only + drop below $200 24-mo spend → preview shows 412 items will be unticked → click Apply → if you change your mind in 30 seconds, click Undo.",
+    related: ["Dormancy", "WEAK", "SKIP", "Description flags"]},
+  {term: "Undo (Smart Trim)", aliases: ["undo trim", "smart trim undo"], category: "Smart Trim",
+    definition: "Restores the RFQ-include checkbox state from immediately before the last Smart Trim apply. Visible for 30 seconds after each apply. Reversible at any point by manual re-checking too.",
+    related: ["Smart Trim"]},
+
+  // ----- Bid statuses -----
+  {term: "PRICED (bid status)", aliases: ["priced"], category: "Bid statuses",
+    definition: "A supplier provided a clean unit price for an item. The default expectation. PRICED bids feed directly into the comparison matrix and award scenarios.",
+    related: ["NO_BID", "NEED_INFO", "UOM_DISC", "SUBSTITUTE"]},
+  {term: "NO_BID (bid status)", aliases: ["no_bid", "no bid"], category: "Bid statuses",
+    definition: "Supplier explicitly declined to bid the item. Excluded from the recommendation engine. If many suppliers no-bid the same item, it's a follow-up flag — maybe the description was unclear or the part is obsolete.",
+    related: ["NEED_INFO", "PRICED"]},
+  {term: "NEED_INFO (bid status)", aliases: ["need_info", "need info"], category: "Bid statuses",
+    definition: "Supplier wants more information before pricing — typically a spec, drawing, or sample. The follow-up xlsx generator includes these in the 'Missing Information' tab so the analyst can package answers.",
+    related: ["NO_BID", "ASK_CLARIFICATION"]},
+  {term: "UOM_DISC (bid status)", aliases: ["uom_disc", "uom discrepancy"], category: "Bid statuses",
+    definition: "The supplier flagged a UOM mismatch between their pricing and the requested unit of measure. CRITICAL: a UOM_DISC bid that looks dramatically cheaper than history is almost certainly a unit conversion error, not real savings. The carve-out engine excludes UOM-suspect savings until verified.",
+    example: "History anchor: $1.20 per BOX of 100. Supplier bids $0.0123 per EACH and flags UOM_DISC. Looks like 99% savings — actually they're priced per-each ($0.0123 × 100 = $1.23/box, only ~3% savings). UOM_DISC alerts the analyst.",
+    related: ["UOM", "UOM annotation", "Suspect carve held"]},
+  {term: "SUBSTITUTE (bid status)", aliases: ["substitute", "sub offered"], category: "Bid statuses",
+    definition: "Supplier didn't quote the exact MFG PN requested but offered a different MFG part as a substitute. Treat with caution — the substitute may be a worse fit (different brand, different spec, different lead time). 'Lowest Qualified' strategy excludes SUBSTITUTE bids from default award.",
+    example: "RFQ asks for SKF 6203-2RS at $X. Supplier offers NTN 6203LLU as a SUBSTITUTE at $Y. Cheaper, but engineering may need to confirm equivalence.",
+    related: ["Lowest Qualified", "PRICED"]},
+
+  // ----- Recommendations -----
+  {term: "ACCEPT (recommendation)", aliases: ["accept"], category: "Recommendations",
+    definition: "The engine recommends awarding to the lowest priced bidder. Conditions: bid is competitive (>= the switch threshold below historical), no UOM/SUB flags on the lowest, bid spread isn't statistically anomalous.",
+    related: ["PUSH_BACK", "ASK_CLARIFICATION", "MANUAL_REVIEW"]},
+  {term: "PUSH_BACK (recommendation)", aliases: ["push_back", "push back"], category: "Recommendations",
+    definition: "The lowest bid is above the historical baseline by more than the pushback threshold. Engine recommends going back to the supplier for a sharper pencil or a Round 2.",
+    example: "Historical $5.20/ea, lowest bid $5.85/ea (+12%). Above the 10% pushback threshold → PUSH_BACK.",
+    related: ["ACCEPT", "Round 2", "Reference price"]},
+  {term: "ASK_CLARIFICATION (recommendation)", aliases: ["ask_clarification", "clarification"], category: "Recommendations",
+    definition: "The lowest bid has a flag (UOM_DISC, SUBSTITUTE, NEED_INFO) that needs to be resolved before the bid can be trusted. Engine routes to the follow-up xlsx generator.",
+    related: ["UOM_DISC", "SUBSTITUTE", "NEED_INFO"]},
+  {term: "EXCLUDE (recommendation)", aliases: ["exclude"], category: "Recommendations",
+    definition: "Item should be excluded from the award entirely — typically because no supplier bid, or all bids no-bid'd, or all bids are flagged. Action: drop from RFQ, follow up with suppliers, or convert to a different sourcing channel.",
+    related: ["NO_BID", "MANUAL_REVIEW"]},
+  {term: "MANUAL_REVIEW (recommendation)", aliases: ["manual_review", "manual review"], category: "Recommendations",
+    definition: "The engine couldn't decide cleanly. Conditions: statistical outlier on lowest bid, marginal savings below the switch threshold, or coverage too thin to compare. Analyst judgment required.",
+    related: ["ACCEPT", "Outlier (bid)"]},
+
+  // ----- Coverage -----
+  {term: "FULL (coverage)", aliases: ["full coverage", "3+ bids", "full competition"], category: "Coverage",
+    definition: "An item received 3 or more priced bids. Full competition; recommendation engine has the most signal here. The 3+ bids KPI tile counts items in this state.",
+    related: ["PARTIAL", "SINGLE", "NONE"]},
+  {term: "PARTIAL (coverage)", aliases: ["partial coverage", "2 bids", "partial competition"], category: "Coverage",
+    definition: "An item received exactly 2 priced bids. Some competition, but spread analysis is weaker. The 2 bids KPI tile counts these.",
+    related: ["FULL", "SINGLE"]},
+  {term: "SINGLE (coverage)", aliases: ["single source", "1 bid"], category: "Coverage",
+    definition: "An item received exactly 1 priced bid. No competition; the bid is essentially a take-it-or-leave-it. Worth a follow-up before awarding to test for negotiation room.",
+    example: "An item where only Supplier A priced — Supplier B and Supplier C no-bid'd. Single-source means Supplier A has no incentive to sharpen pencil. Send a follow-up.",
+    related: ["FULL", "PARTIAL", "NONE", "Round 2 (Rn)"]},
+  {term: "NONE (coverage)", aliases: ["none coverage", "0 bids", "uncovered"], category: "Coverage",
+    definition: "An item received NO priced bid from any supplier. Cannot be awarded as part of this RFQ. Counted as 'uncovered' — surfaces in the headline as a follow-up signal and is excluded from savings math (its historical does NOT inflate the savings number).",
+    example: "An item with $4,200 historical 24-mo spend that no supplier bid on lands 'uncovered'. The $4,200 is reported separately, NOT counted as savings.",
+    related: ["Uncovered count", "Uncovered historical", "Cost avoidance vs historical"]},
+  {term: "Outlier (bid)", aliases: ["outlier", "outliers"], category: "Coverage",
+    definition: "A bid where the lowest price is statistically anomalous vs the cross-supplier median or vs the historical baseline. Threshold: typically >3× or <1/3 of median. Triggers MANUAL_REVIEW because outliers are often UOM mistakes or typos.",
+    example: "Historical $5.20, two suppliers at $5.10 / $5.30, third supplier at $0.52. The third is likely a per-each-vs-per-package error. Flagged outlier.",
+    related: ["MANUAL_REVIEW", "UOM_DISC"]},
+
+  // ----- Strategies -----
+  {term: "Lowest Price (strategy)", aliases: ["lowest price"], category: "Award strategies",
+    definition: "For each item, award to whichever supplier bid lowest. UOM_DISC and SUBSTITUTE bids are INCLUDED. Maximizes raw savings on paper; least defensible if a 'lowest' price is actually a UOM error. Use sparingly.",
+    related: ["Lowest Qualified", "Strategy chip"]},
+  {term: "Lowest Qualified (strategy)", aliases: ["lowest qualified"], category: "Award strategies",
+    definition: "Same logic as Lowest Price but EXCLUDES bids flagged UOM_DISC or SUBSTITUTE. The defensible default — what you'd present in an audit. The recommendation engine produces this view.",
+    example: "Item has bids: Supplier A at $5.10 (UOM_DISC), Supplier B at $5.40 (PRICED), Supplier C at $5.45 (PRICED). Lowest Price awards to A; Lowest Qualified awards to B.",
+    related: ["Lowest Price", "UOM_DISC", "SUBSTITUTE"]},
+  {term: "Consolidate to (strategy)", aliases: ["consolidate", "consolidate to"], category: "Award strategies",
+    definition: "Award everything to one named supplier as primary, EXCEPT items where the carve-out OR-rule fires (another supplier saves enough to justify a carve). The carves are AUTOMATIC under this strategy — they're part of the math, not a separate option. The standard playbook for MRO categories.",
+    example: "Consolidate to Supplier-A: 1,200 items go to A. 47 items where Supplier-B beats A by ≥20% or ≥$3K/yr automatically carve to B. Headline reads: 'CONSOLIDATE TO Supplier-A · 47 carve-outs'.",
+    related: ["Carve-out", "Carve-out OR-rule", "Suspect carve held"]},
+  {term: "Incumbent Preferred (strategy)", aliases: ["incumbent preferred", "incumbent"], category: "Award strategies",
+    definition: "Stay with the historical supplier wherever they bid, UNLESS competition saves at least the switch threshold (default ~5%). Use when relationship continuity matters or switching costs are real. NOTE: if the incumbent doesn't have any priced bid, this strategy degrades to Lowest Price for every item.",
+    example: "Historical supplier bids $5.30. Lowest competitor bids $5.20. Savings = 1.9% < 5% threshold → keep with incumbent. If lowest competitor were $4.85 (8.5%), incumbent would lose.",
+    related: ["Lowest Price"]},
+  {term: "Manual (strategy)", aliases: ["manual strategy"], category: "Award strategies",
+    definition: "Item awards are explicitly set by the analyst, item by item, via locks and per-scenario overrides. The headline reflects whatever the saved manual snapshot contains.",
+    related: ["Item lock", "Snapshot"]},
+  {term: "Strategy chip", aliases: ["chip", "chip strip", "strategy chips"], category: "Award strategies",
+    definition: "The five-button row in the headline card. Click any chip to switch the headline + matrix view to that strategy LIVE — no save needed. Default chip on bid-load is 'Consolidate to' with the top consolidation candidate as the named target.",
+    related: ["Lowest Price (strategy)", "Lowest Qualified (strategy)", "Consolidate to (strategy)", "Incumbent Preferred (strategy)", "Manual (strategy)", "Snapshot"]},
+
+  // ----- Carve-outs -----
+  {term: "Carve-out", aliases: ["carve", "carveout", "carve out"], category: "Carve-outs",
+    definition: "An item where, under a Consolidate-to strategy, the consolidation winner is overridden in favor of a different supplier — because that other supplier's savings clear the carve threshold. The carve-out is part of the consolidation strategy, not a separate option.",
+    example: "Strategy: Consolidate to Supplier-A. Item X: Supplier-A at $10/ea, Supplier-B at $7/ea. With carve-threshold 20%, the 30% savings fires the carve → Item X awarded to Supplier-B even though strategy is consolidate to A.",
+    related: ["Consolidate to (strategy)", "Carve-out OR-rule", "Suspect carve held"]},
+  {term: "Carve-out OR-rule", aliases: ["carve or-rule", "carve dual threshold"], category: "Carve-outs",
+    definition: "The dual-threshold rule that decides whether a carve-out fires: (% savings ≥ threshold A) OR (annual $ savings ≥ threshold B). Defaults: 20% / $3,000-yr. Either firing carves the item. Industry-best-practice — single-threshold rules over-carve on long-tail and under-carve on high-volume.",
+    example: "Threshold: 20% / $3K/yr. Item B (qty 20, RED $10, BLUE $7): 30% pct savings, $30/yr → PCT rule fires. Item C (qty 20K, RED $10, BLUE $9.50): 5% pct, $5K/yr → DOLLAR rule fires. Both carve.",
+    related: ["Carve threshold (%)", "Carve threshold ($)", "Carve rule fired"]},
+  {term: "Carve threshold (%)", aliases: ["carve_out_min_savings_pct", "carve pct threshold"], category: "Carve-outs",
+    definition: "The minimum percent savings (vs the consolidation winner's price) needed to fire a carve-out under the OR-rule. Default 20%. Editable in ⚙ Thresholds.",
+    related: ["Carve-out OR-rule", "Carve threshold ($)"]},
+  {term: "Carve threshold ($)", aliases: ["carve_out_min_savings_annual_dollar", "carve dollar threshold"], category: "Carve-outs",
+    definition: "The minimum annual dollar savings needed to fire a carve-out under the OR-rule. Default $3,000/yr. Editable in ⚙ Thresholds. Annual savings = (winner price − other price) × annual qty (where annual qty = 24-mo qty / 2).",
+    related: ["Carve-out OR-rule", "Carve threshold (%)", "Annual qty (run rate)"]},
+  {term: "Carve rule fired", aliases: ["carve_rule_fired", "rule fired"], category: "Carve-outs",
+    definition: "Per-carve-out, which side of the OR-rule fired: PCT (only the % rule), DOLLAR (only the $/yr rule), or BOTH. Carried in the carve record and shown in tooltips so the analyst can see which threshold justified the carve.",
+    example: "ITEM_D (qty 15K, RED $10, BLUE $7): 30% pct AND $22.5K/yr → BOTH. ITEM_C (qty 20K, 5% pct, $5K/yr) → DOLLAR only. ITEM_B (qty 20, 30% pct, $30/yr) → PCT only.",
+    related: ["Carve-out OR-rule"]},
+  {term: "Suspect carve held", aliases: ["suspect carve", "n_suspect_carves_held", "uom-suspect"], category: "Carve-outs",
+    definition: "A carve-out that would have fired BUT the cheaper bid is UOM-suspect (UOM_DISC flagged OR price ratio target/chosen ≥ ~20×, almost certainly per-each-vs-per-package mismatch). The carve is held — the item stays at the consolidation target's price — and the suspect carve is recorded but its 'savings' are NOT counted.",
+    example: "Strategy: Consolidate to A. A bids $10. B bids $0.40 with UOM_DISC. The 96% savings would fire BOTH rules — but it's a suspect carve. Item awarded to A at $10. n_suspect_carves_held increments.",
+    related: ["UOM_DISC", "UOM suspect ratio", "Carve-out OR-rule"]},
+  {term: "UOM suspect ratio", aliases: ["uom_suspect_ratio"], category: "Carve-outs",
+    definition: "The price-ratio threshold above which a bid is auto-flagged UOM-suspect even when neither side flags UOM_DISC explicitly. Default 20×. If consolidation_winner_price / cheapest_other ≥ 20, the cheap bid is treated as UOM-suspect.",
+    related: ["Suspect carve held", "UOM_DISC"]},
+
+  // ----- Math -----
+  {term: "Covered award total", aliases: ["covered_award_total"], category: "Savings math",
+    definition: "Total $ awarded across items that received a priced bid. Apples-to-apples — items with no bid don't add zero to this; they're tracked separately as uncovered. Headline 'award total' reads from this field.",
+    example: "1,500 items got bids; awarded total = $1,492,226. 8,608 items got no bids — their historical $X is in uncovered_historical_total, NOT in this number.",
+    related: ["Covered historical total", "Covered savings", "Uncovered count"]},
+  {term: "Covered historical total", aliases: ["covered_historical_total"], category: "Savings math",
+    definition: "Historical $ paid for the SAME set of items the strategy awarded. Apples-to-apples baseline — items the strategy couldn't award (no bid available) are excluded so their historical doesn't masquerade as savings.",
+    related: ["Covered award total", "Covered savings"]},
+  {term: "Covered savings", aliases: ["covered_savings_total", "savings"], category: "Savings math",
+    definition: "covered_historical_total − covered_award_total. The truthful savings figure: what you would have paid historically for the items you're now awarding, minus what you're awarding them for. Items with no bid don't inflate this.",
+    example: "Awarded $1.49M. Historical for those same items: $2.05M. Covered savings: $556K. Uncovered items (no bid) have $X historical that's reported separately, NOT folded into the $556K.",
+    related: ["Covered award total", "Covered historical total", "Cost avoidance vs historical"]},
+  {term: "Uncovered count", aliases: ["uncovered_count", "uncovered items"], category: "Savings math",
+    definition: "Number of items where NO supplier provided a priced bid under the active strategy. Surfaced as a separate follow-up signal in the headline — not folded into savings.",
+    example: "11,169 items in RFQ. 2,561 got at least one priced bid (covered). 8,608 got no priced bid (uncovered). Headline shows '⚠ 8,608 items uncovered (no bid) — $X historical, NOT in savings'.",
+    related: ["Uncovered historical", "NONE (coverage)"]},
+  {term: "Uncovered historical", aliases: ["uncovered_historical_total"], category: "Savings math",
+    definition: "Historical 24-mo spend on items where no supplier bid. Reported as a follow-up signal — these items need a different sourcing path (Round 2, follow-up RFQ, catalog) — but their $ is NOT counted as savings since the strategy isn't actually awarding them.",
+    related: ["Uncovered count"]},
+  {term: "Cost avoidance vs historical", aliases: ["cost avoidance"], category: "Savings math",
+    definition: "covered_savings_total in plain language: what you save vs paying the historical baseline. Used for leadership reporting against budgeted spend. Apples-to-apples — uncovered items are excluded.",
+    related: ["Covered savings", "Savings uplift vs auto baseline"]},
+  {term: "Savings uplift vs auto baseline", aliases: ["savings vs auto", "savings_vs_auto", "uplift"], category: "Savings math",
+    definition: "What manual curation gained vs simply taking the lowest_qualified auto-recommendation. Computed as: auto.covered_award_total − active.covered_award_total. Quantifies the value of the analyst's work specifically (locks, exclusions, scenario picks) vs no-touch.",
+    example: "Auto baseline (lowest_qualified): $1,500,000 award total. Active (consolidate_to with 3 manual locks): $1,485,000 → savings uplift $15,000. Even when small, the audit trail of WHY the curation happened is valuable.",
+    related: ["Cost avoidance vs historical"]},
+
+  // ----- Per-item modal -----
+  {term: "Outlier exclusion", aliases: ["exclusion", "exclude line"], category: "Per-item modal",
+    definition: "An analyst-confirmed action to drop a specific PO line from the trend / price math for an item. Untick a row in the modal's Order Lines table — the trend, R², 90-day median, expected-today price, last_unit_price, and qty/spend windows all recompute live on the cleaned set. Persists per item across reloads.",
+    example: "An item had 5 historical orders at $1.20-$1.25 and one outlier at $0.05 (typo). Untick the $0.05 row → trend recomputes; last_unit_price drops back to $1.25 (the previous, real, most-recent price).",
+    related: ["Item lock", "Reset to auto"]},
+  {term: "Item lock", aliases: ["lock", "locked"], category: "Per-item modal",
+    definition: "An analyst-confirmed pin: this item's award goes to a specific supplier across every scenario. Applied via the per-bid lock button on the per-item modal. Beats strategy logic; loses only to per-scenario manual overrides. Useful when you've audited a bid and want to ensure no automated 'lowest price' awards override your judgment.",
+    example: "Item X has bids A=$0.12 (suspicious typo) and B=$1.20 (sensible). Lock to B. Now every strategy awards X to B regardless of A's $0.12.",
+    related: ["Outlier exclusion", "Reset to auto", "Manual (strategy)"]},
+  {term: "Follow-up flag", aliases: ["flag for follow-up", "post-award flag"], category: "Per-item modal",
+    definition: "A per-item flag the analyst sets when they want to mark an item for post-award double-check (e.g., 'verify with site lead', 'confirm UOM after first PO arrives'). Three states: NEW (no flag) → FLAGGED (with note) → RESOLVED (with resolution note). All flags surface in Decision Summary Tab 6.",
+    related: ["Decision Summary"]},
+  {term: "UOM annotation", aliases: ["uom resolution"], category: "Per-item modal",
+    definition: "An analyst-applied UOM conversion factor for a (item, supplier) pair where their UOM differs from history. Example: history is per-BOX-of-100, supplier is per-EACH; annotation factor=100 means multiply supplier's per-each price by 100 to compare to history. Lives in the UOM Resolution Queue (in the Advanced drawer).",
+    related: ["UOM_DISC", "UOM"]},
+
+  // ----- Round 2 / Rn -----
+  {term: "Round 2 (Rn)", aliases: ["round 2", "r2", "round n"], category: "Round 2 / Rn",
+    definition: "A focused re-RFQ for a small subset of items — typically items where the bid spread suggests the supplier has room to sharpen pencil. Generated via the R2 toolbar in the matrix. Each Round 2 xlsx echoes the supplier's R1 bid + a reference price + a paragraph explaining the request.",
+    example: "After R1 you note 8 items where the spread is wide. Tick them in the R2 column → click Generate → you get one R2 xlsx per supplier with just those 8 items. Drop returned R2 xlsx files back into step 4 — they overwrite the R1 prices for re-quoted items only.",
+    related: ["Reference price", "PUSH_BACK", "R2 cell badge"]},
+  {term: "Reference price", aliases: ["projected price", "trend reference"], category: "Round 2 / Rn",
+    definition: "A historical-trend-projected expected price shown in Round 2 RFQ files. Built from cleaned-trend extrapolation. Gives the supplier context for what their bid was vs what history suggests is fair. Includes an explanatory banner so the supplier understands the basis.",
+    related: ["Round 2 (Rn)"]},
+  {term: "R2 cell badge", aliases: ["r2 badge", "r2 cell"], category: "Round 2 / Rn",
+    definition: "A small badge in the matrix on cells where a Round 2 / Rn return overwrote the R1 bid. Shows the % delta vs the prior round (e.g., 'R2 ↓ 5%') with the prior price in the tooltip. Cyan-tinted background + right-edge stripe make these visible at a scan.",
+    related: ["Round 2 (Rn)"]},
+
+  // ----- Outputs -----
+  {term: "Outbound RFQ", aliases: ["outbound rfq xlsx", "supplier rfq"], category: "Outputs",
+    definition: "A per-supplier xlsx file generated from the curated RFQ list. Multi-tab (Cover / Instructions / Items / Quote Terms / etc.). Hidden round-trip identifiers (item_key, rfq_line_id) so returned bids match back to the right line. NO buyer-internal-only fields (no historical paid prices, no internal targets).",
+    related: ["Cross-supplier isolation", "Round 2 (Rn)"]},
+  {term: "Award letter", aliases: ["award letter xlsx"], category: "Outputs",
+    definition: "A per-supplier xlsx confirming the award decision: the supplier's awarded items + their bid + the qty awarded + delivery terms. Strict cross-supplier isolation guard — the export refuses with IsolationViolation if any other supplier's name appears in any cell.",
+    related: ["Cross-supplier isolation", "Outbound RFQ"]},
+  {term: "Internal summary", aliases: ["internal full-detail", "internal_award_summary"], category: "Outputs",
+    definition: "A cross-supplier xlsx with every bid + every decision in one workbook. INTERNAL — NEVER FORWARD banner. For internal review, finance handoff, audit. Never sent to a supplier.",
+    related: ["Award letter", "Decision Summary"]},
+  {term: "Decision Summary", aliases: ["decision summary xlsx", "legal-hold record"], category: "Outputs",
+    definition: "The legal-hold narrative companion to award letters: 7 tabs (Executive_Summary with prose narrative / Settings_Thresholds / Analyst_Actions / System_Flags / CostAvoid_vs_Savings / FollowUp_Items / Decision_Log_Timeline). Captures cost avoidance vs historical AND savings uplift vs auto baseline tracked separately. Retain for legal-hold per company policy.",
+    related: ["Cost avoidance vs historical", "Savings uplift vs auto baseline", "Follow-up flag"]},
+  {term: "Audit log", aliases: ["audit"], category: "Outputs",
+    definition: "Discrete event timeline — every important action (extract, smart trim, threshold change, snapshot save, award letter, exclusion, lock, etc.) is recorded with a timestamp + detail + related identifier. Capped at 500 entries; oldest first dropped. Feeds the Decision Summary Tab 7.",
+    related: ["Decision Summary", "Exclusion log"]},
+  {term: "Exclusion log", aliases: ["data quality log", "exclusion review"], category: "Outputs",
+    definition: "Master data-quality record — every per-item outlier exclusion + UOM annotation + follow-up flag is recorded with the line snapshot + pre-exclusion median/avg of the other priced lines. Cross-app schema (app_source / event_type) so multiple work-apps' logs concatenate into one audit packet.",
+    related: ["Outlier exclusion", "Decision Summary"]},
+
+  // ----- Other -----
+  {term: "Snapshot", aliases: ["snapshot", "saved scenario", "scenario", "bookmark"], category: "Other",
+    definition: "A named save of the current strategy + manual overrides + thresholds, frozen at save time. Used when you want to lock in a specific decision (for award letters / legal-hold) or come back to compare against a different strategy later. Shown as inline pills in the headline card; click for action popover (letters / decision log / delete).",
+    example: "After you set Consolidate to Supplier-A, lock 3 items, and apply 2 UOM resolutions, click 📌 Save snapshot → name it 'April Q1 award'. Now you can flip strategies to explore, and the snapshot stays unchanged.",
+    related: ["Strategy chip", "Manual (strategy)"]},
+  {term: "Reset to auto", aliases: ["reset to auto"], category: "Other",
+    definition: "Clears every analyst-applied manual override: item_locks, item_exclusions, uom_annotations. Recomputes affected aggregates so last_unit_price / qty windows / KPIs return to their raw-historical values. Audit-logged. Confirms before applying.",
+    related: ["Item lock", "Outlier exclusion", "UOM annotation"]},
+  {term: "FOCUSED filter", aliases: ["focused"], category: "Other",
+    definition: "A click-to-filter state on the comparison matrix where the matrix narrows to one supplier's bids. Triggered by clicking a consolidation candidate row OR a supplier intake card. The 'FOCUSED ✕' inline button on the row clears focus.",
+    related: ["Consolidate to (strategy)"]},
+  {term: "Cross-supplier isolation", aliases: ["isolation", "isolation guard", "isolationviolation"], category: "Other",
+    definition: "A defensive cell-level scan applied to every supplier-bound xlsx export (outbound RFQ, award letter, follow-up). The exporter refuses with IsolationViolation if any cell contains a foreign supplier's name. Internal-audience files (banner contains 'INTERNAL — NEVER FORWARD' or filename starts with INTERNAL) are auto-skipped.",
+    example: "Generating an award letter for Supplier-A. The scanner finds 'Supplier-B' in a freeform notes cell. IsolationViolation raised; export refused; analyst clears the cell and retries.",
+    related: ["Outbound RFQ", "Award letter", "Internal summary"]},
+  {term: "Manual override", aliases: ["override", "scenario override"], category: "Other",
+    definition: "A per-item, per-scenario explicit award decision. Beats strategy logic; beats item locks. Applied via the scenario evaluator's 'overrides' parameter or via the per-item modal's explicit-award control.",
+    related: ["Item lock", "Manual (strategy)"]},
+  {term: "Verify isolation (script)", aliases: ["verify_isolation"], category: "Other",
+    definition: "Sibling Python script that walks a folder of award letter xlsx files and flags any cell containing a foreign supplier name. Independent third-party check on the runtime IsolationViolation guard.",
+    related: ["Cross-supplier isolation"]},
+];
+
+let _glossarySearchState = {
+  query: "",
+  matches: [],   // array of glossary indices that match the current query
+  cursor: 0,     // index into matches[] for the "current" match
+};
+
+function _renderGlossary() {
+  const body = document.getElementById('glossary-body');
+  if (!body) return;
+  const byCategory = {};
+  const categoryOrder = [];
+  _GLOSSARY.forEach((g, idx) => {
+    if (!byCategory[g.category]) {
+      byCategory[g.category] = [];
+      categoryOrder.push(g.category);
+    }
+    byCategory[g.category].push({...g, _idx: idx});
+  });
+  let html = '';
+  for (const cat of categoryOrder) {
+    html += `<div class="glossary-category">${_escapeHtml(cat)}</div>`;
+    for (const g of byCategory[cat]) {
+      const aliasTxt = (g.aliases && g.aliases.length)
+        ? `<span class="glossary-aliases">aka ${g.aliases.map(_escapeHtml).join(' · ')}</span>` : '';
+      const exampleHtml = g.example ? `<div class="glossary-example">${_escapeHtml(g.example)}</div>` : '';
+      const relatedHtml = (g.related && g.related.length)
+        ? `<div class="glossary-related">Related: ${g.related.map(r => `<a data-glossary-link="${_escapeHtml(r)}">${_escapeHtml(r)}</a>`).join('')}</div>`
+        : '';
+      html += `<div class="glossary-entry" data-glossary-idx="${g._idx}" id="glossary-entry-${g._idx}">
+        <div class="glossary-term">${_escapeHtml(g.term)}${aliasTxt}</div>
+        <div class="glossary-def">${_escapeHtml(g.definition)}</div>
+        ${exampleHtml}
+        ${relatedHtml}
+      </div>`;
+    }
+  }
+  body.innerHTML = html;
+  body.querySelectorAll('[data-glossary-link]').forEach(a => {
+    a.addEventListener('click', () => {
+      const target = a.getAttribute('data-glossary-link');
+      const input = document.getElementById('glossary-search-input');
+      if (input) { input.value = target; input.focus(); _filterGlossary(target); }
+    });
+  });
+}
+
+function _filterGlossary(rawQuery) {
+  const q = String(rawQuery || '').trim().toLowerCase();
+  _glossarySearchState.query = q;
+  const matches = [];
+  if (q) {
+    _GLOSSARY.forEach((g, idx) => {
+      const haystack = [
+        g.term,
+        ...(g.aliases || []),
+        g.definition,
+        g.example || '',
+        ...(g.related || []),
+      ].join(' ').toLowerCase();
+      if (haystack.includes(q)) matches.push(idx);
+    });
+  }
+  _glossarySearchState.matches = matches;
+  _glossarySearchState.cursor = matches.length ? 0 : -1;
+  const body = document.getElementById('glossary-body');
+  if (!body) return;
+  if (!q) {
+    body.querySelectorAll('.glossary-entry').forEach(el => {
+      el.classList.remove('is-hidden', 'is-current-match');
+      _restoreOriginalText(el);
+    });
+    body.querySelectorAll('.glossary-category').forEach(el => el.classList.remove('is-hidden'));
+    document.getElementById('glossary-match-count').textContent = '';
+    _setNavBtnsEnabled(false);
+    _ensureNoEmpty(body, false);
+    return;
+  }
+  const matchSet = new Set(matches);
+  body.querySelectorAll('.glossary-entry').forEach(el => {
+    const idx = parseInt(el.getAttribute('data-glossary-idx'), 10);
+    if (matchSet.has(idx)) {
+      el.classList.remove('is-hidden');
+      _highlightMatchesInEntry(el, q);
+    } else {
+      el.classList.add('is-hidden');
+      _restoreOriginalText(el);
+    }
+    el.classList.remove('is-current-match');
+  });
+  body.querySelectorAll('.glossary-category').forEach((cat) => {
+    let next = cat.nextElementSibling;
+    let anyVisible = false;
+    while (next && !next.classList.contains('glossary-category')) {
+      if (next.classList.contains('glossary-entry') && !next.classList.contains('is-hidden')) {
+        anyVisible = true; break;
+      }
+      next = next.nextElementSibling;
+    }
+    cat.classList.toggle('is-hidden', !anyVisible);
+  });
+  document.getElementById('glossary-match-count').textContent = matches.length
+    ? `${_glossarySearchState.cursor + 1}/${matches.length}` : '0';
+  _setNavBtnsEnabled(matches.length > 1);
+  _ensureNoEmpty(body, matches.length === 0);
+  if (matches.length) _focusGlossaryMatch(0);
+}
+
+function _highlightMatchesInEntry(el, q) {
+  _restoreOriginalText(el);
+  const fields = ['.glossary-term', '.glossary-def', '.glossary-example', '.glossary-aliases'];
+  for (const sel of fields) {
+    const node = el.querySelector(sel);
+    if (!node) continue;
+    if (!node.dataset.origHtml) node.dataset.origHtml = node.innerHTML;
+    const txt = node.dataset.origHtml;
+    const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(${safeQ})`, 'gi');
+    const parts = txt.split(/(<[^>]+>)/g);
+    const replaced = parts.map(p => p.startsWith('<') ? p : p.replace(re, '<span class="glossary-hit">$1</span>'));
+    node.innerHTML = replaced.join('');
+  }
+}
+function _restoreOriginalText(el) {
+  el.querySelectorAll('[data-orig-html]').forEach(n => {
+    n.innerHTML = n.dataset.origHtml || n.innerHTML;
+    delete n.dataset.origHtml;
+  });
+}
+function _setNavBtnsEnabled(enabled) {
+  const prev = document.getElementById('glossary-prev');
+  const next = document.getElementById('glossary-next');
+  if (prev) prev.disabled = !enabled;
+  if (next) next.disabled = !enabled;
+}
+function _ensureNoEmpty(body, isEmpty) {
+  let empty = body.querySelector('.glossary-empty');
+  if (isEmpty) {
+    if (!empty) {
+      empty = document.createElement('div');
+      empty.className = 'glossary-empty';
+      empty.textContent = 'No matches. Try a partial term or a synonym — every entry searches term + aliases + definition + example.';
+      body.appendChild(empty);
+    }
+  } else if (empty) {
+    empty.remove();
+  }
+}
+function _focusGlossaryMatch(cursor) {
+  const matches = _glossarySearchState.matches;
+  if (!matches.length) return;
+  if (cursor < 0) cursor = matches.length - 1;
+  if (cursor >= matches.length) cursor = 0;
+  _glossarySearchState.cursor = cursor;
+  const idx = matches[cursor];
+  const body = document.getElementById('glossary-body');
+  body.querySelectorAll('.glossary-entry.is-current-match').forEach(el => el.classList.remove('is-current-match'));
+  const target = document.getElementById(`glossary-entry-${idx}`);
+  if (target) {
+    target.classList.add('is-current-match');
+    target.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  }
+  document.getElementById('glossary-match-count').textContent = `${cursor + 1}/${matches.length}`;
+}
+
+function _openGlossary() {
+  const modal = document.getElementById('glossary-modal');
+  if (!modal) return;
+  modal.classList.add('is-open');
+  const body = document.getElementById('glossary-body');
+  if (body && !body.children.length) _renderGlossary();
+  const input = document.getElementById('glossary-search-input');
+  if (input) { input.value = ''; setTimeout(() => input.focus(), 50); }
+  _filterGlossary('');
+}
+function _closeGlossary() {
+  const modal = document.getElementById('glossary-modal');
+  if (modal) modal.classList.remove('is-open');
+}
+
+(function _wireGlossary() {
+  const btn = document.getElementById('open-glossary');
+  if (btn) btn.addEventListener('click', _openGlossary);
+  const closeBtn = document.getElementById('glossary-close');
+  if (closeBtn) closeBtn.addEventListener('click', _closeGlossary);
+  const modal = document.getElementById('glossary-modal');
+  if (modal) modal.addEventListener('click', (ev) => {
+    if (ev.target === modal) _closeGlossary();
+  });
+  const input = document.getElementById('glossary-search-input');
+  if (input) {
+    input.addEventListener('input', (ev) => _filterGlossary(ev.target.value));
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && _glossarySearchState.matches.length) {
+        ev.preventDefault();
+        if (ev.shiftKey) _focusGlossaryMatch(_glossarySearchState.cursor - 1);
+        else _focusGlossaryMatch(_glossarySearchState.cursor + 1);
+      } else if (ev.key === 'Escape') {
+        ev.preventDefault();
+        _closeGlossary();
+      }
+    });
+  }
+  const prev = document.getElementById('glossary-prev');
+  const next = document.getElementById('glossary-next');
+  if (prev) prev.addEventListener('click', () => _focusGlossaryMatch(_glossarySearchState.cursor - 1));
+  if (next) next.addEventListener('click', () => _focusGlossaryMatch(_glossarySearchState.cursor + 1));
+  document.addEventListener('keydown', (ev) => {
+    const m = document.getElementById('glossary-modal');
+    if (m && m.classList.contains('is-open') && ev.key === 'Escape') _closeGlossary();
+  });
+})();
+
+// ==========================================================================
 // Save bar UI — injected dynamically (CSS-var styled so it works under
 // any palette / design pass). Appears once a session is initialized.
 // ==========================================================================

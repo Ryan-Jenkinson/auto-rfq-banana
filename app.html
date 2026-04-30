@@ -61,6 +61,27 @@
   </div>
 </div>
 
+<!-- Glossary modal — searchable reference for every term in the app. Built
+     dynamically by _renderGlossary() in app.js from a static term list. -->
+<div id="glossary-modal" role="dialog" aria-modal="true" aria-labelledby="glossary-eyebrow">
+  <div class="glossary-card">
+    <div class="glossary-header">
+      <span class="glossary-eyebrow" id="glossary-eyebrow">GLOSSARY</span>
+      <div class="glossary-search-wrap">
+        <span class="glossary-search-icon">⌕</span>
+        <input id="glossary-search-input" class="glossary-search-input" type="search" autocomplete="off" placeholder="search terms, definitions, examples — Enter for next match" />
+        <span class="glossary-match-status" id="glossary-match-status">
+          <span class="glossary-match-count" id="glossary-match-count"></span>
+          <button id="glossary-prev" type="button" class="glossary-nav-btn" title="Previous match (Shift+Enter)" aria-label="Previous match">↑</button>
+          <button id="glossary-next" type="button" class="glossary-nav-btn" title="Next match (Enter)" aria-label="Next match">↓</button>
+        </span>
+      </div>
+      <button id="glossary-close" type="button" class="glossary-close" title="Close (Esc)" aria-label="Close glossary">×</button>
+    </div>
+    <div class="glossary-body" id="glossary-body"></div>
+  </div>
+</div>
+
 <div id="loading">
   <div class="pulse"><div class="pulse-core"></div></div>
   <h1>Loading Python runtime</h1>
@@ -76,6 +97,7 @@
     </div>
     <div style="margin-left:auto;display:flex;align-items:center;gap:14px;">
       <button id="open-profile" type="button" title="Set your name, email, and signature line — these appear on outbound RFQ files, follow-up xlsx, and award letters as the contact-of-record." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⌂ PROFILE</button>
+      <button id="open-glossary" type="button" title="Open a searchable glossary of every term in the app — tiers, bid statuses, recommendations, strategies, math fields, etc. Each entry has a thorough definition, worked examples, and cross-references. Use after the hover tooltips when you need the deeper context." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">📖 GLOSSARY</button>
       <button id="open-audit" type="button" title="Open the audit log — every important action (extract, smart trim, bid intake, threshold change, scenario save, award letter, exclusion, lock, etc.) is recorded with a timestamp. The trail feeds the Decision Log xlsx for legal-hold." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⊞ AUDIT</button>
       <button id="open-settings" type="button" title="Tune the 11 engine thresholds — scoring weights, outlier factor, savings cutoffs, carve-out threshold, etc. Defaults work for most cases; touch only if a specific RFQ needs different judgment." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:4px;cursor:pointer;letter-spacing:0.04em;">⚙ THRESHOLDS</button>
       <div class="steps">
