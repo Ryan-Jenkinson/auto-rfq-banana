@@ -266,16 +266,51 @@
       <button class="btn ghost" id="bid-clear-btn" title="Remove every loaded bid (does not delete the source xlsx). Use to start step 4 over with a clean slate.">Clear all bids</button>
     </div>
 
+    <!-- Partial-data banner — fires when fewer suppliers loaded than the
+         outbound RFQs we generated in step 3. Reminds the analyst the
+         analysis below is provisional. Hidden until reveal logic decides. -->
+    <div id="partial-data-banner" hidden style="margin-top:24px;"></div>
+
+    <!-- HEADLINE CARD — system recommendation + scenario chips + manual-override
+         indicators. The single most important surface in step 4 — what the
+         analyst should look at first. Hidden until first bid loads. -->
+    <div id="headline-card" hidden style="margin-top:32px;"></div>
+
     <div id="bid-summary-row" class="kpi-row" style="margin-top:32px;"></div>
 
-    <!-- UOM Resolution Queue panel (hidden by default; toggled from the clean-savings panel) -->
-    <div id="uom-resolution-panel" style="display:none;margin-top:24px;padding:20px 24px;background:rgba(255,183,51,0.04);border:1px solid var(--warn);border-radius:6px;"></div>
+    <div id="comparison-section" style="margin-top:24px;"></div>
 
-    <div id="consolidation-block" style="margin-top:32px;"></div>
-
-    <div id="comparison-section" style="margin-top:32px;"></div>
-
-    <div id="scenarios-section" style="margin-top:48px;"></div>
+    <!-- DRAWER STACK — refinement surfaces. Each drawer is collapsed by
+         default; the summary line carries the $ teaser so the analyst knows
+         what's hidden. Order: Hybrid (carve-outs) → Round 2 → Saved scenarios
+         → Advanced. -->
+    <div id="drawer-stack" hidden style="margin-top:32px;">
+      <details class="rfq-drawer" id="drawer-hybrid">
+        <summary class="rfq-drawer-summary"><span class="rfq-drawer-label">Hybrid with carve-outs</span><span class="rfq-drawer-teaser" id="drawer-hybrid-teaser">—</span></summary>
+        <div class="rfq-drawer-body">
+          <div id="consolidation-block"></div>
+        </div>
+      </details>
+      <details class="rfq-drawer" id="drawer-r2">
+        <summary class="rfq-drawer-summary"><span class="rfq-drawer-label">Round 2 — push back on uncompetitive bids</span><span class="rfq-drawer-teaser" id="drawer-r2-teaser">—</span></summary>
+        <div class="rfq-drawer-body">
+          <div id="drawer-r2-body"></div>
+        </div>
+      </details>
+      <details class="rfq-drawer" id="drawer-scenarios">
+        <summary class="rfq-drawer-summary"><span class="rfq-drawer-label">Saved scenarios</span><span class="rfq-drawer-teaser" id="drawer-scenarios-teaser">—</span></summary>
+        <div class="rfq-drawer-body">
+          <div id="scenarios-section"></div>
+        </div>
+      </details>
+      <details class="rfq-drawer" id="drawer-advanced">
+        <summary class="rfq-drawer-summary"><span class="rfq-drawer-label">Advanced — savings tiers · UOM resolution · audit log</span><span class="rfq-drawer-teaser" id="drawer-advanced-teaser">—</span></summary>
+        <div class="rfq-drawer-body">
+          <div id="clean-savings-host"></div>
+          <div id="uom-resolution-panel" style="display:none;margin-top:18px;padding:20px 24px;background:rgba(255,183,51,0.04);border:1px solid var(--warn);border-radius:6px;"></div>
+        </div>
+      </details>
+    </div>
 
     <div class="actions">
       <button class="btn ghost" id="back-to-3" title="Back to step 3 — useful for tweaking the candidate list (smart-trim again, untick more outliers in per-item modals) before re-running comparisons.">← Back to RFQ list</button>

@@ -1999,29 +1999,58 @@ function _renderBidSummary() {
   // wait for async render
 }
 
+// Step-4 redesign — module-level state.
+//
+// _activeChip:  which strategy chip is currently selected in the headline.
+//   Defaults to 'consolidate_to' when bids loaded (Ryan's standard playbook),
+//   or 'lowest_qualified' when no consolidation candidate exists.
+// _consolidateSupplier: the supplier the user picked from the consolidate-to
+//   dropdown (null = use system default = top consolidation candidate).
+// _lastHeadline: cache of the most recent compute_headline_strategies payload
+//   so chip flips can re-render the headline without round-tripping Python.
+let _activeChip = null;
+let _consolidateSupplier = null;
+let _lastHeadline = null;
+
 async function _refreshConsolidationAndMatrix() {
   const consolEl = $('consolidation-block');
   const compEl = $('comparison-section');
   const scenEl = $('scenarios-section');
+  const headlineEl = $('headline-card');
+  const drawerStack = $('drawer-stack');
+  const partialBanner = $('partial-data-banner');
+
   if (!Object.keys(_loadedBids).length) {
-    consolEl.innerHTML = '';
+    if (consolEl) consolEl.innerHTML = '';
     compEl.innerHTML = '';
     if (scenEl) scenEl.innerHTML = '';
     $('bid-summary-row').innerHTML = '';
+    if (headlineEl) { headlineEl.innerHTML = ''; headlineEl.hidden = true; }
+    if (drawerStack) drawerStack.hidden = true;
+    if (partialBanner) { partialBanner.innerHTML = ''; partialBanner.hidden = true; }
     return;
   }
-  consolEl.innerHTML = '<div style="padding:24px;color:var(--ink-2);font-family:var(--mono);font-size:12px;">Computing consolidation analysis…</div>';
+  if (consolEl) consolEl.innerHTML = '<div style="padding:24px;color:var(--ink-2);font-family:var(--mono);font-size:12px;">Computing consolidation analysis…</div>';
   compEl.innerHTML = '';
 
+  // Pass the current consolidate supplier into compute_headline_strategies
+  // so the consolidate_to chip's totals reflect the user's picked target
+  // (or the system default if they haven't picked one yet).
+  const consolSupplierLit = _consolidateSupplier ? JSON.stringify(_consolidateSupplier) : 'None';
   const out = await _py.runPythonAsync(`
 import json
-from app_engine import compute_comparison_matrix, compute_consolidation_analysis, list_award_scenarios, compute_clean_savings_summary, list_round2_selection
+from app_engine import (
+  compute_comparison_matrix, compute_consolidation_analysis,
+  list_award_scenarios, compute_clean_savings_summary,
+  list_round2_selection, compute_headline_strategies,
+)
 result = {
   "matrix": compute_comparison_matrix(),
   "consolidation": compute_consolidation_analysis(),
   "scenarios": list_award_scenarios(),
   "clean_savings": compute_clean_savings_summary(),
   "round2_selection": list_round2_selection(),
+  "headline": compute_headline_strategies(${consolSupplierLit}),
 }
 json.dumps(result, default=str)
 `);
@@ -2029,11 +2058,351 @@ json.dumps(result, default=str)
   // Rehydrate the round-2 selection from saved Python state so a reloaded
   // session shows the analyst's prior R2 picks intact.
   _round2Selection = new Set(data.round2_selection || []);
+  _lastHeadline = data.headline;
+  if (_activeChip == null) {
+    _activeChip = data.headline.default_chip || 'lowest_qualified';
+  }
+  if (_consolidateSupplier == null) {
+    _consolidateSupplier = data.headline.default_consolidate_supplier || null;
+  }
+  if (headlineEl) headlineEl.hidden = false;
+  if (drawerStack) drawerStack.hidden = false;
+  _renderHeadlineCard(data.headline, data.consolidation);
+  _renderPartialDataBanner();
   _renderBidCoverageKPIs(data.matrix);
   _renderCleanSavingsPanel(data.clean_savings);
   _renderConsolidation(data.consolidation);
   _renderComparisonMatrix(data.matrix);
   _renderScenariosBlock(data.scenarios, data.consolidation);
+  _updateDrawerTeasers(data);
+}
+
+// Returns the count of expected suppliers — sourced from the outbound RFQs
+// the analyst generated in step 3. If we don't have that record, return null
+// (and the partial-data banner suppresses itself).
+function _expectedSupplierCount() {
+  try {
+    const list = (window._rfqResult && window._rfqResult.outbound_history) || [];
+    if (Array.isArray(list) && list.length) {
+      const seen = new Set();
+      for (const o of list) { if (o && o.supplier) seen.add(String(o.supplier).toLowerCase()); }
+      return seen.size || null;
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+function _renderPartialDataBanner() {
+  const el = $('partial-data-banner');
+  if (!el) return;
+  const expected = _expectedSupplierCount();
+  const loaded = Object.keys(_loadedBids).length;
+  if (!expected || loaded >= expected) {
+    el.innerHTML = ''; el.hidden = true; return;
+  }
+  el.hidden = false;
+  el.className = 'partial-data-banner';
+  el.innerHTML = `<span class="pdb-icon">⚠</span><span>Showing analysis based on <b style="color:var(--ink-0);">${loaded}</b> of <b style="color:var(--ink-0);">${expected}</b> expected suppliers — drop the remaining bid xlsx files for the full comparison. The recommendation below will sharpen as more bids arrive.</span>`;
+}
+
+// HEADLINE CARD — the "system recommendation" surface. Reads from _lastHeadline
+// and _activeChip; can be re-rendered cheaply on chip flip without a Python
+// round-trip (chip flip just changes which strategy's totals we display).
+function _renderHeadlineCard(headline, consolidation) {
+  const el = $('headline-card');
+  if (!el) return;
+  el.className = 'headline-card';
+  const fmt$ = (n) => n == null ? '—' : (n < 0 ? '−$' : '$') + Math.abs(n).toLocaleString('en-US', { maximumFractionDigits: 0 });
+  const fmtPct = (n) => n == null ? '—' : (n < 0 ? '+' : '−') + Math.abs(n).toFixed(1) + '%';
+
+  const strategies = headline.strategies || {};
+  const active = strategies[_activeChip] || strategies.lowest_qualified || null;
+  const ovr = headline.manual_overrides || {n_locks: 0, n_exclusions: 0, n_uom_resolutions: 0};
+  const totalOverrides = (ovr.n_locks||0) + (ovr.n_exclusions||0) + (ovr.n_uom_resolutions||0);
+  const th = headline.thresholds || {};
+  const carvePct = th.carve_out_min_savings_pct != null ? Math.round(th.carve_out_min_savings_pct * 100) : 20;
+  const carveDollar = th.carve_out_min_savings_annual_dollar != null ? th.carve_out_min_savings_annual_dollar : 3000;
+
+  // Determine the display supplier for the verdict line:
+  //   - consolidate_to: show the chip's named target (consolidate_supplier)
+  //     even if carves shift the actual $-primary supplier elsewhere.
+  //     The chip strip's caption + drawer teaser surface the carve $.
+  //   - everything else: show the highest-$ supplier (supplier_primary).
+  let verdictSupplier = null;
+  if (active) {
+    verdictSupplier = (_activeChip === 'consolidate_to') ? active.consolidate_supplier : active.supplier_primary;
+  }
+  const savingsTotal = active ? active.savings_total : 0;
+  const savingsPct = active ? active.savings_pct : 0;
+  const awardTotal = active ? active.award_total : 0;
+  const nItems = active ? active.n_items : 0;
+  const nCarved = active ? (active.n_carved || 0) : 0;
+  const nLocksUnhonored = active ? (active.n_locks_unhonored || 0) : 0;
+
+  // Strategy chip list — labels + tooltips
+  const chips = [
+    {key: 'lowest_price',        label: 'Lowest Price',         tip: 'For each item, pick whoever bid lowest. No filtering of UOM mismatches or substitutions. Use sparingly — exposes you to UOM-pollution.'},
+    {key: 'lowest_qualified',    label: 'Lowest Qualified',     tip: 'Same as Lowest Price but skips bids flagged UOM_DISC or SUBSTITUTE. Standard "best on paper" cut. This is what the recommendation engine produces.'},
+    {key: 'consolidate_to',      label: 'Consolidate to ▾',     tip: `Award everything to one supplier — except items where another saves ≥${carvePct}% OR ≥$${carveDollar.toLocaleString()}/yr (the carve-out OR-rule). Click to pick supplier.`},
+    {key: 'incumbent_preferred', label: 'Incumbent Preferred',  tip: 'Stay with the historical supplier when their bid is within ~5% of the lowest. Avoids switching costs / new-supplier setup overhead when savings are marginal.'},
+    {key: 'manual',              label: 'Manual',               tip: 'Use saved manual scenarios (created via the Saved Scenarios drawer). The headline reflects whatever scenario is loaded.'},
+  ];
+
+  const chipHtml = chips.map(c => {
+    const isActive = _activeChip === c.key;
+    const summary = strategies[c.key];
+    let savings = '';
+    if (summary && summary.savings_total != null) {
+      const s = summary.savings_total;
+      const sign = s >= 0 ? '' : '−';
+      savings = `<span class="chip-savings">${sign}$${Math.abs(s).toLocaleString('en-US',{maximumFractionDigits:0})}</span>`;
+    } else if (c.key === 'manual') {
+      savings = '<span class="chip-savings">load saved</span>';
+    }
+    let label = c.label;
+    if (c.key === 'consolidate_to') {
+      const sup = active && _activeChip === 'consolidate_to' && active.consolidate_supplier
+        ? active.consolidate_supplier : (headline.default_consolidate_supplier || '—');
+      label = `Consolidate to: ${sup} <span class="chip-caret">▾</span>`;
+    }
+    return `<button class="chip${isActive?' active':''}" data-chip="${c.key}" type="button" title="${c.tip.replace(/"/g,'&quot;')}">${label}${savings}</button>`;
+  }).join('');
+
+  // Manual-override pip row — clickable per-class
+  const lockPip = ovr.n_locks > 0
+    ? `<span class="override-pip" data-override="locks" title="${ovr.n_locks} item lock(s). Click to open the locks panel and review/clear individually."><span class="pip-dot"></span>${ovr.n_locks} lock${ovr.n_locks===1?'':'s'}</span>`
+    : `<span class="override-pip empty"><span class="pip-dot"></span>0 locks</span>`;
+  const excPip = ovr.n_exclusions > 0
+    ? `<span class="override-pip" data-override="exclusions" title="${ovr.n_exclusions} item(s) with at least one excluded order line. Click to see the exclusion review log."><span class="pip-dot"></span>${ovr.n_exclusions} outlier-exclusion${ovr.n_exclusions===1?'':'s'}</span>`
+    : `<span class="override-pip empty"><span class="pip-dot"></span>0 outlier-exclusions</span>`;
+  const uomPip = ovr.n_uom_resolutions > 0
+    ? `<span class="override-pip" data-override="uom" title="${ovr.n_uom_resolutions} UOM annotation(s) applied. Click to open the UOM resolution drawer."><span class="pip-dot"></span>${ovr.n_uom_resolutions} UOM resolution${ovr.n_uom_resolutions===1?'':'s'}</span>`
+    : `<span class="override-pip empty"><span class="pip-dot"></span>0 UOM resolutions</span>`;
+  const resetBtn = totalOverrides > 0
+    ? `<button class="btn-reset-auto" id="btn-reset-auto" type="button" title="Clear every manual override (locks, outlier exclusions, UOM annotations). The system returns to its purely-auto recommendation. Audit-logged. Confirms first.">↺ Reset to auto</button>`
+    : `<button class="btn-reset-auto" disabled title="No manual overrides applied — already at auto.">↺ Reset to auto</button>`;
+
+  // Verdict line variants
+  let verdictLine;
+  if (verdictSupplier) {
+    verdictLine = `<span class="arrow">→</span><span class="award-label">AWARD TO</span><span class="supplier-name">${_escapeHtml(verdictSupplier)}</span>`;
+  } else {
+    verdictLine = `<span class="arrow">→</span><span class="placeholder">No clear winner — review bids below.</span>`;
+  }
+
+  // Subhead counts line
+  const carveCountTxt = nCarved > 0 ? ` · <span style="color:var(--ink-1);">${nCarved}</span> carve-out${nCarved===1?'':'s'}` : '';
+  const unhonoredTxt = nLocksUnhonored > 0 ? `<span class="sep">·</span><span style="color:var(--accent);">${nLocksUnhonored}</span> lock${nLocksUnhonored===1?'':'s'} unhonored` : '';
+  const r2Count = (typeof _round2Selection !== 'undefined' ? _round2Selection.size : 0);
+  const r2CountTxt = r2Count > 0 ? `<span class="sep">·</span><span style="color:var(--cyan);">${r2Count}</span> R2 candidate${r2Count===1?'':'s'}` : '';
+
+  el.innerHTML = `
+    <div class="headline-pretitle" title="The system's automatic award recommendation given the current bids + your manual overrides. Flip the chip strip below to see what each strategy would produce. The numbers update live.">SYSTEM RECOMMENDATION</div>
+    <div class="headline-verdict">${verdictLine}</div>
+    <div class="headline-money">
+      <span class="total" title="Total $ awarded under the active strategy. Computed as Σ(awarded_price × qty_24mo) across every item.">${fmt$(awardTotal)}</span>
+      <span class="${savingsTotal >= 0 ? 'saves' : 'saves-bad'}" title="Cost avoidance vs the historical baseline (qty × last-paid price). Positive = saves; negative = costs more than today.">${savingsTotal >= 0 ? 'saves' : 'costs'} ${fmt$(Math.abs(savingsTotal))}</span>
+      <span class="pct" title="Savings as a percent of the historical baseline.">${fmtPct(savingsPct)}</span>
+    </div>
+    <div class="headline-counts">
+      <span title="Total RFQ items in the analysis.">${nItems.toLocaleString()} items</span>${carveCountTxt}${r2CountTxt}${unhonoredTxt}
+    </div>
+    <div class="chip-strip" id="chip-strip">${chipHtml}</div>
+    <div class="override-row">
+      <span class="muted" style="text-transform:uppercase;letter-spacing:0.10em;font-size:10px;">Manual overrides:</span>
+      ${lockPip} ${excPip} ${uomPip}
+      <span class="override-spacer"></span>
+      ${resetBtn}
+    </div>
+  `;
+
+  // Wire chip clicks
+  for (const btn of el.querySelectorAll('[data-chip]')) {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const key = btn.getAttribute('data-chip');
+      if (key === 'consolidate_to') {
+        _toggleConsolidatePicker(btn, headline);
+        return;
+      }
+      _setActiveChip(key);
+    });
+  }
+  // Override pip clicks
+  for (const pip of el.querySelectorAll('[data-override]')) {
+    pip.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      _handleOverridePipClick(pip.getAttribute('data-override'));
+    });
+  }
+  // Reset-to-auto
+  const resetBtnEl = $('btn-reset-auto');
+  if (resetBtnEl && !resetBtnEl.disabled) {
+    resetBtnEl.addEventListener('click', _handleResetToAuto);
+  }
+}
+
+// Set the active chip + re-render the headline (and re-fetch headline data
+// only when the chip is consolidate_to with a different supplier — the other
+// strategies are pre-computed on every refresh).
+async function _setActiveChip(key) {
+  _activeChip = key;
+  if (_lastHeadline) _renderHeadlineCard(_lastHeadline, null);
+}
+
+function _toggleConsolidatePicker(anchorBtn, headline) {
+  // If picker already open, close it
+  const prior = document.getElementById('consolidate-picker');
+  if (prior) { prior.remove(); _setActiveChip('consolidate_to'); return; }
+
+  const wrap = document.createElement('div');
+  wrap.className = 'consolidate-picker-wrap';
+  // The picker positions absolutely below the chip
+  const picker = document.createElement('div');
+  picker.id = 'consolidate-picker';
+  picker.className = 'consolidate-picker';
+  const suppliers = (headline && headline.available_consolidate_suppliers) || Object.keys(_loadedBids);
+  picker.innerHTML = suppliers.map(s => {
+    const sel = (s === _consolidateSupplier) ? ' selected' : '';
+    return `<div class="picker-row${sel}" data-supplier="${_escapeHtml(s)}">${_escapeHtml(s)}</div>`;
+  }).join('') || '<div class="picker-row" style="cursor:default;color:var(--ink-2);">No priced bids</div>';
+
+  // Anchor below the chip button
+  const rect = anchorBtn.getBoundingClientRect();
+  picker.style.position = 'fixed';
+  picker.style.top = (rect.bottom + 4) + 'px';
+  picker.style.left = rect.left + 'px';
+  document.body.appendChild(picker);
+
+  // Pick → set _consolidateSupplier and re-fetch headline
+  for (const row of picker.querySelectorAll('[data-supplier]')) {
+    row.addEventListener('click', async () => {
+      _consolidateSupplier = row.getAttribute('data-supplier');
+      picker.remove();
+      _activeChip = 'consolidate_to';
+      // Re-fetch — Python recomputes the consolidate_to summary with the
+      // newly-picked supplier as the consolidation target.
+      await _refreshConsolidationAndMatrix();
+    });
+  }
+  // Click outside closes
+  setTimeout(() => {
+    const closeOnOutside = (ev) => {
+      if (!picker.contains(ev.target) && ev.target !== anchorBtn) {
+        picker.remove();
+        document.removeEventListener('click', closeOnOutside, true);
+      }
+    };
+    document.addEventListener('click', closeOnOutside, true);
+  }, 0);
+}
+
+function _handleOverridePipClick(kind) {
+  if (kind === 'locks') {
+    // Scroll the analyst to the matrix and surface a list of locked items.
+    // For now, simple: open the audit-log modal filtered to lock events.
+    if (typeof _openAuditModal === 'function') _openAuditModal({filter: 'lock'});
+    else alert('Lock list — feature pending. Use the per-item modal\'s lock button to review/clear.');
+  } else if (kind === 'exclusions') {
+    // Trigger the exclusion-log download (the master record).
+    const btn = document.getElementById('export-exclusion-log');
+    if (btn) btn.click();
+    else alert('Exclusion log — open the per-item modals to review.');
+  } else if (kind === 'uom') {
+    // Open the UOM resolution drawer + scroll to it.
+    const drawer = document.getElementById('drawer-advanced');
+    if (drawer) { drawer.open = true; drawer.scrollIntoView({behavior:'smooth', block:'start'}); }
+    const panel = document.getElementById('uom-resolution-panel');
+    if (panel) panel.style.display = 'block';
+  }
+}
+
+async function _handleResetToAuto() {
+  const ok = confirm(
+    'Reset to auto? This will clear:\n' +
+    '  • all item locks\n' +
+    '  • all per-item outlier exclusions\n' +
+    '  • all UOM annotations\n\n' +
+    'The system returns to its purely-auto recommendation. The action is audit-logged. Continue?'
+  );
+  if (!ok) return;
+  await _py.runPythonAsync(`
+from app_engine import reset_to_auto
+import json
+json.dumps(reset_to_auto())
+`);
+  // Fully refresh — RFQ list aggregates may have changed
+  await _refreshConsolidationAndMatrix();
+  // Patch the RFQ table too if exclusions changed last_unit_price
+  if (typeof _renderRfqTable === 'function' && window._rfqResult) {
+    // pull fresh items
+    const out = await _py.runPythonAsync(`
+import json
+from app_engine import _STATE
+json.dumps(_STATE.get("items", []))
+`);
+    try {
+      window._rfqResult.items = JSON.parse(out);
+      _renderRfqTable();
+    } catch (e) { /* ignore */ }
+  }
+}
+
+// Drawer teaser update — the collapsed-row caption that shows $ + count.
+// Called after every refresh. Reads _activeChip to flow strategy-specific
+// numbers (the carve-out drawer's $ depends on the active strategy's carves).
+function _updateDrawerTeasers(data) {
+  const fmt$ = (n) => n == null ? '—' : (n < 0 ? '−$' : '$') + Math.abs(n).toLocaleString('en-US', {maximumFractionDigits: 0});
+
+  // Hybrid drawer: carve-out savings from consolidation analysis
+  const hybridT = $('drawer-hybrid-teaser');
+  if (hybridT) {
+    const w = (data.consolidation && data.consolidation.winner) || null;
+    const carves = (w && w.carve_outs) || [];
+    const carveSavings = (w && w.carve_out_savings_total) || 0;
+    if (carves.length === 0) {
+      hybridT.innerHTML = '<span class="empty">no carve-outs at current thresholds</span>';
+    } else {
+      hybridT.innerHTML = `<span class="savings">+${fmt$(carveSavings)}</span> &nbsp;<span class="count">${carves.length} item${carves.length===1?'':'s'} carved</span>`;
+    }
+  }
+
+  // R2 drawer: count selected + estimated impact
+  const r2T = $('drawer-r2-teaser');
+  if (r2T) {
+    const n = (typeof _round2Selection !== 'undefined') ? _round2Selection.size : 0;
+    if (n === 0) {
+      r2T.innerHTML = '<span class="empty">no items selected — pick rows in the matrix above</span>';
+    } else {
+      r2T.innerHTML = `<span class="count">${n} item${n===1?'':'s'} flagged</span> &nbsp;<span style="color:var(--cyan);">ready to send</span>`;
+    }
+  }
+
+  // Scenarios drawer
+  const scT = $('drawer-scenarios-teaser');
+  if (scT) {
+    const scs = data.scenarios || [];
+    if (scs.length === 0) {
+      scT.innerHTML = '<span class="empty">0 saved — bookmark the active chip below to come back to it</span>';
+    } else {
+      scT.innerHTML = `<span class="count">${scs.length} scenario${scs.length===1?'':'s'} saved</span>`;
+    }
+  }
+
+  // Advanced drawer
+  const advT = $('drawer-advanced-teaser');
+  if (advT) {
+    const t = (data.clean_savings && data.clean_savings.totals) || {};
+    if (t.strict != null) {
+      advT.innerHTML = `<span style="color:var(--ink-1);">CLEAN ${fmt$(t.clean)}</span> &nbsp;<span class="savings">STRICT ${fmt$(t.strict)}</span>`;
+    } else {
+      advT.innerHTML = '<span class="empty">savings tiers · UOM resolution · audit log</span>';
+    }
+  }
+}
+
+function _escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch]);
 }
 
 // Renders the RAW / CLEAN / STRICT savings tiers as a panel below the bid-coverage KPIs.
@@ -2046,7 +2415,11 @@ json.dumps(result, default=str)
 //   STRICT = CLEAN + bid UOM matches history UOM after normalization
 function _renderCleanSavingsPanel(clean) {
   if (!clean || !clean.by_supplier) return;
-  const wrap = $('bid-summary-row');
+  // Step-4 redesign: clean-savings panel lives in the Advanced drawer.
+  // Append as a child of clean-savings-host so the panel sits cleanly inside
+  // the drawer body (legacy behavior of inserting AFTER bid-summary-row
+  // would split the panel out of any container).
+  const wrap = $('clean-savings-host');
   if (!wrap) return;
 
   // Remove any prior render (so re-runs don't duplicate)
@@ -2125,7 +2498,7 @@ function _renderCleanSavingsPanel(clean) {
       </details>
     </div>
   `;
-  wrap.insertAdjacentHTML('afterend', html);
+  wrap.insertAdjacentHTML('beforeend', html);
   // Wire up the UOM queue button
   const openBtn = document.getElementById('uom-queue-open-btn');
   if (openBtn) openBtn.addEventListener('click', _renderUomResolutionPanel);

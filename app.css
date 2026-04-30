@@ -375,3 +375,223 @@ tr.r2-selected {
 .matrix-cell-r2:hover {
   background: rgba(86,210,255,0.22) !important;
 }
+
+/* ---------- Step-4 redesign — headline card, chip strip, drawers ---------- */
+
+/* Partial-data banner. Soft amber outline. Reminds the analyst the
+   recommendation is provisional until the remaining bids drop. */
+.partial-data-banner {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 18px;
+  background: rgba(255,183,51,0.06);
+  border: 1px solid var(--accent-deep);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  font-family: var(--mono); font-size: 12px; color: var(--ink-1);
+  letter-spacing: 0.02em;
+}
+.partial-data-banner .pdb-icon { color: var(--accent); font-size: 14px; }
+
+/* HEADLINE CARD — the single most important surface in step 4.
+   The pretitle ("SYSTEM RECOMMENDATION") is muted uppercase tracking-wide.
+   The verdict line is HUGE mono, amber on the supplier name, terminal-style
+   arrow prefix. The savings is the second amber number. Below: secondary
+   counts (items / carve-outs / R2 candidates), the chip strip, and the
+   manual-override indicators with reset-to-auto button. */
+.headline-card {
+  padding: 32px 36px 28px;
+  background: linear-gradient(135deg, var(--bg-1) 0%, var(--bg-2) 100%);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  position: relative;
+  overflow: hidden;
+}
+.headline-card::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(255,183,51,0.6);
+}
+.headline-card::after {
+  /* subtle terminal grain */
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background-image: linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px);
+  background-size: 100% 3px;
+  opacity: 0.6;
+}
+.headline-pretitle {
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.16em;
+  color: var(--ink-2);
+  margin-bottom: 10px;
+}
+.headline-verdict {
+  font-family: var(--mono); font-size: 30px; font-weight: 700;
+  letter-spacing: -0.005em; line-height: 1.1;
+  color: var(--ink-0);
+  margin-bottom: 14px;
+}
+.headline-verdict .arrow { color: var(--accent); margin-right: 14px; opacity: 0.85; }
+.headline-verdict .award-label { color: var(--ink-2); font-weight: 400; margin-right: 12px; font-size: 22px; letter-spacing: 0.08em; }
+.headline-verdict .supplier-name { color: var(--accent); }
+.headline-verdict .placeholder { color: var(--ink-2); font-weight: 400; font-size: 22px; letter-spacing: 0.04em; }
+
+.headline-money {
+  font-family: var(--mono); font-size: 18px; font-weight: 600;
+  color: var(--ink-1);
+  margin-bottom: 4px;
+  display: flex; gap: 28px; align-items: baseline; flex-wrap: wrap;
+}
+.headline-money .total { color: var(--ink-0); }
+.headline-money .saves { color: var(--green); }
+.headline-money .saves-bad { color: var(--red); }
+.headline-money .pct { color: var(--ink-2); font-size: 13px; }
+
+.headline-counts {
+  font-family: var(--mono); font-size: 12px; color: var(--ink-2);
+  letter-spacing: 0.02em;
+  margin-bottom: 22px;
+}
+.headline-counts .sep { margin: 0 10px; opacity: 0.4; }
+
+/* CHIP STRIP — five strategy buttons. Active chip is amber-bordered,
+   amber-text, slight glow. Hover: cyan border. The "Consolidate to ▾"
+   chip carries an inline supplier dropdown. */
+.chip-strip {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 18px;
+  position: relative; z-index: 1;
+}
+.chip {
+  font-family: var(--mono); font-size: 12px; font-weight: 500;
+  padding: 8px 14px;
+  background: transparent;
+  color: var(--ink-1);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+.chip:hover { border-color: var(--cyan); color: var(--ink-0); }
+.chip.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(255,183,51,0.06);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 12px rgba(255,183,51,0.2);
+}
+.chip .chip-savings {
+  margin-left: 8px;
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 400;
+}
+.chip.active .chip-savings { color: var(--accent-deep); }
+.chip .chip-caret { margin-left: 4px; opacity: 0.6; }
+
+/* Consolidate-to dropdown (inline supplier picker) */
+.consolidate-picker-wrap { position: relative; }
+.consolidate-picker {
+  position: absolute; top: calc(100% + 4px); left: 0;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 0;
+  min-width: 180px;
+  z-index: 50;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+}
+.consolidate-picker[hidden] { display: none; }
+.consolidate-picker .picker-row {
+  padding: 7px 14px;
+  font-family: var(--mono); font-size: 12px;
+  color: var(--ink-1);
+  cursor: pointer;
+}
+.consolidate-picker .picker-row:hover { background: var(--bg-2); color: var(--ink-0); }
+.consolidate-picker .picker-row.selected { color: var(--accent); }
+
+/* MANUAL OVERRIDE INDICATORS — small mono pips with counts.
+   Click each to drill into that override class. Reset button on the right. */
+.override-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+  letter-spacing: 0.04em;
+  position: relative; z-index: 1;
+}
+.override-pip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 9px;
+  background: rgba(86,210,255,0.07);
+  border: 1px solid rgba(86,210,255,0.3);
+  border-radius: 3px;
+  color: var(--cyan);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.override-pip:hover { background: rgba(86,210,255,0.14); border-color: var(--cyan); }
+.override-pip .pip-dot { width: 6px; height: 6px; background: var(--cyan); border-radius: 50%; }
+.override-pip.empty { color: var(--ink-2); border-color: var(--line); background: transparent; cursor: default; }
+.override-pip.empty .pip-dot { background: var(--line); }
+.override-row .override-spacer { flex: 1; }
+.btn-reset-auto {
+  font-family: var(--mono); font-size: 11px; font-weight: 600;
+  padding: 5px 11px;
+  background: transparent;
+  color: var(--ink-1);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  cursor: pointer;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  transition: border-color 0.15s, color 0.15s;
+}
+.btn-reset-auto:hover { border-color: var(--accent); color: var(--accent); }
+.btn-reset-auto:disabled { opacity: 0.35; cursor: default; }
+
+/* DRAWER — native <details>/<summary> styled for the terminal aesthetic.
+   Collapsed: chevron, label, dotted-line teaser with $ + count.
+   Expanded: chevron rotates, body slides in. */
+.rfq-drawer {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.rfq-drawer[open] { border-color: rgba(255,183,51,0.25); }
+.rfq-drawer-summary {
+  list-style: none;
+  padding: 14px 20px;
+  display: flex; align-items: center; gap: 14px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+.rfq-drawer-summary::-webkit-details-marker { display: none; }
+.rfq-drawer-summary::before {
+  content: "▸";
+  font-family: var(--mono); font-size: 11px;
+  color: var(--accent);
+  transition: transform 0.2s;
+  width: 12px; flex-shrink: 0;
+}
+.rfq-drawer[open] > .rfq-drawer-summary::before {
+  transform: rotate(90deg);
+}
+.rfq-drawer-summary:hover { background: rgba(255,183,51,0.04); }
+.rfq-drawer-label {
+  font-family: var(--mono); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.10em;
+  color: var(--ink-0);
+}
+.rfq-drawer-teaser {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+  letter-spacing: 0.02em;
+  margin-left: auto;
+}
+.rfq-drawer-teaser .savings { color: var(--green); font-weight: 600; }
+.rfq-drawer-teaser .count { color: var(--ink-1); }
+.rfq-drawer-teaser .empty { color: var(--ink-2); font-style: italic; }
+.rfq-drawer-body { padding: 6px 20px 20px; border-top: 1px solid var(--line); }
+.rfq-drawer-body > *:first-child { margin-top: 14px; }
