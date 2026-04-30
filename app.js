@@ -1007,33 +1007,237 @@ if ($('bulk-exclude-all')) {
     _saveMgr.markDirty();
   });
 }
-if ($('smart-trim')) {
-  $('smart-trim').addEventListener('click', () => {
-    if (!_rfqResult) return;
-    if (!confirm(
-      'Smart trim will untick:\n' +
-      '  • Items in WEAK or SKIP tier (low spend / few orders / poor data)\n' +
-      '  • Items with concerning description patterns (service / freight / tariff / obsolete / rental)\n\n' +
-      'You can re-tick individual items afterward. Proceed?'
-    )) return;
-    let trimmed = 0;
-    let kept = 0;
-    for (const it of _rfqResult.items) {
-      const isWeak = (it.tier === 'WEAK' || it.tier === 'SKIP');
-      const dflags = it.desc_flags || [];
-      const hasRedFlag = dflags.some(f => _RED_DESC_FLAGS.has(f));
-      if ((isWeak || hasRedFlag) && it.included) {
-        it.included = false;
-        trimmed++;
-      } else if (it.included) {
-        kept++;
-      }
+// ----------------------------------------------------------------------------
+// Smart Trim — policy-driven bulk RFQ-include flipper.
+//
+// Replaces the old single-button "untick WEAK/SKIP + red desc" with a
+// collapsible panel that lets the analyst pick:
+//   - Dormancy window (12 / 24 / 36 mo OR off) — different supplier
+//     categories have different ordering cadences
+//   - Drop red description flags (service/freight/tariff/obsolete/rental)
+//   - Drop by tier (WEAK + SKIP, or SKIP only — keeps WEAK borderline items)
+//   - Drop below a $ minimum 24-mo spend
+//
+// Every toggle change recomputes the live summary on the right (no commit).
+// Apply commits the unticks, snapshots the prior include-state into
+// _smartTrimUndoSnapshot, and shows an Undo button for 30 seconds.
+// Manual decisions (items where the user has already toggled vs the default)
+// are surfaced in the summary so a careless Apply doesn't silently overwrite
+// 20 minutes of per-item review work.
+// ----------------------------------------------------------------------------
+const _SMART_TRIM_RED_FLAGS = new Set(['service', 'freight', 'tariff', 'obsolete', 'rental']);
+
+let _smartTrimUndoSnapshot = null;     // {item_num: bool} — RFQ-include state immediately before last apply
+let _smartTrimUndoTimer = null;
+
+function _smartTrimReadPolicy() {
+  return {
+    dormancy_on: !!$('st-dormancy-on') && $('st-dormancy-on').checked,
+    dormancy_window: (() => {
+      const r = document.querySelector('input[name="st-dormancy"]:checked');
+      return r ? r.value : '24';
+    })(),
+    redflags_on: !!$('st-redflags-on') && $('st-redflags-on').checked,
+    tier_on: !!$('st-tier-on') && $('st-tier-on').checked,
+    tier_mode: (() => {
+      const r = document.querySelector('input[name="st-tier"]:checked');
+      return r ? r.value : 'WEAK_SKIP';
+    })(),
+    minspend_on: !!$('st-minspend-on') && $('st-minspend-on').checked,
+    minspend_value: parseFloat(($('st-minspend-value') && $('st-minspend-value').value) || '0') || 0,
+  };
+}
+
+function _smartTrimEvaluate(policy) {
+  // Returns { willCut, willKeep, byBucket, manualOverwrites, examples } —
+  // willCut = items that would be unticked if Apply ran right now.
+  // Each item evaluated against every active rule; bucket counts are
+  // per-rule (an item can land in multiple buckets — counts may overlap).
+  if (!_rfqResult) return null;
+  const wKey12 = '_12mo', wKey24 = '_24mo', wKey36 = '_36mo';
+  const dormQty = (it) => {
+    const w = policy.dormancy_window;
+    if (w === '12') return it.qty_12mo || 0;
+    if (w === '24') return it.qty_24mo || 0;
+    if (w === '36') return it.qty_36mo || 0;
+    return 0;
+  };
+  let willCut = 0, willKeep = 0;
+  let bucketDormant = 0, bucketRedflag = 0, bucketTier = 0, bucketMinspend = 0;
+  let manualOverwrites = 0;
+  const examplesCut = [];
+  for (const it of _rfqResult.items) {
+    let cut = false;
+    if (policy.dormancy_on && dormQty(it) === 0) { cut = true; bucketDormant++; }
+    if (policy.redflags_on && (it.desc_flags || []).some(f => _SMART_TRIM_RED_FLAGS.has(f))) {
+      cut = true; bucketRedflag++;
     }
-    $('trim-status').textContent = `Trimmed ${trimmed.toLocaleString()} items · ${kept.toLocaleString()} still included`;
-    _renderRfqTable();
-    _saveMgr.markDirty();
+    if (policy.tier_on) {
+      const t = it.tier || 'WEAK';
+      if (policy.tier_mode === 'WEAK_SKIP' && (t === 'WEAK' || t === 'SKIP')) { cut = true; bucketTier++; }
+      else if (policy.tier_mode === 'SKIP_ONLY' && t === 'SKIP') { cut = true; bucketTier++; }
+    }
+    if (policy.minspend_on && (it.spend_24mo_actual || it.spend_24mo || 0) < policy.minspend_value) {
+      cut = true; bucketMinspend++;
+    }
+    if (cut) {
+      willCut++;
+      if (it.included && examplesCut.length < 3) {
+        examplesCut.push({
+          item_num: it.item_num,
+          description: (it.description || '').slice(0, 50),
+        });
+      }
+      // Manual-overwrite guard: default-included = qty_24mo > 0. If the
+      // user has explicitly TICKED an item that the engine would have
+      // un-ticked by default, that's a manual override we'd be erasing.
+      const defaultIncluded = (it.qty_24mo || 0) > 0;
+      if (it.included && !defaultIncluded) manualOverwrites++;
+    } else {
+      if (it.included) willKeep++;
+    }
+  }
+  return {
+    willCut, willKeep,
+    byBucket: { dormant: bucketDormant, redflag: bucketRedflag, tier: bucketTier, minspend: bucketMinspend },
+    manualOverwrites,
+    examplesCut,
+  };
+}
+
+function _smartTrimRenderSummary() {
+  const body = document.getElementById('st-summary-body');
+  if (!body) return;
+  const policy = _smartTrimReadPolicy();
+  const hasAnyRule = policy.dormancy_on || policy.redflags_on || policy.tier_on || policy.minspend_on;
+  if (!hasAnyRule) {
+    body.innerHTML = '<span style="color:var(--ink-2);">No rules active. Tick at least one toggle on the left to see a preview.</span>';
+    document.getElementById('st-apply').disabled = true;
+    return;
+  }
+  document.getElementById('st-apply').disabled = false;
+  const e = _smartTrimEvaluate(policy);
+  if (!e) {
+    body.innerHTML = '<span style="color:var(--ink-2);">Need to extract the RFQ first.</span>';
+    return;
+  }
+  const fmt = (n) => n.toLocaleString();
+  const activeRules = [];
+  if (policy.dormancy_on)  activeRules.push(`zero qty in ${policy.dormancy_window}-mo (${fmt(e.byBucket.dormant)})`);
+  if (policy.redflags_on)  activeRules.push(`red description flags (${fmt(e.byBucket.redflag)})`);
+  if (policy.tier_on)      activeRules.push(`tier ${policy.tier_mode === 'SKIP_ONLY' ? 'SKIP only' : 'WEAK + SKIP'} (${fmt(e.byBucket.tier)})`);
+  if (policy.minspend_on)  activeRules.push(`24-mo spend &lt; $${fmt(policy.minspend_value)} (${fmt(e.byBucket.minspend)})`);
+  let html = `<div style="margin-bottom:8px;color:var(--ink-2);">Active rules: ${activeRules.join(' · ')}</div>`;
+  html += `<div style="font-size:14px;color:var(--ink-0);margin-bottom:6px;"><strong style="color:var(--red);">${fmt(e.willCut)}</strong> items will be unticked</div>`;
+  html += `<div style="font-size:14px;color:var(--ink-0);margin-bottom:14px;"><strong style="color:var(--green);">${fmt(e.willKeep)}</strong> items kept ticked for the RFQ</div>`;
+  if (e.manualOverwrites > 0) {
+    html += `<div style="margin-bottom:10px;padding:8px 10px;background:rgba(255,77,109,0.08);border:1px solid var(--red);border-radius:3px;color:var(--red);font-size:11px;">⚠ <strong>${fmt(e.manualOverwrites)}</strong> manual decisions will be overwritten — items you've ticked despite the engine's default. Confirm dialog will list them before commit.</div>`;
+  }
+  if (e.examplesCut.length) {
+    html += '<div style="color:var(--ink-2);margin-bottom:6px;">Examples that would be cut:</div>';
+    for (const ex of e.examplesCut) {
+      html += `<div style="padding-left:8px;font-size:11px;color:var(--ink-1);">· <code>${_escapeHtml(ex.item_num)}</code> ${_escapeHtml(ex.description)}</div>`;
+    }
+  }
+  body.innerHTML = html;
+}
+
+function _smartTrimApply() {
+  if (!_rfqResult) return;
+  const policy = _smartTrimReadPolicy();
+  const e = _smartTrimEvaluate(policy);
+  if (!e || e.willCut === 0) {
+    alert('No items match the current policy — nothing to untick.');
+    return;
+  }
+  let confirmMsg = `Apply Smart Trim?\n\n${e.willCut.toLocaleString()} items will be unticked.\n${e.willKeep.toLocaleString()} items will remain ticked for the RFQ.`;
+  if (e.manualOverwrites > 0) {
+    confirmMsg += `\n\n⚠ ${e.manualOverwrites} of the items being unticked are manual decisions you previously made (ticked despite engine default). These will be overwritten.`;
+  }
+  confirmMsg += `\n\nReversible — click Undo within 30 seconds, or 'Include all visible' to undo broadly.`;
+  if (!confirm(confirmMsg)) return;
+
+  // Snapshot prior include-state for undo
+  const snapshot = {};
+  for (const it of _rfqResult.items) snapshot[it.item_num] = !!it.included;
+  _smartTrimUndoSnapshot = snapshot;
+
+  // Apply
+  let trimmed = 0;
+  for (const it of _rfqResult.items) {
+    if (!it.included) continue;
+    let cut = false;
+    if (policy.dormancy_on) {
+      const w = policy.dormancy_window;
+      const q = (w === '12') ? it.qty_12mo : (w === '36') ? it.qty_36mo : it.qty_24mo;
+      if ((q || 0) === 0) cut = true;
+    }
+    if (policy.redflags_on && (it.desc_flags || []).some(f => _SMART_TRIM_RED_FLAGS.has(f))) cut = true;
+    if (policy.tier_on) {
+      const t = it.tier || 'WEAK';
+      if (policy.tier_mode === 'WEAK_SKIP' && (t === 'WEAK' || t === 'SKIP')) cut = true;
+      else if (policy.tier_mode === 'SKIP_ONLY' && t === 'SKIP') cut = true;
+    }
+    if (policy.minspend_on && (it.spend_24mo_actual || it.spend_24mo || 0) < policy.minspend_value) cut = true;
+    if (cut) { it.included = false; trimmed++; }
+  }
+  $('trim-status').textContent = `Trimmed ${trimmed.toLocaleString()} items · ${e.willKeep.toLocaleString()} still included`;
+  _renderRfqTable();
+  _smartTrimRenderSummary();  // refresh in case re-eval reflects post-trim state
+  _saveMgr.markDirty();
+
+  // Show the Undo button for 30 seconds
+  const undoBtn = document.getElementById('st-undo');
+  if (undoBtn) {
+    undoBtn.style.display = '';
+    if (_smartTrimUndoTimer) clearTimeout(_smartTrimUndoTimer);
+    _smartTrimUndoTimer = setTimeout(() => {
+      undoBtn.style.display = 'none';
+      _smartTrimUndoSnapshot = null;
+    }, 30000);
+  }
+}
+
+function _smartTrimUndo() {
+  if (!_smartTrimUndoSnapshot || !_rfqResult) return;
+  let restored = 0;
+  for (const it of _rfqResult.items) {
+    const prior = _smartTrimUndoSnapshot[it.item_num];
+    if (prior !== undefined && it.included !== prior) {
+      it.included = prior;
+      restored++;
+    }
+  }
+  $('trim-status').textContent = `Undo: restored ${restored.toLocaleString()} items to their prior include state.`;
+  _renderRfqTable();
+  _smartTrimRenderSummary();
+  _saveMgr.markDirty();
+  // Clear the snapshot + hide button
+  _smartTrimUndoSnapshot = null;
+  if (_smartTrimUndoTimer) { clearTimeout(_smartTrimUndoTimer); _smartTrimUndoTimer = null; }
+  const undoBtn = document.getElementById('st-undo');
+  if (undoBtn) undoBtn.style.display = 'none';
+}
+
+// Wire toggles + buttons
+if ($('smart-trim-toggle')) {
+  $('smart-trim-toggle').addEventListener('click', () => {
+    const panel = document.getElementById('smart-trim-panel');
+    if (!panel) return;
+    const showing = panel.style.display !== 'none';
+    panel.style.display = showing ? 'none' : '';
+    if (!showing) _smartTrimRenderSummary();
   });
 }
+for (const id of ['st-dormancy-on', 'st-redflags-on', 'st-tier-on', 'st-minspend-on', 'st-minspend-value']) {
+  const el = $(id);
+  if (el) el.addEventListener('input', _smartTrimRenderSummary);
+}
+document.querySelectorAll('input[name="st-dormancy"], input[name="st-tier"]').forEach(r => {
+  r.addEventListener('change', _smartTrimRenderSummary);
+});
+if ($('st-apply')) $('st-apply').addEventListener('click', _smartTrimApply);
+if ($('st-undo')) $('st-undo').addEventListener('click', _smartTrimUndo);
 
 // ==========================================================================
 // Charts (table-first; charts live below the table per ryan's rule)

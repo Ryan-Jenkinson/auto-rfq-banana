@@ -177,8 +177,60 @@
     <div class="actions" style="margin-top:0;margin-bottom:14px;">
       <button class="btn ghost" id="bulk-include-all" title="Tick every visible row at once — useful after narrowing the filter to a specific subset you want in the RFQ." style="padding:6px 12px;font-size:12px;">Include all visible</button>
       <button class="btn ghost" id="bulk-exclude-all" title="Untick every visible row at once — useful after filtering to weak/SKIP tier or risky description patterns." style="padding:6px 12px;font-size:12px;">Exclude all visible</button>
-      <button class="btn ghost" id="smart-trim" title="Bulk-untick items with WEAK/SKIP tier OR risky description patterns (service / freight / tariff / obsolete / rental). Reversible — items stay in the list, just unchecked. The single most common first move on a fresh extract." style="padding:6px 12px;font-size:12px;">⚡ Smart trim</button>
+      <button class="btn ghost" id="smart-trim-toggle" title="Open the Smart Trim panel — pick a dormancy window (12 / 24 / 36 mo) and which classes of items to drop. Live preview shows what will be unticked before you commit. All unticks are reversible — the data stays, just the RFQ checkbox flips." style="padding:6px 12px;font-size:12px;">⚡ Smart trim ▾</button>
       <span class="muted" id="trim-status"></span>
+    </div>
+
+    <!-- Smart Trim panel — collapsible, hidden by default. Live summary recomputes as toggles flip. -->
+    <div id="smart-trim-panel" style="display:none;margin-bottom:18px;padding:18px 20px;background:var(--bg-1);border:1px solid var(--line);border-radius:6px;">
+      <div style="display:grid;grid-template-columns:minmax(360px,1.2fr) minmax(280px,1fr);gap:24px;">
+        <!-- Left column — controls -->
+        <div>
+          <h3 style="margin:0 0 14px;font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;">Smart trim policy</h3>
+
+          <label style="display:block;margin-bottom:14px;font-size:13px;color:var(--ink-1);" title="Drop items that haven't been ordered in the chosen window. Different supplier categories have different ordering cadences — monthly-cycle MRO suppliers can use 12-mo; quarterly capital suppliers may need 36-mo so a 15-month gap doesn't drop a still-active item.">
+            <input type="checkbox" id="st-dormancy-on" checked style="vertical-align:middle;margin-right:6px;accent-color:var(--accent);">
+            <strong style="color:var(--ink-0);">Drop dormant items</strong> — no qty in the last:
+            <div style="margin:8px 0 0 24px;display:flex;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-size:12px;">
+              <label title="Aggressive — for fast-cycle MRO suppliers."><input type="radio" name="st-dormancy" value="12" style="accent-color:var(--accent);"> 12 months</label>
+              <label title="Default — matches the standard RFQ baseline window."><input type="radio" name="st-dormancy" value="24" checked style="accent-color:var(--accent);"> 24 months</label>
+              <label title="Conservative — for slow-cycle / quarterly suppliers."><input type="radio" name="st-dormancy" value="36" style="accent-color:var(--accent);"> 36 months</label>
+            </div>
+          </label>
+
+          <label style="display:block;margin-bottom:14px;font-size:13px;color:var(--ink-1);" title="Drop items whose description is service / freight / tariff / obsolete / rental — almost never RFQ-worthy regardless of context.">
+            <input type="checkbox" id="st-redflags-on" checked style="vertical-align:middle;margin-right:6px;accent-color:var(--accent);">
+            <strong style="color:var(--ink-0);">Drop red description flags</strong>
+            <span style="color:var(--ink-2);font-family:var(--mono);font-size:11px;margin-left:6px;">service / freight / tariff / obsolete / rental</span>
+          </label>
+
+          <label style="display:block;margin-bottom:14px;font-size:13px;color:var(--ink-1);" title="Drop items the engine flagged as low-confidence. WEAK = thin signal (low spend / few orders / poor data). SKIP = almost no signal at all. The reason text on each tier chip explains why. Note: WEAK doesn't always mean unimportant — a $300 critical maintenance part is WEAK by the engine but absolutely belongs in an RFQ. Use 'SKIP only' if you're worried about losing borderline items.">
+            <input type="checkbox" id="st-tier-on" style="vertical-align:middle;margin-right:6px;accent-color:var(--accent);">
+            <strong style="color:var(--ink-0);">Drop by tier</strong>
+            <div style="margin:8px 0 0 24px;display:flex;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-size:12px;">
+              <label title="Aggressive — drops every WEAK and SKIP item."><input type="radio" name="st-tier" value="WEAK_SKIP" checked style="accent-color:var(--accent);"> WEAK + SKIP</label>
+              <label title="Conservative — keeps WEAK items, drops only SKIP (score &lt; 25)."><input type="radio" name="st-tier" value="SKIP_ONLY" style="accent-color:var(--accent);"> SKIP only</label>
+            </div>
+          </label>
+
+          <label style="display:block;margin-bottom:14px;font-size:13px;color:var(--ink-1);" title="Drop items whose 24-month spend is below this dollar amount. Catches items that are technically active but too small to be worth running through an RFQ.">
+            <input type="checkbox" id="st-minspend-on" style="vertical-align:middle;margin-right:6px;accent-color:var(--accent);">
+            <strong style="color:var(--ink-0);">Drop items with 24-mo spend below</strong>
+            <input type="number" id="st-minspend-value" min="0" step="50" value="100" style="width:80px;background:var(--bg-2);color:var(--ink-0);border:1px solid var(--line);border-radius:3px;padding:4px 8px;font-family:var(--mono);font-size:12px;margin-left:8px;">
+          </label>
+
+          <div style="display:flex;gap:10px;margin-top:18px;flex-wrap:wrap;">
+            <button class="btn primary" id="st-apply" title="Untick the items in the preview (right) — committed to the RFQ-include checkbox. Reversible: 'Include all visible' or per-row re-checking will undo. The 'Undo' button below appears for 30s after apply." style="padding:8px 16px;font-size:13px;">⚡ Apply Smart Trim</button>
+            <button class="btn ghost" id="st-undo" title="Restore the RFQ-include state from immediately before the last Smart Trim apply. Visible for 30 seconds after each apply." style="padding:8px 16px;font-size:13px;display:none;">↺ Undo last Smart Trim</button>
+          </div>
+        </div>
+
+        <!-- Right column — live preview -->
+        <div id="st-summary" style="padding:16px;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;font-family:var(--mono);font-size:12px;line-height:1.7;color:var(--ink-1);min-height:240px;">
+          <div style="color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.10em;font-weight:600;margin-bottom:10px;">CURRENT POLICY · LIVE PREVIEW</div>
+          <div id="st-summary-body" style="color:var(--ink-1);">Adjust toggles on the left to see what would be unticked.</div>
+        </div>
+      </div>
     </div>
 
     <div class="rfq-table-wrap">
