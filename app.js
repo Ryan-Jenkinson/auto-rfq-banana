@@ -4311,12 +4311,21 @@ function _ensureItemModal() {
         <button id="im-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;flex-shrink:0;margin-left:14px;">×</button>
       </div>
       <div id="im-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0;border-bottom:1px solid var(--line);"></div>
-      <div style="padding:22px 26px 8px;">
-        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;">
+      <div id="im-chart-section" style="padding:22px 26px 8px;">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:10px;">
           <h3 style="margin:0;font-size:11px;color:var(--ink-2);font-weight:600;text-transform:uppercase;letter-spacing:0.10em;font-family:var(--ui);">UNIT PRICE OVER TIME</h3>
-          <div id="im-trend-label" style="font-size:11px;color:var(--ink-2);font-family:var(--mono);"></div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <div id="im-event-filters" style="display:flex;gap:4px;flex-wrap:wrap;"></div>
+            <button id="im-events-toggle" type="button" title="Show / hide the table of economic events overlaid on this chart. Click any vertical line on the chart to scroll to that event in the table." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:10px;padding:4px 8px;border-radius:3px;cursor:pointer;letter-spacing:0.06em;">EVENTS ▾</button>
+            <button id="im-chart-fullscreen" type="button" title="Expand the chart to fill the entire screen. Esc or click the ✕ to return." style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-family:var(--mono);font-size:10px;padding:4px 8px;border-radius:3px;cursor:pointer;letter-spacing:0.06em;">⤢ FULLSCREEN</button>
+            <div id="im-trend-label" style="font-size:11px;color:var(--ink-2);font-family:var(--mono);"></div>
+          </div>
         </div>
-        <svg id="im-chart" style="width:100%;height:280px;display:block;" preserveAspectRatio="xMidYMid meet"></svg>
+        <div id="im-chart-wrap" style="position:relative;">
+          <svg id="im-chart" style="width:100%;height:280px;display:block;" preserveAspectRatio="xMidYMid meet"></svg>
+          <button id="im-chart-fullscreen-close" type="button" style="display:none;position:absolute;top:12px;right:12px;background:var(--bg-2);border:1px solid var(--accent);color:var(--accent);font-family:var(--mono);font-size:13px;padding:6px 12px;border-radius:4px;cursor:pointer;z-index:201;letter-spacing:0.06em;">✕ EXIT FULLSCREEN</button>
+        </div>
+        <div id="im-events-table" hidden style="margin-top:10px;border:1px solid var(--line);border-radius:4px;background:var(--bg-2);max-height:200px;overflow:auto;"></div>
         <div id="im-trend-callout" style="margin-top:10px;padding:10px 12px;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;font-size:12px;color:var(--ink-1);font-family:var(--mono);"></div>
       </div>
       <div id="im-bids-section" style="padding:0 26px;display:none;">
@@ -4352,6 +4361,29 @@ function _ensureItemModal() {
   `;
   document.body.appendChild(m);
   document.getElementById('im-close').addEventListener('click', _closeItemModal);
+
+  // Events table toggle — show / hide the description-of-events table below
+  // the chart. Persistent within the modal session; resets on next open.
+  const evToggle = document.getElementById('im-events-toggle');
+  if (evToggle) evToggle.addEventListener('click', () => {
+    const tbl = document.getElementById('im-events-table');
+    if (!tbl) return;
+    tbl.hidden = !tbl.hidden;
+    evToggle.textContent = tbl.hidden ? 'EVENTS ▾' : 'EVENTS ▴';
+  });
+
+  // Fullscreen toggle — wraps the chart so it fills the viewport. Click the
+  // ✕ button or press Esc to exit. Re-renders the chart at the new size.
+  const fsBtn = document.getElementById('im-chart-fullscreen');
+  const fsClose = document.getElementById('im-chart-fullscreen-close');
+  if (fsBtn) fsBtn.addEventListener('click', _enterChartFullscreen);
+  if (fsClose) fsClose.addEventListener('click', _exitChartFullscreen);
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      const wrap = document.getElementById('im-chart-wrap');
+      if (wrap && wrap.classList.contains('is-fullscreen')) _exitChartFullscreen();
+    }
+  });
   m.addEventListener('click', (e) => { if (e.target === m) _closeItemModal(); });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && m.style.display === 'flex') _closeItemModal();
@@ -5025,9 +5057,113 @@ ${pyFn}(_item_num_in, _note_in)
   }
 }
 
+// ----- Economic / tariff / commodity events overlay -----
+//
+// A static list of events that overlay the per-item history chart as
+// vertical date markers + labels. Each event has a category so the analyst
+// can filter (toggle TARIFF / COMMODITY / ECONOMIC chips on/off). The list
+// is intentionally short and editable — replace with your org's actual
+// event ledger or wire to a JSON file when ready. Companion app
+// (tariff-impact) carries its own canonical list; this is the lite version
+// that ships in this app for the chart overlay.
+const _CHART_EVENTS = [
+  // Examples — replace / extend with the real event timeline
+  {date: "2025-04-09", category: "TARIFF", label: "Section 301 tariff +10% (illustrative)", description: "Tariff schedule update increasing duties on selected industrial imports. Replace with real event when known."},
+  {date: "2024-11-01", category: "TARIFF", label: "Tariff schedule revision (illustrative)", description: "Adjustment to industrial-goods duty rates. Replace with real event."},
+  {date: "2024-08-15", category: "COMMODITY", label: "Aluminum supply tightening (illustrative)", description: "Supply-side pressure on aluminum stock; expect upstream cost pass-through. Replace with real event."},
+  {date: "2024-04-15", category: "COMMODITY", label: "Copper price spike (illustrative)", description: "Major copper price spike on supply concerns; affects motor / wiring / fastener costs. Replace with real event."},
+  {date: "2023-08-01", category: "ECONOMIC", label: "Fed rate hike cycle peak (illustrative)", description: "Macro tightening; pricing pressure in capital-intensive supplier categories. Replace with real event."},
+  {date: "2022-03-01", category: "ECONOMIC", label: "Inflation surge (illustrative)", description: "Broad-based PPI inflation; widespread mid-cycle supplier pass-through. Replace with real event."},
+];
+const _EVENT_CATEGORY_COLORS = {
+  TARIFF:    "var(--red)",
+  COMMODITY: "var(--cyan)",
+  ECONOMIC:  "var(--accent)",
+};
+let _chartEventFilter = {TARIFF: true, COMMODITY: true, ECONOMIC: true};
+
+function _renderEventFilters() {
+  const wrap = document.getElementById('im-event-filters');
+  if (!wrap) return;
+  const categories = ["TARIFF", "COMMODITY", "ECONOMIC"];
+  wrap.innerHTML = categories.map(cat => {
+    const on = _chartEventFilter[cat];
+    const color = _EVENT_CATEGORY_COLORS[cat];
+    return `<button type="button" data-event-filter="${cat}" title="Toggle ${cat} events on/off in the chart overlay." style="background:${on ? `rgba(255,183,51,0.06)` : 'transparent'};border:1px solid ${on ? color : 'var(--line)'};color:${on ? color : 'var(--ink-2)'};font-family:var(--mono);font-size:10px;padding:3px 8px;border-radius:3px;cursor:pointer;letter-spacing:0.06em;font-weight:${on ? 700 : 400};">${on ? '●' : '○'} ${cat}</button>`;
+  }).join('');
+  wrap.querySelectorAll('[data-event-filter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const cat = btn.getAttribute('data-event-filter');
+      _chartEventFilter[cat] = !_chartEventFilter[cat];
+      _renderEventFilters();
+      // Re-render the chart so the overlay updates without a full modal refresh
+      if (_currentItemHistory) _drawItemHistoryChart(_currentItemHistory);
+      _renderEventsTable();
+    });
+  });
+}
+
+function _renderEventsTable() {
+  const el = document.getElementById('im-events-table');
+  if (!el) return;
+  const visibleEvents = _CHART_EVENTS.filter(e => _chartEventFilter[e.category]);
+  if (!visibleEvents.length) {
+    el.innerHTML = '<div style="padding:14px;color:var(--ink-2);font-family:var(--mono);font-size:11px;text-align:center;">No events visible — toggle a category filter on.</div>';
+    return;
+  }
+  // Sort by date desc
+  const sorted = [...visibleEvents].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  let html = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono);">';
+  html += '<thead style="background:var(--bg-1);position:sticky;top:0;"><tr>';
+  html += '<th style="padding:6px 10px;text-align:left;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;font-weight:600;width:90px;">Date</th>';
+  html += '<th style="padding:6px 10px;text-align:left;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;font-weight:600;width:90px;">Category</th>';
+  html += '<th style="padding:6px 10px;text-align:left;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;font-weight:600;">Event</th>';
+  html += '</tr></thead><tbody>';
+  for (const e of sorted) {
+    const color = _EVENT_CATEGORY_COLORS[e.category] || 'var(--ink-1)';
+    html += `<tr id="event-row-${_escapeHtml(e.date)}" style="border-bottom:1px solid var(--line);" title="${_escapeHtml(e.description || '')}">
+      <td style="padding:6px 10px;color:var(--ink-1);">${_escapeHtml(e.date)}</td>
+      <td style="padding:6px 10px;color:${color};font-weight:600;">${_escapeHtml(e.category)}</td>
+      <td style="padding:6px 10px;color:var(--ink-0);">${_escapeHtml(e.label)}<br><small style="color:var(--ink-2);">${_escapeHtml(e.description || '')}</small></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function _enterChartFullscreen() {
+  const wrap = document.getElementById('im-chart-wrap');
+  if (!wrap) return;
+  wrap.classList.add('is-fullscreen');
+  const closeBtn = document.getElementById('im-chart-fullscreen-close');
+  if (closeBtn) closeBtn.style.display = 'block';
+  // Bump the SVG to fill the viewport and redraw at new dimensions
+  const svg = document.getElementById('im-chart');
+  if (svg) {
+    svg.style.height = 'calc(100vh - 80px)';
+  }
+  if (_currentItemHistory) _drawItemHistoryChart(_currentItemHistory);
+}
+
+function _exitChartFullscreen() {
+  const wrap = document.getElementById('im-chart-wrap');
+  if (!wrap) return;
+  wrap.classList.remove('is-fullscreen');
+  const closeBtn = document.getElementById('im-chart-fullscreen-close');
+  if (closeBtn) closeBtn.style.display = 'none';
+  const svg = document.getElementById('im-chart');
+  if (svg) {
+    svg.style.height = '280px';
+  }
+  if (_currentItemHistory) _drawItemHistoryChart(_currentItemHistory);
+}
+
 function _drawItemHistoryChart(h) {
   const svg = document.getElementById('im-chart');
-  const W = svg.clientWidth || 800, H = 280;
+  // Render filter chips + events table (idempotent — safe to call repeatedly)
+  _renderEventFilters();
+  _renderEventsTable();
+  const W = svg.clientWidth || 800, H = svg.clientHeight || 280;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
   // Right pad widened to ~140 so per-supplier bid labels render beside the
   // anchor-date column without overlapping the EXPECTED marker callout.
@@ -5069,6 +5205,27 @@ function _drawItemHistoryChart(h) {
   const xScale = (d) => padL + ((d.getTime() - minDate) / dateRange) * innerW;
 
   let s = '';
+
+  // Economic / tariff / commodity event overlays — rendered FIRST so other
+  // elements draw on top of them. Vertical line at the event date, with a
+  // small label rotated up the line. Filtered by _chartEventFilter category
+  // toggles. Click a line → scroll to + flash the matching row in the
+  // events table below the chart.
+  for (const ev of _CHART_EVENTS) {
+    if (!_chartEventFilter[ev.category]) continue;
+    if (!ev.date) continue;
+    const evDate = new Date(ev.date);
+    const evMs = evDate.getTime();
+    if (evMs < minDate || evMs > maxDate) continue;
+    const ex = padL + ((evMs - minDate) / dateRange) * innerW;
+    const color = _EVENT_CATEGORY_COLORS[ev.category] || 'var(--ink-2)';
+    s += `<g class="chart-event" data-event-date="${_escapeHtml(ev.date)}" style="cursor:pointer;">
+      <line x1="${ex}" y1="${padT}" x2="${ex}" y2="${padT + innerH}" stroke="${color}" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.55"/>
+      <rect x="${ex - 1}" y="${padT}" width="3" height="${innerH}" fill="transparent" pointer-events="all"/>
+      <text x="${ex + 4}" y="${padT + 12}" fill="${color}" font-family="var(--mono)" font-size="9" font-weight="600" letter-spacing="0.06em" text-rendering="geometricPrecision">${_escapeHtml(ev.label.length > 38 ? ev.label.slice(0, 36) + '…' : ev.label)}</text>
+      <title>${_escapeHtml(ev.date)} · ${_escapeHtml(ev.category)} · ${_escapeHtml(ev.label)} — ${_escapeHtml(ev.description || '')}</title>
+    </g>`;
+  }
 
   // Y-axis grid lines + labels (4 ticks)
   for (let i = 0; i <= 4; i++) {
@@ -5129,12 +5286,20 @@ function _drawItemHistoryChart(h) {
     const x = xScale(p.date);
     const y = yScale(p.price);
     const r = Math.max(2.5, Math.min(6, 2.5 + (p.qty / maxQty) * 4));
+    // Dots are clickable: click → scroll to + flash the matching row in the
+    // Order Lines table below. Easier than hunting the small USE checkbox
+    // for an outlier point. Wrapped in a <g> with a wider invisible hit-rect
+    // so clicking near (not on) the dot still works.
+    const dot_title = `${p.date.toISOString().slice(0,10)} · qty ${p.qty} · $${p.price.toFixed(2)}${p.excluded ? ' · EXCLUDED' : ''} · click to highlight in table below`;
+    s += `<g class="chart-dot" data-line-idx="${p.lineIdx}" style="cursor:pointer;">
+      <circle cx="${x}" cy="${y}" r="${Math.max(r + 4, 8)}" fill="transparent" pointer-events="all"/>`;
     if (p.excluded) {
-      s += `<circle cx="${x}" cy="${y}" r="${r}" fill="none" stroke="var(--ink-2)" stroke-width="1" opacity="0.55"/>`;
-      s += `<line x1="${x - r - 1}" y1="${y - r - 1}" x2="${x + r + 1}" y2="${y + r + 1}" stroke="var(--ink-2)" stroke-width="1" opacity="0.45"/>`;
+      s += `<circle cx="${x}" cy="${y}" r="${r}" fill="none" stroke="var(--ink-2)" stroke-width="1" opacity="0.55" pointer-events="none"/>`;
+      s += `<line x1="${x - r - 1}" y1="${y - r - 1}" x2="${x + r + 1}" y2="${y + r + 1}" stroke="var(--ink-2)" stroke-width="1" opacity="0.45" pointer-events="none"/>`;
     } else {
-      s += `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--accent)" opacity="0.78"/>`;
+      s += `<circle cx="${x}" cy="${y}" r="${r}" fill="var(--accent)" opacity="0.78" pointer-events="none"/>`;
     }
+    s += `<title>${_escapeHtml(dot_title)}</title></g>`;
   }
   // Last cleaned-set point — bigger, red if spike, with a price label
   if (lastPoint) {
@@ -5205,6 +5370,39 @@ function _drawItemHistoryChart(h) {
   }
 
   svg.innerHTML = s;
+
+  // Wire chart-event line clicks → reveal events table + scroll to that row
+  svg.querySelectorAll('.chart-event').forEach(g => {
+    g.addEventListener('click', () => {
+      const date = g.getAttribute('data-event-date');
+      const tbl = document.getElementById('im-events-table');
+      if (tbl && tbl.hidden) tbl.hidden = false;
+      const row = document.getElementById(`event-row-${date}`);
+      if (row) {
+        row.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+        row.style.transition = 'background-color 0.4s';
+        row.style.backgroundColor = 'rgba(255,183,51,0.18)';
+        setTimeout(() => { row.style.backgroundColor = ''; }, 1500);
+      }
+    });
+  });
+
+  // Wire dot clicks → flash the matching row in the Order Lines table below
+  svg.querySelectorAll('.chart-dot[data-line-idx]').forEach(g => {
+    g.addEventListener('click', () => {
+      const idx = g.getAttribute('data-line-idx');
+      // Order Lines tbody rows have data-line-idx already (per-item modal).
+      const row = document.querySelector(`#im-lines-body tr[data-line-idx="${CSS.escape(idx)}"]`);
+      if (!row) return;
+      row.scrollIntoView({behavior: 'smooth', block: 'center'});
+      row.style.transition = 'background-color 0.4s';
+      row.style.backgroundColor = 'rgba(255,183,51,0.20)';
+      setTimeout(() => { row.style.backgroundColor = ''; }, 1500);
+      // Focus the USE checkbox so spacebar can toggle exclusion immediately
+      const cb = row.querySelector('input[type="checkbox"]');
+      if (cb) try { cb.focus({preventScroll: true}); } catch (_) { cb.focus(); }
+    });
+  });
 }
 
 // ==========================================================================

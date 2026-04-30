@@ -904,6 +904,22 @@ th.sortable.sort-desc::after { content: "▼"; color: var(--accent); opacity: 1;
 .all-fields-key { color: var(--ink-2); letter-spacing: 0.04em; text-transform: uppercase; font-size: 10px; align-self: center; }
 .all-fields-val { color: var(--ink-0); word-break: break-word; }
 
+/* Chart fullscreen toggle — applied to #im-chart-wrap */
+#im-chart-wrap.is-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: var(--bg-0);
+  padding: 32px;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+}
+#im-chart-wrap.is-fullscreen #im-chart {
+  width: 100%;
+  height: 100% !important;
+}
+
 /* Persistence indicator on dropzones (last loaded file) */
 .dropzone-last-loaded {
   margin-top: 14px;
