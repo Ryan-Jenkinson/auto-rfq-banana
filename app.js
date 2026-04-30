@@ -2526,6 +2526,140 @@ function _escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch]);
 }
 
+// ---------- Universal row selection + sortable columns ----------
+//
+// Opt-in by adding to any <table>:
+//   data-table-id="<unique key>"   identifies the table for state persistence
+//   data-rowselect="1"             rows become click-to-select (cyan stripe + bg)
+//   data-sortable="1"              <th data-sort-key="<col>" data-sort-type="num|str|date">
+//                                  headers become click-to-sort (asc → desc → none)
+//
+// Both use a single document-level click delegator so re-renders don't need
+// to re-wire. Selection + sort state live in module-level Maps keyed by
+// data-table-id. After every render, _restoreUniversalTableState(tableEl)
+// re-applies the saved selection class + sort order. Resets only when the
+// underlying dataset is replaced (caller calls _resetUniversalTableState).
+const _tableSelection = {};   // {tableId: rowKey}
+const _tableSort = {};        // {tableId: {key, dir, type}} where dir = 'asc'|'desc'
+
+function _restoreUniversalTableState(tableEl) {
+  if (!tableEl) return;
+  const tableId = tableEl.getAttribute('data-table-id');
+  if (!tableId) return;
+  // Restore selection
+  const selKey = _tableSelection[tableId];
+  if (selKey) {
+    const tr = tableEl.querySelector(`tbody tr[data-row-key="${CSS.escape(selKey)}"]`);
+    if (tr) tr.classList.add('row-selected');
+  }
+  // Restore sort
+  const sort = _tableSort[tableId];
+  if (sort && sort.key) {
+    _applyTableSort(tableEl, sort.key, sort.dir, sort.type);
+    const th = tableEl.querySelector(`th[data-sort-key="${CSS.escape(sort.key)}"]`);
+    if (th) th.classList.add(sort.dir === 'asc' ? 'sort-asc' : 'sort-desc');
+  }
+}
+
+function _resetUniversalTableState(tableId) {
+  if (tableId) {
+    delete _tableSelection[tableId];
+    delete _tableSort[tableId];
+  } else {
+    for (const k of Object.keys(_tableSelection)) delete _tableSelection[k];
+    for (const k of Object.keys(_tableSort)) delete _tableSort[k];
+  }
+}
+
+function _applyTableSort(tableEl, key, dir, type) {
+  const tbody = tableEl.querySelector('tbody');
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr')).filter(tr => !tr.classList.contains('no-sort'));
+  const valueOf = (tr) => {
+    // Priority: row-level data-sort-<key> attr; cell-level data-sort-value
+    // on a [data-sort-cell="key"]; cell innerText.
+    const rowAttr = tr.getAttribute(`data-sort-${key}`);
+    if (rowAttr != null) return rowAttr;
+    const cell = tr.querySelector(`[data-sort-cell="${key}"]`);
+    if (cell) {
+      const cellAttr = cell.getAttribute('data-sort-value');
+      if (cellAttr != null) return cellAttr;
+      return cell.innerText || '';
+    }
+    return '';
+  };
+  const cmp = (a, b) => {
+    const av = valueOf(a); const bv = valueOf(b);
+    if (type === 'num') {
+      const an = parseFloat(String(av).replace(/[^\d.\-]/g, '')) || 0;
+      const bn = parseFloat(String(bv).replace(/[^\d.\-]/g, '')) || 0;
+      return an - bn;
+    }
+    if (type === 'date') {
+      return (Date.parse(av) || 0) - (Date.parse(bv) || 0);
+    }
+    return String(av).localeCompare(String(bv), undefined, {numeric: true, sensitivity: 'base'});
+  };
+  rows.sort(cmp);
+  if (dir === 'desc') rows.reverse();
+  // Re-append in order
+  for (const r of rows) tbody.appendChild(r);
+}
+
+// One-time document-level click delegator. Wires both row-selection and
+// sortable-header clicks. Set up at boot (called from end-of-file IIFE).
+function _setupUniversalTableDelegator() {
+  document.addEventListener('click', (ev) => {
+    // Sortable header click — find the closest <th data-sort-key> inside a
+    // <table data-sortable="1">.
+    const th = ev.target.closest('th[data-sort-key]');
+    if (th) {
+      const tableEl = th.closest('table[data-sortable="1"]');
+      if (tableEl) {
+        const tableId = tableEl.getAttribute('data-table-id');
+        if (!tableId) return;
+        const key = th.getAttribute('data-sort-key');
+        const type = th.getAttribute('data-sort-type') || 'str';
+        const cur = _tableSort[tableId] || {};
+        let nextDir;
+        if (cur.key !== key)        nextDir = 'asc';
+        else if (cur.dir === 'asc') nextDir = 'desc';
+        else                        nextDir = null;     // 3rd click clears
+        // Strip prior sort indicators
+        tableEl.querySelectorAll('th[data-sort-key]').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+        if (nextDir) {
+          _tableSort[tableId] = {key, dir: nextDir, type};
+          th.classList.add(nextDir === 'asc' ? 'sort-asc' : 'sort-desc');
+          _applyTableSort(tableEl, key, nextDir, type);
+        } else {
+          delete _tableSort[tableId];
+          // No restore — leave whatever order the renderer produced
+        }
+        return;
+      }
+    }
+    // Row-select click — find the closest <tr> inside a <table data-rowselect="1"> tbody.
+    const tr = ev.target.closest('tr[data-row-key]');
+    if (tr) {
+      const tableEl = tr.closest('table[data-rowselect="1"]');
+      if (tableEl) {
+        const tableId = tableEl.getAttribute('data-table-id');
+        if (!tableId) return;
+        const key = tr.getAttribute('data-row-key');
+        // Toggle: clicking the already-selected row clears selection.
+        const wasSelected = tr.classList.contains('row-selected');
+        tableEl.querySelectorAll('tbody tr.row-selected').forEach(r => r.classList.remove('row-selected'));
+        if (!wasSelected) {
+          tr.classList.add('row-selected');
+          _tableSelection[tableId] = key;
+        } else {
+          delete _tableSelection[tableId];
+        }
+      }
+    }
+  }, false);
+}
+
 // Renders the RAW / CLEAN / STRICT savings tiers as a panel below the bid-coverage KPIs.
 // Added on the demo-existing-rfq branch to surface the "real" savings number for the
 // the multi-supplier demo (Red / Blue / Green Team) where the RAW number is polluted by UOM mismatches.
@@ -3342,20 +3476,20 @@ function _renderConsolidation(consol) {
   let html = '<h2 style="margin-top:0;">Consolidation candidates</h2>';
   html += '<p class="subtitle" style="margin-bottom:18px;">Default award strategy: consolidate to one supplier. Then carve out exceptions where another supplier saves significantly on a specific item.</p>';
   html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-bottom:24px;">';
-  html += '<table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;">';
+  html += '<table data-table-id="consolidation-candidates" data-rowselect="1" data-sortable="1" style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;">';
   html += `<thead style="background:var(--bg-2);"><tr>
-    <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Supplier</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Items quoted</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">% of RFQ</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Lowest on N items</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Award all to them</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Items they didn't quote</th>
+    <th data-sort-key="supplier" data-sort-type="str" class="sortable" style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Supplier</th>
+    <th data-sort-key="n_quoted" data-sort-type="num" class="sortable" style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Items quoted</th>
+    <th data-sort-key="pct_quoted" data-sort-type="num" class="sortable" style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">% of RFQ</th>
+    <th data-sort-key="n_lowest" data-sort-type="num" class="sortable" style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Lowest on N items</th>
+    <th data-sort-key="consol_value" data-sort-type="num" class="sortable" style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Award all to them</th>
+    <th data-sort-key="not_quoted" data-sort-type="num" class="sortable" style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Items they didn't quote</th>
   </tr></thead><tbody>`;
   cands.forEach((c, i) => {
     const isWinner = i === 0;
     const isFocused = (_matrixFilter.supplier === c.supplier);
     const rowBg = isFocused ? 'background:rgba(255,183,51,0.12);' : (isWinner ? 'background:rgba(255,183,51,0.06);' : '');
-    html += `<tr class="clickable-row" data-consol-supplier="${_escapeHtml(c.supplier)}" title="Click to focus the comparison matrix on ${_escapeHtml(c.supplier)} — see exactly which items they bid and at what price." style="border-bottom:1px solid var(--line);${rowBg}">
+    html += `<tr class="clickable-row" data-consol-supplier="${_escapeHtml(c.supplier)}" data-row-key="${_escapeHtml(c.supplier)}" data-sort-supplier="${_escapeHtml(c.supplier)}" data-sort-n_quoted="${c.n_items_quoted}" data-sort-pct_quoted="${c.pct_items_quoted}" data-sort-n_lowest="${c.n_items_lowest}" data-sort-consol_value="${c.consolidation_value}" data-sort-not_quoted="${c.items_not_quoted}" title="Click to focus the comparison matrix on ${_escapeHtml(c.supplier)} — see exactly which items they bid and at what price." style="border-bottom:1px solid var(--line);${rowBg}">
       <td style="padding:12px 14px;font-weight:${isWinner ? '700' : '400'};color:${isWinner ? 'var(--accent)' : 'var(--ink-0)'};">
         ${isWinner ? '★ ' : ''}${_escapeHtml(c.supplier)}${isFocused ? ` <button type="button" class="consol-focus-clear" data-clear-focus="1" title="Currently filtering the matrix to ${_escapeHtml(c.supplier)} — click to clear focus." style="display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--accent);font-family:var(--mono);letter-spacing:0.08em;margin-left:8px;background:rgba(255,183,51,0.15);border:1px solid var(--accent);padding:2px 6px;border-radius:3px;cursor:pointer;text-transform:uppercase;">FOCUSED ✕</button>` : ''}
       </td>
@@ -3385,20 +3519,22 @@ function _renderConsolidation(consol) {
       </div>
     </div>`;
 
-    // Verified carve-outs
+    // Verified carve-outs — opt in to universal row select + sortable columns,
+    // and double-click a row → open the per-item chart modal so the analyst
+    // can audit the underlying history without leaving the drawer.
     if (realCarves.length) {
-      html += `<details open style="margin-bottom:14px;"><summary style="cursor:pointer;padding:10px 0;font-family:var(--ui);font-size:13px;font-weight:600;color:var(--ink-0);">${realCarves.length} verified carve-out${realCarves.length === 1 ? '' : 's'} — ${fmt$(w.carve_out_savings_total)} additional savings</summary>`;
-      html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:400px;margin-top:8px;"><table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
+      html += `<details open style="margin-bottom:14px;"><summary style="cursor:pointer;padding:10px 0;font-family:var(--ui);font-size:13px;font-weight:600;color:var(--ink-0);">${realCarves.length} verified carve-out${realCarves.length === 1 ? '' : 's'} — ${fmt$(w.carve_out_savings_total)} additional savings · click row to select · double-click to open chart</summary>`;
+      html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:400px;margin-top:8px;"><table data-table-id="verified-carves" data-rowselect="1" data-sortable="1" style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
       html += `<thead style="background:var(--bg-2);position:sticky;top:0;"><tr>
-        <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item #</th>
-        <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Description</th>
-        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty</th>
-        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Winner $/ea</th>
-        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Carve to → $/ea</th>
-        <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Savings</th>
+        <th data-sort-key="item" data-sort-type="str" class="sortable" style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item #</th>
+        <th data-sort-key="desc" data-sort-type="str" class="sortable" style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Description</th>
+        <th data-sort-key="qty" data-sort-type="num" class="sortable" style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty</th>
+        <th data-sort-key="winner_price" data-sort-type="num" class="sortable" style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Winner $/ea</th>
+        <th data-sort-key="carve_price" data-sort-type="num" class="sortable" style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Carve to → $/ea</th>
+        <th data-sort-key="savings_total" data-sort-type="num" class="sortable" style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Savings</th>
       </tr></thead><tbody>`;
       for (const co of realCarves.slice(0, 200)) {
-        html += `<tr style="border-bottom:1px solid var(--line);">
+        html += `<tr class="clickable-row" data-row-key="${_escapeHtml(co.item_num)}" data-carve-item="${_escapeHtml(co.item_num)}" data-sort-item="${_escapeHtml(co.item_num)}" data-sort-desc="${_escapeHtml(co.description || '')}" data-sort-qty="${co.qty_24mo || 0}" data-sort-winner_price="${co.winner_price}" data-sort-carve_price="${co.carve_price}" data-sort-savings_total="${co.savings_total}" title="Double-click to open the per-item chart with order history + supplier bid overlays. Useful for auditing why this carve fires before approving." style="border-bottom:1px solid var(--line);">
           <td style="padding:10px;color:var(--ink-0);">${_escapeHtml(co.item_num)}</td>
           <td style="padding:10px;color:var(--ink-1);max-width:280px;">${_escapeHtml(_truncate(co.description, 60))}</td>
           <td style="padding:10px;text-align:right;color:var(--ink-1);">${(co.qty_24mo||0).toLocaleString()}</td>
@@ -3408,7 +3544,7 @@ function _renderConsolidation(consol) {
         </tr>`;
       }
       if (realCarves.length > 200) {
-        html += `<tr><td colspan="6" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${realCarves.length - 200} more verified carve-outs</td></tr>`;
+        html += `<tr class="no-sort"><td colspan="6" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${realCarves.length - 200} more verified carve-outs</td></tr>`;
       }
       html += '</tbody></table></div></details>';
     }
@@ -3454,6 +3590,9 @@ function _renderConsolidation(consol) {
   }
 
   el.innerHTML = html;
+  // Restore universal-table state for the consolidation candidates table.
+  const consolTable = el.querySelector('table[data-table-id="consolidation-candidates"]');
+  if (consolTable) _restoreUniversalTableState(consolTable);
   // Wire candidate rows → focus matrix on that supplier. The inline
   // FOCUSED ✕ button stops propagation and clears focus directly so the
   // analyst doesn't have to click the row a second time (which is the
@@ -3474,6 +3613,17 @@ function _renderConsolidation(consol) {
       if (compEl) compEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   });
+  // Carve-out row double-click → open the per-item modal so the analyst
+  // can audit the trend / bid history of a flagged carve before approving.
+  el.querySelectorAll('[data-carve-item]').forEach(tr => {
+    tr.addEventListener('dblclick', () => {
+      const itemNum = tr.getAttribute('data-carve-item');
+      if (typeof _openItemHistory === 'function') _openItemHistory(itemNum);
+    });
+  });
+  // Restore state on the verified-carves table too.
+  const carvesTable = el.querySelector('table[data-table-id="verified-carves"]');
+  if (carvesTable) _restoreUniversalTableState(carvesTable);
 }
 
 // Module-level color/label maps reused by the matrix renderer + the
@@ -3603,19 +3753,31 @@ function _renderComparisonMatrix(matrix) {
   // Renders only if at least one supplier has bid (otherwise R2 doesn't apply yet).
   html += _renderRound2Toolbar(filtered, rows);
   html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:70vh;">';
-  html += '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
+  // Comparison matrix opts in to universal row-select + sortable columns.
+  // Each row gets data-row-key="<item_num>"; the whole table carries
+  // data-table-id="comparison-matrix" so selection + sort persist across
+  // re-renders (chip flips, filter toggles).
+  // The Last $/ea column gets a left vertical separator + amber-tinted
+  // header to signal it's the historical baseline. The last supplier
+  // column (final supplier in the loop) closes with a right separator so
+  // the price block visually reads as one grouped section.
+  html += '<table data-table-id="comparison-matrix" data-rowselect="1" data-sortable="1" style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
   html += `<thead style="background:var(--bg-2);position:sticky;top:0;z-index:1;"><tr>
-    <th title="Tick to select this item for the next Round 2 / Rn focused-RFQ batch. Use to push back on items where bids look uncompetitive — selected items get sent to picked suppliers for a re-quote, with the historical-trend reference price shown for context." style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;width:36px;">R2</th>
-    <th title="Item description (Coupa exports call this the 'Item' field — it's the mandatory, always-populated long descriptive name). The text most analysts recognize at a glance, leading with this column rather than the bare part number." style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item</th>
-    <th title="Andersen item number — the part-number dedup key (item_num / eam_pn / part_number cascade). Distinct from the descriptive 'Item' column to its left." style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Part #</th>
-    <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty 24mo</th>
-    <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Last $/ea</th>`;
-  for (const sup of suppliers) {
+    <th title="Tick to select this item for the next Round 2 / Rn focused-RFQ batch. Use to push back on items where bids look uncompetitive." style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;width:36px;">R2</th>
+    <th data-sort-key="desc" data-sort-type="str" title="Item description (Coupa 'Item' field). Click to sort A-Z / Z-A." class="sortable" style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item</th>
+    <th data-sort-key="part" data-sort-type="str" title="Andersen item number — dedup key. Click to sort." class="sortable" style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Part #</th>
+    <th data-sort-key="lastdate" data-sort-type="date" title="Most recent order date for this item. Click to sort by recency." class="sortable" style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Last order</th>
+    <th data-sort-key="qty" data-sort-type="num" title="Quantity ordered in the last 24 months. Click to sort." class="sortable" style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty 24mo</th>
+    <th data-sort-key="lastprice" data-sort-type="num" title="Last priced unit price — historical baseline. The price block (Last $/ea + supplier bids) is bracketed by amber separators to read as one grouped section." class="sortable" style="padding:10px;text-align:right;color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;font-weight:700;border-left:2px solid var(--accent-deep);background:rgba(255,183,51,0.06);">Last $/ea</th>`;
+  for (let i = 0; i < suppliers.length; i++) {
+    const sup = suppliers[i];
+    const isLastSup = (i === suppliers.length - 1);
     const emph = (_matrixFilter.supplier === sup) ? ' matrix-supplier-emphasized' : '';
-    html += `<th class="${emph.trim()}" style="padding:10px;text-align:right;color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;border-left:1px solid var(--line);">${_escapeHtml(sup)}</th>`;
+    const rightBorder = isLastSup ? 'border-right:2px solid var(--accent-deep);' : '';
+    html += `<th data-sort-key="sup_${_escapeHtml(sup)}" data-sort-type="num" class="sortable${emph}" title="${_escapeHtml(sup)}'s bid price for each item. Click to sort by their price." style="padding:10px;text-align:right;color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;border-left:1px solid var(--line);${rightBorder}">${_escapeHtml(sup)}</th>`;
   }
-  html += `<th style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Cov</th>
-    <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Recommendation</th>
+  html += `<th data-sort-key="cov" data-sort-type="str" class="sortable" style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Cov</th>
+    <th data-sort-key="rec" data-sort-type="str" class="sortable" style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Recommendation</th>
   </tr></thead><tbody>`;
 
   // Sort by 24-mo qty × hist price desc (highest-value items first)
@@ -3678,7 +3840,10 @@ function _renderComparisonMatrix(matrix) {
         }
       }
       const baseStyle = r2InlineStyle || `color:${cellColor};font-weight:${isLow ? '700' : '400'};`;
-      cells += `<td class="matrix-cell${emph}${r2CellClass}" data-cell-item="${_escapeHtml(r.item_num)}" data-cell-supplier="${_escapeHtml(sup)}" title="${cellTitle}" style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);${baseStyle}">${cellContent}${r2Badge}</td>`;
+      // Right-edge accent border for the LAST supplier column so the price
+      // block (Last $/ea + N supplier bids) reads as one grouped section.
+      const rightStripe = (sup === suppliers[suppliers.length - 1]) ? 'border-right:2px solid var(--accent-deep);' : '';
+      cells += `<td class="matrix-cell${emph}${r2CellClass}" data-cell-item="${_escapeHtml(r.item_num)}" data-cell-supplier="${_escapeHtml(sup)}" data-sort-cell="sup_${_escapeHtml(sup)}" data-sort-value="${b.price != null ? b.price : ''}" title="${cellTitle}" style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);${rightStripe}${baseStyle}">${cellContent}${r2Badge}</td>`;
     }
     const covColor = r.coverage === 'FULL' ? 'var(--green)' : r.coverage === 'PARTIAL' ? 'var(--accent)' : r.coverage === 'SINGLE' ? 'var(--cyan)' : 'var(--red)';
     const rec = r.recommendation || 'MANUAL_REVIEW';
@@ -3686,21 +3851,26 @@ function _renderComparisonMatrix(matrix) {
     const recLbl = _MATRIX_REC_LABELS[rec] || rec;
     const recReason = r.recommendation_reason || '';
     const isSelectedR2 = _round2Selection.has(r.item_num);
-    html += `<tr class="clickable-row${isSelectedR2 ? ' r2-selected' : ''}" style="border-bottom:1px solid rgba(122,109,115,0.25);" data-comp-item="${_escapeHtml(r.item_num)}" data-row-rec="${rec}">
+    const lastOrderDate = r.last_order || '';
+    // data-sort-<key> per cell so universal sort can read values without
+    // string-parsing the displayed text. Sort keys defined on the <th>s above.
+    html += `<tr class="clickable-row${isSelectedR2 ? ' r2-selected' : ''}" style="border-bottom:1px solid rgba(122,109,115,0.25);" data-comp-item="${_escapeHtml(r.item_num)}" data-row-rec="${rec}" data-row-key="${_escapeHtml(r.item_num)}" data-sort-desc="${_escapeHtml(r.description || '')}" data-sort-part="${_escapeHtml(r.item_num)}" data-sort-lastdate="${_escapeHtml(lastOrderDate)}" data-sort-qty="${r.qty_24mo || 0}" data-sort-lastprice="${r.last_unit_price || 0}" data-sort-cov="${r.coverage || ''}" data-sort-rec="${rec}">
       <td style="padding:6px 8px;text-align:center;" class="r2-cell">
         <input type="checkbox" class="r2-row-check" data-r2-item="${_escapeHtml(r.item_num)}" ${isSelectedR2 ? 'checked' : ''} title="Tick to include this item in the next Round 2 batch — pushes the supplier(s) for a sharper-pencil re-quote with their R1 echo + reference price shown." style="cursor:pointer;accent-color:var(--accent);">
       </td>
       <td style="padding:8px 10px;color:var(--ink-0);max-width:340px;" title="${_escapeHtml(r.description || '')}">${_escapeHtml(_truncate(r.description, 70))}</td>
       <td style="padding:8px 10px;color:var(--ink-2);font-family:var(--mono);font-size:11px;">${_escapeHtml(r.item_num)}</td>
+      <td style="padding:8px 10px;text-align:right;color:var(--ink-2);font-family:var(--mono);font-size:10px;">${_escapeHtml(lastOrderDate)}</td>
       <td style="padding:8px 10px;text-align:right;color:var(--ink-0);">${(r.qty_24mo||0).toLocaleString()}</td>
-      <td style="padding:8px 10px;text-align:right;color:var(--ink-1);">$${(r.last_unit_price||0).toFixed(2)}</td>
+      <td style="padding:8px 10px;text-align:right;color:var(--ink-1);background:rgba(255,183,51,0.04);border-left:2px solid var(--accent-deep);font-weight:600;">$${(r.last_unit_price||0).toFixed(2)}</td>
       ${cells}
       <td style="padding:8px 10px;text-align:center;color:${covColor};font-weight:600;font-size:10px;">${r.coverage}</td>
       <td style="padding:8px 10px;color:${recColor};font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline dotted;" title="${_escapeHtml(recReason)} · click to filter to ${_MATRIX_REC_LABELS[rec] || rec}" data-rec-row-filter="${rec}">${recLbl}</td>
     </tr>`;
   }
   // colspan accounts for the new R2 column (+1 from prior layout)
-  const totalCols = suppliers.length + 7;
+  // R2 + Item + Part# + LastOrder + Qty + Last$ + N suppliers + Cov + Rec
+  const totalCols = suppliers.length + 8;
   if (filtered.length > cap) {
     html += `<tr><td colspan="${totalCols}" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${(filtered.length - cap).toLocaleString()} more items hidden (sort by qty × hist price desc — narrow the filters to bring more into view)</td></tr>`;
   }
@@ -3708,9 +3878,12 @@ function _renderComparisonMatrix(matrix) {
     html += `<tr><td colspan="${totalCols}" style="padding:24px;text-align:center;color:var(--ink-2);">No items match the active filter set. <button type="button" class="matrix-filter-clear" data-pill-clear-all style="margin-left:8px;">clear all filters</button></td></tr>`;
   }
   html += '</tbody></table></div>';
-  html += '<div style="margin-top:8px;color:var(--ink-2);font-size:11px;font-family:var(--mono);">⚠ = UOM discrepancy noted by supplier &nbsp;·&nbsp; † = substitute part offered &nbsp;·&nbsp; <strong style="color:var(--green);">green</strong> = lowest non-flagged bid &nbsp;·&nbsp; click any cell to open the per-item drill-down</div>';
+  html += '<div style="margin-top:8px;color:var(--ink-2);font-size:11px;font-family:var(--mono);">⚠ = UOM discrepancy noted by supplier &nbsp;·&nbsp; † = substitute part offered &nbsp;·&nbsp; <strong style="color:var(--green);">green</strong> = lowest non-flagged bid &nbsp;·&nbsp; click row to select · click cell to open drill-down · click column header to sort</div>';
 
   el.innerHTML = html;
+  // Restore universal-table state (selection + sort) — survives re-renders.
+  const matrixTable = el.querySelector('table[data-table-id="comparison-matrix"]');
+  if (matrixTable) _restoreUniversalTableState(matrixTable);
 
   // Recommendation chips — toggle the matrix filter.
   el.querySelectorAll('[data-rec-filter]').forEach(chip => {
@@ -4164,6 +4337,9 @@ function _closeItemModal() {
   const m = document.getElementById('item-modal');
   if (m) m.style.display = 'none';
   _currentItemHistory = null;
+  // Drop the persistent modal-open-source highlight so the .last-viewed-row
+  // fade can take over (existing behavior — fading green trail).
+  document.querySelectorAll('tr.modal-open-source').forEach(r => r.classList.remove('modal-open-source'));
   if (_lastViewedItemNum) {
     _markLastViewedRow(_lastViewedItemNum);
     // Return keyboard focus to the originating row so arrow keys
@@ -4180,6 +4356,13 @@ function _closeItemModal() {
 async function _openItemHistory(itemNum) {
   _ensureItemModal();
   _lastViewedItemNum = itemNum;
+  // Persistent source-row highlight while the modal is open. Backlog #2 —
+  // when the analyst is in the modal flagging / locking / excluding, the
+  // originating row stays visibly highlighted across every table on the
+  // page so they can tell which row will receive the action.
+  document.querySelectorAll('tr.modal-open-source').forEach(r => r.classList.remove('modal-open-source'));
+  const sourceSel = `tr[data-item="${CSS.escape(itemNum)}"], tr[data-comp-item="${CSS.escape(itemNum)}"], tr[data-carve-item="${CSS.escape(itemNum)}"]`;
+  document.querySelectorAll(sourceSel).forEach(r => r.classList.add('modal-open-source'));
   const m = document.getElementById('item-modal');
   m.style.display = 'flex';
   document.getElementById('im-title').textContent = itemNum;
@@ -5259,6 +5442,9 @@ restore_state(_restore_payload.to_py())
 
 // Expose for console debugging / future UI wiring
 window._saveMgr = _saveMgr;
+
+// One-time setup of universal table-click delegator (row select + sort).
+_setupUniversalTableDelegator();
 
 // ==========================================================================
 // Save bar UI — injected dynamically (CSS-var styled so it works under
