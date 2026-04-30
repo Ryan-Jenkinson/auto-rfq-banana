@@ -392,11 +392,26 @@ def _add(d: dict, k, v):
 
 
 def _extract_rows(file_bytes, mapping: dict) -> list:
-    """Stream rows from the workbook, returning a list of dicts (parsed)."""
+    """Stream rows from the workbook, returning a list of dicts (parsed).
+
+    Each parsed row also carries an `all_columns` dict mapping every workbook
+    header → cell value for that row. This preserves columns the engine
+    didn't import (requestor, site, address, cost-center, etc.) so the
+    per-item modal's 'all fields' popup can show the full original record
+    of the most-recent PO line for any item.
+    """
     if not isinstance(file_bytes, (bytes, bytearray)):
         file_bytes = bytes(file_bytes)
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
+
+    # Capture headers (first row) so we can build all_columns dicts per row.
+    headers_iter = iter(ws.iter_rows(values_only=True))
+    try:
+        header_row = next(headers_iter)
+    except StopIteration:
+        header_row = ()
+    headers = [norm_text(h) if h is not None else f"col_{i}" for i, h in enumerate(header_row)]
 
     # Resolve column indexes once
     def col(field):
@@ -423,15 +438,23 @@ def _extract_rows(file_bytes, mapping: dict) -> list:
         return "" if _is_blanky(s) else s
 
     rows = []
-    first = True
-    for row in ws.iter_rows(values_only=True):
-        if first:
-            first = False
-            continue
+    # The header row was already consumed via headers_iter above; iterate the
+    # remaining rows directly.
+    for row in headers_iter:
         if row is None:
             continue
         def g(i):
             return None if (i is None or i >= len(row)) else row[i]
+        # Build the full-row dict (all original columns, header-keyed) so the
+        # all-fields popup can show every cell from this PO line later.
+        all_columns = {}
+        for i, h in enumerate(headers):
+            v = row[i] if i < len(row) else None
+            if v is None:
+                continue
+            if hasattr(v, "isoformat"):
+                v = v.isoformat()
+            all_columns[h] = v
         item = _clean(g(c_item)) if c_item is not None else ""
         eam = _clean(g(c_eam)) if c_eam is not None else ""
         part = _clean(g(c_part)) if c_part is not None else ""
@@ -457,6 +480,7 @@ def _extract_rows(file_bytes, mapping: dict) -> list:
             "uom": _clean(g(c_uom)) if c_uom is not None else "",
             "commodity": _clean(g(c_comm)) if c_comm is not None else "",
             "supplier": _clean(g(c_sup)) if c_sup is not None else "",
+            "all_columns": all_columns,
         })
     wb.close()
     return rows
@@ -507,6 +531,10 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         "first_order": None, "last_order": None,
         "last_unit_price": None,
         "last_order_dt": None,
+        # Full row dict from the most-recent PO line — preserved so the
+        # per-item 'all fields' popup can show every original column
+        # (requestor, site, cost-center, etc.) from the source data.
+        "last_order_all_columns": {},
     })
 
     annual: dict = defaultdict(lambda: {"spend": 0.0, "items": set(), "qty": 0.0})
@@ -557,6 +585,10 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
         if rec["last_order_dt"] is None or d > rec["last_order_dt"]:
             rec["last_order_dt"] = d
             rec["last_unit_price"] = r["unit_price"]
+            # Capture the full original row of the most-recent PO line so the
+            # per-item 'all fields' popup can show every column (requestor,
+            # site, cost center, etc.) from the source data.
+            rec["last_order_all_columns"] = r.get("all_columns") or {}
 
         for w in (12, 24, 36):
             if d >= cutoffs[w]:
@@ -640,6 +672,10 @@ def extract_rfq_list(file_bytes, mapping: dict) -> dict:
             "last_unit_price": current_price,
             "first_order": rec["first_order"].date().isoformat() if rec["first_order"] else None,
             "last_order": rec["last_order_dt"].date().isoformat() if rec["last_order_dt"] else None,
+            # All original columns from the most-recent PO line — surfaces
+            # in the per-item 'all fields' popup (requestor / site / cost-
+            # center / address / etc.).
+            "last_order_all_columns": rec.get("last_order_all_columns") or {},
             # Default include: any qty in the 24-month window
             "included": rec["qty_24mo"] > 0,
         })
@@ -1032,6 +1068,80 @@ def _median(values):
     s = sorted(values)
     mid = len(s) // 2
     return (s[mid] + s[~mid]) / 2.0
+
+
+def find_items(query: str = "", limit: int = 100) -> list:
+    """Search the FULL extracted item list (not just the RFQ-included subset)
+    by free-form query. Matches against item_num, eam_pn, part_number,
+    description, mfg_name, mfg_pn — case-insensitive substring.
+
+    Returns slim records suitable for a search-result list:
+      {item_num, description, mfg_name, mfg_pn, uom, tier, score, included,
+       qty_24mo, spend_24mo, last_unit_price, last_order, n_total_lines,
+       has_all_columns}
+
+    Use case: an analyst filters out an item via Smart Trim, then later
+    wonders "wait, was that really right?" — they search for it, see it's
+    still in _STATE["items"] with its full history, and can open the chart
+    modal or the all-fields popup to verify. Uncovered/unticketed items
+    remain searchable; this is the search-the-whole-haystack tool.
+    """
+    items = _STATE.get("items", []) or []
+    q = (query or "").strip().lower()
+    if not q:
+        # Return the top-N by 24-mo spend so the empty-search state is useful
+        sorted_items = sorted(items, key=lambda it: -(it.get("spend_24mo") or 0))
+        out = sorted_items[:limit]
+    else:
+        matches = []
+        for it in items:
+            haystack = " ".join([
+                str(it.get("item_num") or ""),
+                str(it.get("eam_pn") or ""),
+                str(it.get("part_number") or ""),
+                str(it.get("description") or ""),
+                str(it.get("mfg_name") or ""),
+                str(it.get("mfg_pn") or ""),
+            ]).lower()
+            if q in haystack:
+                matches.append(it)
+        out = matches[:limit]
+    return [{
+        "item_num": it.get("item_num"),
+        "eam_pn": it.get("eam_pn"),
+        "part_number": it.get("part_number"),
+        "description": it.get("description"),
+        "mfg_name": it.get("mfg_name"),
+        "mfg_pn": it.get("mfg_pn"),
+        "uom": it.get("uom"),
+        "tier": it.get("tier"),
+        "score": it.get("score"),
+        "included": it.get("included", False),
+        "qty_24mo": it.get("qty_24mo") or 0,
+        "spend_24mo": it.get("spend_24mo") or 0,
+        "last_unit_price": it.get("last_unit_price"),
+        "last_order": it.get("last_order"),
+        "po_count": it.get("po_count") or 0,
+        "has_all_columns": bool(it.get("last_order_all_columns")),
+    } for it in out]
+
+
+def get_item_all_columns(item_num: str) -> dict:
+    """Return the all_columns dict from the most-recent PO line of an item —
+    every header/value pair from the source workbook, including columns the
+    engine didn't import for RFQ purposes. Used by the per-item 'all fields'
+    popup to show requestor / site / cost-center / address / etc.
+    """
+    items = _STATE.get("items", []) or []
+    for it in items:
+        if it.get("item_num") == item_num:
+            return {
+                "item_num": item_num,
+                "description": it.get("description"),
+                "last_order": it.get("last_order"),
+                "all_columns": it.get("last_order_all_columns") or {},
+            }
+    return {"item_num": item_num, "description": "", "last_order": None, "all_columns": {}}
 
 
 def get_item_history(item_num: str) -> dict:

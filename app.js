@@ -254,6 +254,8 @@ async function _onExportFile(file, zone, fileNameId) {
   _exportFile = file;
   zone.classList.add('loaded');
   $(fileNameId).textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MB · reading…`;
+  // Persist for next session — re-use without picking from disk again.
+  _saveLastFile('export', file).catch(() => {});
 
   try {
     const buf = await file.arrayBuffer();
@@ -287,6 +289,22 @@ json.dumps(_inspect_result)
 }
 
 _bindDropzone('dz-export', 'file-export', 'f-export', _onExportFile);
+
+// Render the persistence "Last loaded" badge on the export dropzone — runs
+// once at module load (synchronous DOM exists by now since this script is
+// at end of body).
+(async () => {
+  const zone = document.getElementById('dz-export');
+  if (zone) {
+    await _renderLastFileBadge(zone, 'export', async (blob, filename) => {
+      // Re-construct a File from the persisted blob so _onExportFile can
+      // treat it identically to a fresh drop.
+      const reusedFile = new File([blob], filename, {type: blob.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+      const fileNameEl = document.getElementById('f-export');
+      await _onExportFile(reusedFile, zone, 'f-export');
+    });
+  }
+})();
 
 // ==========================================================================
 // Step transitions
@@ -1863,6 +1881,10 @@ async function _onAddBidClick() {
 
 async function _onBidFileSelected(file) {
   if (!file) return;
+  // Persist the most-recent bid file for this session — single-slot (the
+  // "last bid drop" pattern). Multiple bid files are a normal flow, but
+  // the most recent is what's worth one-click reloading.
+  _saveLastFile('bid', file).catch(() => {});
   // Suggest supplier name from filename (strip extension + dates + RFQ tags)
   const stem = file.name.replace(/\.xlsx$/i, '');
   const suggest = stem
@@ -6024,6 +6046,266 @@ function _closeGlossary() {
     if (m && m.classList.contains('is-open') && ev.key === 'Escape') _closeGlossary();
   });
 })();
+
+// ==========================================================================
+// Item search modal — searchable view of the FULL extracted item list,
+// including items filtered out of the RFQ via Smart Trim or untick. Each
+// result row opens the per-item chart modal; the "All fields" button shows
+// every column from the most-recent PO line for that item.
+// ==========================================================================
+
+let _itemSearchDebounce = null;
+async function _runItemSearch(query) {
+  if (!_pyAppLoaded || !_py) return;
+  const body = document.getElementById('item-search-body');
+  const status = document.getElementById('item-search-status');
+  if (!body) return;
+  body.innerHTML = '<div class="glossary-empty">Searching…</div>';
+  try {
+    _py.globals.set('_search_q_in', query || '');
+    const out = await _py.runPythonAsync(`
+import json
+from app_engine import find_items
+json.dumps(find_items(_search_q_in, limit=100), default=str)
+`);
+    const results = JSON.parse(out);
+    if (status) status.textContent = `${results.length}${results.length === 100 ? '+' : ''} match${results.length === 1 ? '' : 'es'}`;
+    if (!results.length) {
+      body.innerHTML = '<div class="glossary-empty">No items match. Try a different term, partial item #, or part of the description.</div>';
+      return;
+    }
+    const fmt$ = (n) => n == null ? '—' : '$' + Math.round(n).toLocaleString();
+    const fmtP = (n) => n == null ? '—' : '$' + Number(n).toFixed(2);
+    let html = '';
+    if (!query) html += '<div class="glossary-empty" style="padding:14px 20px;text-align:left;">Top 100 items by 24-mo spend. Type to filter.</div>';
+    for (const r of results) {
+      const tier = r.tier || 'SKIP';
+      const tierClass = `item-search-tier-${tier}`;
+      const inLbl = r.included ? 'IN RFQ' : 'OUT';
+      const inClass = r.included ? 'is-in' : 'is-out';
+      const subParts = [r.item_num, r.mfg_name, r.mfg_pn].filter(Boolean).join(' · ');
+      html += `<div class="item-search-result" data-search-item="${_escapeHtml(r.item_num)}">
+        <div class="item-search-result-desc">${_escapeHtml(r.description || '(no description)')}<small>${_escapeHtml(subParts)}</small></div>
+        <div class="item-search-tier ${tierClass}" title="Tier (score). WEAK/SKIP items are typically dropped from RFQs.">${tier}</div>
+        <div class="item-search-included ${inClass}" title="${r.included ? 'Currently included in the RFQ list (ticked).' : 'Currently NOT included in the RFQ list (unticked or dropped via Smart Trim).'}">${inLbl}</div>
+        <div class="item-search-num" title="24-mo qty / 24-mo spend">${(r.qty_24mo||0).toLocaleString()}<br><small style="color:var(--ink-2);">${fmt$(r.spend_24mo)}</small></div>
+        <div class="item-search-num" title="Last unit price · Last order date">${fmtP(r.last_unit_price)}<br><small style="color:var(--ink-2);">${_escapeHtml(r.last_order || '—')}</small></div>
+        <div class="item-search-actions">
+          <button data-search-action="chart" data-search-item="${_escapeHtml(r.item_num)}" title="Open the per-item history modal — chart, order lines, supplier-bid overlays, lock/exclusion controls.">CHART</button>
+          ${r.has_all_columns ? `<button data-search-action="fields" data-search-item="${_escapeHtml(r.item_num)}" title="Show every column from the most-recent PO line — including columns not imported for RFQ (requestor, site, cost-center, address, etc.).">ALL FIELDS</button>` : ''}
+        </div>
+      </div>`;
+    }
+    body.innerHTML = html;
+    // Wire row click → CHART action; wire button clicks separately (stop propagation)
+    body.querySelectorAll('.item-search-result').forEach(row => {
+      row.addEventListener('click', (ev) => {
+        if (ev.target.closest('button')) return;
+        const num = row.getAttribute('data-search-item');
+        _closeItemSearch();
+        _openItemHistory(num);
+      });
+    });
+    body.querySelectorAll('[data-search-action]').forEach(btn => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const action = btn.getAttribute('data-search-action');
+        const num = btn.getAttribute('data-search-item');
+        if (action === 'chart') {
+          _closeItemSearch();
+          _openItemHistory(num);
+        } else if (action === 'fields') {
+          _openAllFieldsPopup(num);
+        }
+      });
+    });
+  } catch (err) {
+    body.innerHTML = `<div class="glossary-empty">Search failed: ${_escapeHtml(err.message || String(err))}</div>`;
+  }
+}
+
+function _openItemSearch() {
+  if (!_pyAppLoaded) { alert('Drop a multi-year supplier export first (step 1) so there are items to search.'); return; }
+  const modal = document.getElementById('item-search-modal');
+  if (!modal) return;
+  modal.classList.add('is-open');
+  const input = document.getElementById('item-search-input');
+  if (input) {
+    input.value = '';
+    setTimeout(() => input.focus(), 50);
+  }
+  _runItemSearch('');   // empty query → top-N by spend
+}
+function _closeItemSearch() {
+  const modal = document.getElementById('item-search-modal');
+  if (modal) modal.classList.remove('is-open');
+}
+
+async function _openAllFieldsPopup(itemNum) {
+  if (!_pyAppLoaded || !_py) return;
+  const modal = document.getElementById('all-fields-modal');
+  const body = document.getElementById('all-fields-body');
+  const subtitle = document.getElementById('all-fields-subtitle');
+  if (!modal || !body) return;
+  body.innerHTML = '<div class="glossary-empty">Loading…</div>';
+  modal.classList.add('is-open');
+  try {
+    _py.globals.set('_field_item_in', itemNum);
+    const out = await _py.runPythonAsync(`
+import json
+from app_engine import get_item_all_columns
+json.dumps(get_item_all_columns(_field_item_in), default=str)
+`);
+    const data = JSON.parse(out);
+    if (subtitle) subtitle.textContent = `${data.item_num || '—'} · last order ${data.last_order || '—'}`;
+    const cols = data.all_columns || {};
+    const keys = Object.keys(cols).sort();
+    if (!keys.length) {
+      body.innerHTML = '<div class="glossary-empty">No source columns retained for this item. (Older imports — re-extract the source workbook to capture all columns.)</div>';
+      return;
+    }
+    let html = `<div style="margin-bottom:10px;color:var(--ink-2);font-family:var(--mono);font-size:11px;">${_escapeHtml(data.description || '')}</div>`;
+    html += keys.map(k => `<div class="all-fields-row"><div class="all-fields-key">${_escapeHtml(k)}</div><div class="all-fields-val">${_escapeHtml(cols[k] == null ? '' : String(cols[k]))}</div></div>`).join('');
+    body.innerHTML = html;
+  } catch (err) {
+    body.innerHTML = `<div class="glossary-empty">All-fields lookup failed: ${_escapeHtml(err.message || String(err))}</div>`;
+  }
+}
+function _closeAllFieldsPopup() {
+  const modal = document.getElementById('all-fields-modal');
+  if (modal) modal.classList.remove('is-open');
+}
+
+(function _wireItemSearch() {
+  const btn = document.getElementById('open-item-search');
+  if (btn) btn.addEventListener('click', _openItemSearch);
+  const closeBtn = document.getElementById('item-search-close');
+  if (closeBtn) closeBtn.addEventListener('click', _closeItemSearch);
+  const modal = document.getElementById('item-search-modal');
+  if (modal) modal.addEventListener('click', (ev) => {
+    if (ev.target === modal) _closeItemSearch();
+  });
+  const input = document.getElementById('item-search-input');
+  if (input) {
+    input.addEventListener('input', (ev) => {
+      const q = ev.target.value;
+      clearTimeout(_itemSearchDebounce);
+      _itemSearchDebounce = setTimeout(() => _runItemSearch(q), 150);
+    });
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') { ev.preventDefault(); _closeItemSearch(); }
+    });
+  }
+  const afClose = document.getElementById('all-fields-close');
+  if (afClose) afClose.addEventListener('click', _closeAllFieldsPopup);
+  const afModal = document.getElementById('all-fields-modal');
+  if (afModal) afModal.addEventListener('click', (ev) => {
+    if (ev.target === afModal) _closeAllFieldsPopup();
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Escape') return;
+    const af = document.getElementById('all-fields-modal');
+    if (af && af.classList.contains('is-open')) { _closeAllFieldsPopup(); return; }
+    const is = document.getElementById('item-search-modal');
+    if (is && is.classList.contains('is-open')) { _closeItemSearch(); }
+  });
+})();
+
+// ==========================================================================
+// Last-uploaded-file persistence — IndexedDB-backed.
+//
+// Each dropzone (multi-year export, returned bid xlsx, etc.) stores
+// {filename, blob, savedAt, dropzoneId} keyed by dropzoneId. On page load,
+// each dropzone shows an inline "Last loaded: <filename> (Xm ago) · Re-use"
+// affordance. Click → loads from IndexedDB without re-picking from disk.
+//
+// Storing the file binary (not just metadata) means re-load is one click,
+// across browser sessions, with no system file-picker round-trip. Files are
+// already chunked / streamed by the browser; ~10-50MB MRO exports fit well.
+// ==========================================================================
+
+const _LAST_FILE_DB = 'auto_rfq_last_files';
+const _LAST_FILE_STORE = 'files';
+let _lastFileDbInstance = null;
+
+function _lastFileDb() {
+  if (_lastFileDbInstance) return Promise.resolve(_lastFileDbInstance);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(_LAST_FILE_DB, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(_LAST_FILE_STORE)) {
+        db.createObjectStore(_LAST_FILE_STORE, {keyPath: 'dropzoneId'});
+      }
+    };
+    req.onsuccess = () => { _lastFileDbInstance = req.result; resolve(req.result); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function _saveLastFile(dropzoneId, file) {
+  if (!file || !dropzoneId) return;
+  try {
+    const db = await _lastFileDb();
+    const tx = db.transaction(_LAST_FILE_STORE, 'readwrite');
+    tx.objectStore(_LAST_FILE_STORE).put({
+      dropzoneId,
+      filename: file.name,
+      blob: file,
+      savedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn('[last-file] save failed', err);
+  }
+}
+
+async function _loadLastFile(dropzoneId) {
+  try {
+    const db = await _lastFileDb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(_LAST_FILE_STORE, 'readonly');
+      const req = tx.objectStore(_LAST_FILE_STORE).get(dropzoneId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    return null;
+  }
+}
+
+function _formatTimeAgo(iso) {
+  if (!iso) return '';
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 60000) return 'just now';
+  const m = Math.floor(ms / 60000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}
+
+async function _renderLastFileBadge(dropzoneEl, dropzoneId, onReuse) {
+  if (!dropzoneEl || !dropzoneId) return;
+  const rec = await _loadLastFile(dropzoneId);
+  // Remove any prior badge
+  const prior = dropzoneEl.querySelector('.dropzone-last-loaded');
+  if (prior) prior.remove();
+  if (!rec || !rec.blob) return;
+  const badge = document.createElement('div');
+  badge.className = 'dropzone-last-loaded';
+  badge.innerHTML = `<span title="Last file loaded into this dropzone, persisted across browser sessions. Click Re-use to load again without picking from disk.">↻ Last: <b style="color:var(--ink-0);">${_escapeHtml(rec.filename)}</b> · ${_escapeHtml(_formatTimeAgo(rec.savedAt))}</span>
+    <button class="reload-btn" type="button" title="Reload this file from local browser storage. No system file-picker round-trip.">RE-USE</button>`;
+  badge.querySelector('.reload-btn').addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    if (typeof onReuse === 'function') {
+      try { await onReuse(rec.blob, rec.filename); } catch (err) { console.error('[last-file reuse]', err); }
+    }
+  });
+  // Insert AFTER the dropzone-file area (or just append) — visual position
+  // below the dropzone's own status text.
+  dropzoneEl.appendChild(badge);
+}
 
 // ==========================================================================
 // Save bar UI — injected dynamically (CSS-var styled so it works under
