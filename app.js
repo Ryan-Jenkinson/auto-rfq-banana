@@ -2175,12 +2175,30 @@ function _renderHeadlineCard(headline, consolidation) {
   if (active) {
     verdictSupplier = (_activeChip === 'consolidate_to') ? active.consolidate_supplier : active.supplier_primary;
   }
-  const savingsTotal = active ? active.savings_total : 0;
-  const savingsPct = active ? active.savings_pct : 0;
-  const awardTotal = active ? active.award_total : 0;
-  const nItems = active ? active.n_items : 0;
+  // Headline reads apples-to-apples covered numbers — uncovered (no-bid) items
+  // are surfaced separately so they don't masquerade as savings. The "11,169
+  // items" pre-fix was the total; we now show the count flowing to the verdict
+  // supplier (or the consolidate target for consolidate_to). Uncovered items
+  // get their own line.
+  const savingsTotal = active ? active.covered_savings_total : 0;
+  const savingsPct = active ? active.covered_savings_pct : 0;
+  const awardTotal = active ? active.covered_award_total : 0;
   const nCarved = active ? (active.n_carved || 0) : 0;
+  const nSuspectHeld = active ? (active.n_suspect_carves_held || 0) : 0;
   const nLocksUnhonored = active ? (active.n_locks_unhonored || 0) : 0;
+  const nUncovered = active ? (active.uncovered_count || 0) : 0;
+  const uncoveredHistTotal = active ? (active.uncovered_historical_total || 0) : 0;
+  // Items going to the headline supplier — for consolidate_to that's the
+  // chip's named target; for everything else it's the supplier_primary.
+  let headlineSupplierItems = 0;
+  if (active && active.items_by_supplier) {
+    if (_activeChip === 'consolidate_to' && active.consolidate_supplier) {
+      headlineSupplierItems = active.items_by_supplier[active.consolidate_supplier] || 0;
+    } else {
+      headlineSupplierItems = active.supplier_primary_items || 0;
+    }
+  }
+  const nItemsAwarded = active ? (active.n_awarded || 0) : 0;
 
   // Strategy chip list — labels + tooltips
   const chips = [
@@ -2195,8 +2213,8 @@ function _renderHeadlineCard(headline, consolidation) {
     const isActive = _activeChip === c.key;
     const summary = strategies[c.key];
     let savings = '';
-    if (summary && summary.savings_total != null) {
-      const s = summary.savings_total;
+    if (summary && summary.covered_savings_total != null) {
+      const s = summary.covered_savings_total;
       const sign = s >= 0 ? '' : '−';
       savings = `<span class="chip-savings">${sign}$${Math.abs(s).toLocaleString('en-US',{maximumFractionDigits:0})}</span>`;
     } else if (c.key === 'manual') {
@@ -2226,31 +2244,74 @@ function _renderHeadlineCard(headline, consolidation) {
     : `<button class="btn-reset-auto" disabled title="No manual overrides applied — already at auto.">↺ Reset to auto</button>`;
 
   // Verdict line variants
+  // Verdict line — for consolidate_to, show the named target. For everything
+  // else, the strategy distributes awards across N suppliers; show the primary
+  // and tease the per-supplier split below.
   let verdictLine;
   if (verdictSupplier) {
-    verdictLine = `<span class="arrow">→</span><span class="award-label">AWARD TO</span><span class="supplier-name">${_escapeHtml(verdictSupplier)}</span>`;
+    if (_activeChip === 'consolidate_to') {
+      verdictLine = `<span class="arrow">→</span><span class="award-label">CONSOLIDATE TO</span><span class="supplier-name">${_escapeHtml(verdictSupplier)}</span>`;
+    } else {
+      verdictLine = `<span class="arrow">→</span><span class="award-label">AWARD: PRIMARY</span><span class="supplier-name">${_escapeHtml(verdictSupplier)}</span>`;
+    }
   } else {
     verdictLine = `<span class="arrow">→</span><span class="placeholder">No clear winner — review bids below.</span>`;
   }
 
-  // Subhead counts line
-  const carveCountTxt = nCarved > 0 ? ` · <span style="color:var(--ink-1);">${nCarved}</span> carve-out${nCarved===1?'':'s'}` : '';
-  const unhonoredTxt = nLocksUnhonored > 0 ? `<span class="sep">·</span><span style="color:var(--accent);">${nLocksUnhonored}</span> lock${nLocksUnhonored===1?'':'s'} unhonored` : '';
+  // Per-supplier split line — small mono row directly under the money line.
+  // Shows where the awarded $ actually lands across suppliers (the "AWARD TO X"
+  // primary alone hides the split when 3 suppliers each get a chunk).
+  const byS = (active && active.award_by_supplier) || {};
+  const itemsByS = (active && active.items_by_supplier) || {};
+  const supEntries = Object.entries(byS).filter(([s, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+  let splitLine = '';
+  if (supEntries.length > 1) {
+    const parts = supEntries.map(([s, v]) => {
+      const items = itemsByS[s] || 0;
+      return `<span style="color:var(--ink-0);">${_escapeHtml(s)}</span> <span style="color:var(--ink-2);">${fmt$(v)}</span> <span style="color:var(--ink-2);">(${items.toLocaleString()})</span>`;
+    });
+    splitLine = `<div class="headline-split" title="Distribution of awarded $ across suppliers under the active strategy. Counts in parens are item counts." style="font-family:var(--mono);font-size:11px;color:var(--ink-2);letter-spacing:0.02em;margin-top:6px;margin-bottom:14px;">SPLIT: ${parts.join(' &nbsp;·&nbsp; ')}</div>`;
+  }
+
+  // Subhead counts line — items-going-to-headline-supplier (not the total RFQ),
+  // carves count, R2 candidates, and the all-important UNCOVERED line so the
+  // analyst sees no-bid items as a follow-up signal.
+  const headlineSupplierLbl = (_activeChip === 'consolidate_to') ? (active && active.consolidate_supplier) : verdictSupplier;
+  const itemsCountTxt = headlineSupplierLbl
+    ? `<span title="Items flowing to ${_escapeHtml(headlineSupplierLbl)} under the active strategy (n_carved go to other suppliers; uncovered items get no award).">${headlineSupplierItems.toLocaleString()} items → ${_escapeHtml(headlineSupplierLbl)}</span>`
+    : `<span>${nItemsAwarded.toLocaleString()} items awarded</span>`;
+  const carveCountTxt = nCarved > 0 ? `<span class="sep">·</span><span style="color:var(--ink-1);" title="Items carved off the consolidate target to a cheaper supplier per the OR-rule (≥${carvePct}% or ≥$${carveDollar.toLocaleString()}/yr).">${nCarved} carve-out${nCarved===1?'':'s'}</span>` : '';
+  const suspectHeldTxt = nSuspectHeld > 0 ? `<span class="sep">·</span><span style="color:var(--accent);" title="Carves that would have fired but the cheaper bid was UOM-suspect (UOM_DISC or extreme price ratio). Held at the consolidate target's price — verify UOM before counting these as savings.">${nSuspectHeld} suspect carve${nSuspectHeld===1?'':'s'} held</span>` : '';
+  const unhonoredTxt = nLocksUnhonored > 0 ? `<span class="sep">·</span><span style="color:var(--accent);" title="Item locks where the locked supplier had no priced bid → the lock fell through to strategy logic.">${nLocksUnhonored} lock${nLocksUnhonored===1?'':'s'} unhonored</span>` : '';
   const r2Count = (typeof _round2Selection !== 'undefined' ? _round2Selection.size : 0);
-  const r2CountTxt = r2Count > 0 ? `<span class="sep">·</span><span style="color:var(--cyan);">${r2Count}</span> R2 candidate${r2Count===1?'':'s'}` : '';
+  const r2CountTxt = r2Count > 0 ? `<span class="sep">·</span><span style="color:var(--cyan);">${r2Count} R2 candidate${r2Count===1?'':'s'}</span>` : '';
+  const uncoveredTxt = nUncovered > 0
+    ? `<div style="margin-top:6px;font-family:var(--mono);font-size:11px;color:var(--red);letter-spacing:0.02em;" title="Items where NO supplier provided a priced bid. Their historical spend ($X) is NOT included in the savings figure above. Send a follow-up RFQ or consolidate elsewhere.">⚠ ${nUncovered.toLocaleString()} items uncovered (no bid) — ${fmt$(uncoveredHistTotal)} historical, NOT in savings</div>`
+    : '';
+
+  // Strategy explainer — incumbent-not-bidding fallthrough warning
+  const incumbentBidding = (typeof headline !== 'undefined' && headline) ? headline.incumbent_is_bidding : true;
+  const incumbentName = (typeof headline !== 'undefined' && headline) ? (headline.incumbent_name || 'incumbent') : '';
+  let strategyExplainer = '';
+  if (_activeChip === 'incumbent_preferred' && !incumbentBidding) {
+    strategyExplainer = `<div class="strategy-explainer" title="Incumbent Preferred only differs from Lowest Price when the historical supplier has a bid you'd consider keeping. Since they don't, this strategy degrades to Lowest Price for every item." style="margin-top:10px;padding:6px 12px;background:rgba(255,183,51,0.08);border:1px solid var(--accent-deep);border-radius:3px;font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:0.04em;">ⓘ ${_escapeHtml(incumbentName) || 'The incumbent'} isn't bidding — this strategy is identical to Lowest Price for every item.</div>`;
+  }
 
   el.innerHTML = `
     <div class="headline-pretitle" title="The system's automatic award recommendation given the current bids + your manual overrides. Flip the chip strip below to see what each strategy would produce. The numbers update live.">SYSTEM RECOMMENDATION</div>
     <div class="headline-verdict">${verdictLine}</div>
     <div class="headline-money">
-      <span class="total" title="Total $ awarded under the active strategy. Computed as Σ(awarded_price × qty_24mo) across every item.">${fmt$(awardTotal)}</span>
-      <span class="${savingsTotal >= 0 ? 'saves' : 'saves-bad'}" title="Cost avoidance vs the historical baseline (qty × last-paid price). Positive = saves; negative = costs more than today.">${savingsTotal >= 0 ? 'saves' : 'costs'} ${fmt$(Math.abs(savingsTotal))}</span>
-      <span class="pct" title="Savings as a percent of the historical baseline.">${fmtPct(savingsPct)}</span>
+      <span class="total" title="Total $ awarded under the active strategy on items that received a priced bid. Apples-to-apples — items with no bid are not in this number.">${fmt$(awardTotal)}</span>
+      <span class="${savingsTotal >= 0 ? 'saves' : 'saves-bad'}" title="Cost avoidance vs the historical baseline of awarded items only. Positive = saves vs what we paid historically. Items with no priced bid are excluded — see the warning line if any.">${savingsTotal >= 0 ? 'saves' : 'costs'} ${fmt$(Math.abs(savingsTotal))}</span>
+      <span class="pct" title="Savings as a percent of the covered (awarded-items-only) historical baseline.">${fmtPct(savingsPct)}</span>
     </div>
+    ${splitLine}
     <div class="headline-counts">
-      <span title="Total RFQ items in the analysis.">${nItems.toLocaleString()} items</span>${carveCountTxt}${r2CountTxt}${unhonoredTxt}
+      ${itemsCountTxt}${carveCountTxt}${suspectHeldTxt}${r2CountTxt}${unhonoredTxt}
     </div>
+    ${uncoveredTxt}
     <div class="chip-strip" id="chip-strip">${chipHtml}</div>
+    ${strategyExplainer}
     <div class="override-row">
       <span class="muted" style="text-transform:uppercase;letter-spacing:0.10em;font-size:10px;">Manual overrides:</span>
       ${lockPip} ${excPip} ${uomPip}
@@ -2820,10 +2881,11 @@ function _renderScenariosBlock(scenarios, consol) {
   html += `<thead style="background:var(--bg-2);"><tr>
     <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;"><input type="checkbox" id="scen-select-all" style="vertical-align:middle;margin-right:6px;">Name</th>
     <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Strategy</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Items awarded</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Award total</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Historical</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Savings</th>
+    <th title="Items awarded a priced bid under this strategy / total items in the RFQ. The gap = items with no priced bid (uncovered)." style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Awarded</th>
+    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Uncovered</th>
+    <th title="Total $ awarded to suppliers under this strategy. Apples-to-apples — covers awarded items only." style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Award total</th>
+    <th title="Historical $ paid for the same set of items the strategy awarded. Apples-to-apples — covers awarded items only." style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Historical (covered)</th>
+    <th title="Cost avoidance vs historical, on the awarded items only. Items with no priced bid are NOT included — see Uncovered column." style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Savings</th>
     <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Switched</th>
     <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Saved at</th>
     <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;"></th>
@@ -2838,9 +2900,10 @@ function _renderScenariosBlock(scenarios, consol) {
       <td style="padding:12px 14px;color:var(--ink-0);font-weight:600;"><input type="checkbox" class="scen-pick" data-scen-name="${_escapeHtml(s.name)}" style="vertical-align:middle;margin-right:8px;">${_escapeHtml(s.name)}</td>
       <td style="padding:12px 14px;color:var(--ink-1);">${_escapeHtml(stratLabel)}</td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${(t.n_awarded||0).toLocaleString()} <span style="color:var(--ink-2);">/ ${(t.n_items||0).toLocaleString()}</span></td>
-      <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${fmt$(t.award_total)}</td>
-      <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${fmt$(t.historical_total)}</td>
-      <td style="padding:12px 14px;text-align:right;color:var(--green);font-weight:600;">${fmt$(t.savings_total)} <span style="color:var(--ink-2);">(${fmtPct(t.savings_pct)})</span></td>
+      <td style="padding:12px 14px;text-align:right;color:${(t.uncovered_count||0) > 0 ? 'var(--red)' : 'var(--ink-2)'};" title="${(t.uncovered_count||0) > 0 ? `${t.uncovered_count} items with no priced bid — ${fmt$(t.uncovered_historical_total)} historical NOT in savings` : ''}">${(t.uncovered_count||0).toLocaleString()}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${fmt$(t.covered_award_total)}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${fmt$(t.covered_historical_total)}</td>
+      <td style="padding:12px 14px;text-align:right;color:var(--green);font-weight:600;">${fmt$(t.covered_savings_total)} <span style="color:var(--ink-2);">(${fmtPct(t.covered_savings_pct)})</span></td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${(t.items_switched||0).toLocaleString()}</td>
       <td style="padding:12px 14px;text-align:right;color:var(--ink-2);font-size:11px;">${(s.saved_at||'').slice(0,16).replace('T',' ')}</td>
       <td style="padding:12px 14px;text-align:right;white-space:nowrap;">
@@ -3058,10 +3121,10 @@ json.dumps(compare_award_scenarios(_scen_a, _scen_b), default=str)
   let html = `<div style="background:var(--bg-1);border:1px solid var(--accent);border-radius:6px;padding:24px;margin-top:18px;">
     <h3 style="margin:0 0 14px;font-family:var(--ui);font-size:14px;font-weight:600;color:var(--ink-0);text-transform:none;letter-spacing:0;">Side-by-side: ${_escapeHtml(picks[0])} → ${_escapeHtml(picks[1])}</h3>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:18px;">
-      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Award total</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:${colorDelta(sd.award_total)};margin-top:4px;">${sd.award_total >= 0 ? '+' : ''}${fmt$(sd.award_total)}</div></div>
-      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Savings</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:${colorDelta(-sd.savings_total)};margin-top:4px;">${sd.savings_total >= 0 ? '+' : ''}${fmt$(sd.savings_total)}</div></div>
+      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Award total</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:${colorDelta(sd.covered_award_total)};margin-top:4px;">${sd.covered_award_total >= 0 ? '+' : ''}${fmt$(sd.covered_award_total)}</div></div>
+      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Savings</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:${colorDelta(-sd.covered_savings_total)};margin-top:4px;">${sd.covered_savings_total >= 0 ? '+' : ''}${fmt$(sd.covered_savings_total)}</div></div>
       <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Items switched</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--ink-0);margin-top:4px;">${sd.items_switched >= 0 ? '+' : ''}${(sd.items_switched||0).toLocaleString()}</div></div>
-      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ No-award items</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--ink-0);margin-top:4px;">${sd.n_no_award >= 0 ? '+' : ''}${(sd.n_no_award||0).toLocaleString()}</div></div>
+      <div><div style="font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.12em;">Δ Uncovered items</div><div style="font-family:var(--mono);font-size:18px;font-weight:600;color:var(--ink-0);margin-top:4px;">${sd.uncovered_count >= 0 ? '+' : ''}${(sd.uncovered_count||0).toLocaleString()}</div></div>
     </div>
     <div style="font-family:var(--mono);font-size:12px;color:var(--ink-2);margin-bottom:8px;">${(cmp.n_items_differ||0).toLocaleString()} items have a different award decision</div>`;
   if (cmp.diffs && cmp.diffs.length) {

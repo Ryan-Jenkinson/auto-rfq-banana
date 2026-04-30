@@ -92,20 +92,20 @@ def _approx(a, b, tol=0.01):
 
 
 def test_strategies_internally_consistent():
-    """For every strategy, savings_total == historical_total - award_total."""
+    """For every strategy, covered_savings_total == covered_historical_total - covered_award_total.
+    And award_by_supplier sums to covered_award_total."""
     _reset_state(); _seed_synthetic()
     headline = compute_headline_strategies()
     for name, summary in headline["strategies"].items():
         if summary is None:
             continue
         assert _approx(
-            summary["savings_total"],
-            summary["historical_total"] - summary["award_total"],
-        ), f"strategy {name}: savings_total != historical - award"
-        # award_by_supplier must sum to award_total
+            summary["covered_savings_total"],
+            summary["covered_historical_total"] - summary["covered_award_total"],
+        ), f"strategy {name}: covered_savings != covered_historical - covered_award"
         sup_sum = sum(summary["award_by_supplier"].values())
-        assert _approx(sup_sum, summary["award_total"]), \
-            f"strategy {name}: award_by_supplier sums to {sup_sum}, award_total {summary['award_total']}"
+        assert _approx(sup_sum, summary["covered_award_total"]), \
+            f"strategy {name}: award_by_supplier sums to {sup_sum}, covered_award_total {summary['covered_award_total']}"
     print("PASS  strategies_internally_consistent")
 
 
@@ -114,8 +114,8 @@ def test_lowest_price_le_qualified():
     _reset_state(); _seed_synthetic()
     h = compute_headline_strategies()
     assert _approx(
-        h["strategies"]["lowest_price"]["award_total"],
-        h["strategies"]["lowest_qualified"]["award_total"],
+        h["strategies"]["lowest_price"]["covered_award_total"],
+        h["strategies"]["lowest_qualified"]["covered_award_total"],
     ), "with no UOM/SUB bids, lowest_price should equal lowest_qualified"
     print("PASS  lowest_price_eq_qualified_when_no_uom_or_sub")
 
@@ -128,8 +128,8 @@ def test_uom_disc_drops_in_qualified():
     blue_c = next(b for b in _STATE["bids"]["BLUE"]["bids"] if b["rfq_key"] == "ITEM_C")
     blue_c["status"] = BID_STATUS_UOM_DISC
     h = compute_headline_strategies()
-    lp_total = h["strategies"]["lowest_price"]["award_total"]
-    lq_total = h["strategies"]["lowest_qualified"]["award_total"]
+    lp_total = h["strategies"]["lowest_price"]["covered_award_total"]
+    lq_total = h["strategies"]["lowest_qualified"]["covered_award_total"]
     assert lq_total > lp_total, \
         f"lowest_qualified ({lq_total}) should exceed lowest_price ({lp_total}) when UOM_DISC dropped"
     delta = lq_total - lp_total

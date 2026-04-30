@@ -3910,12 +3910,31 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
         # Final award value = winner's full quote − carve savings + items at best alt
         final_award_value = winner["consolidation_value"] - carve_savings_total + items_at_best_alt
 
-        # vs historical at last_unit_price (for items either supplier covers)
+        # Apples-to-apples historical baseline — only items the winner OR a
+        # carve target / best-alt actually quoted (i.e., items that will
+        # appear in the awarded set). Items nobody quoted are surfaced
+        # separately as `uncovered_*` so they stop inflating the savings
+        # number when treated as "$X saved by paying $0."
+        covered_keys = set()
+        # winner quoted these:
+        for it in items:
+            if bid_lookup.get((winner_sup, it["key"])) is not None:
+                covered_keys.add(it["key"])
+        # items_not_quoted_details rows where best_alt_supplier is set are also covered
+        for d in items_not_quoted_details:
+            if d.get("best_alt_supplier"):
+                covered_keys.add(d["rfq_key"])
         historical_value = 0.0
+        uncovered_historical_value = 0.0
+        uncovered_count_block = 0
         for it in items:
             qty = it.get("qty_24mo") or 0
             hist = it.get("last_unit_price") or 0
-            historical_value += hist * qty
+            if it["key"] in covered_keys:
+                historical_value += hist * qty
+            else:
+                uncovered_historical_value += hist * qty
+                uncovered_count_block += 1
 
         winner_block = {
             "supplier": winner_sup,
@@ -3926,8 +3945,10 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
             "n_items_winner_didnt_quote": len(items_not_quoted_details),
             "items_at_best_alt_value": items_at_best_alt,
             "final_award_value": final_award_value,
-            "historical_value": historical_value,
+            "historical_value": historical_value,                         # apples-to-apples: covered only
             "savings_vs_history": historical_value - final_award_value,
+            "uncovered_historical_value": uncovered_historical_value,     # items NO ONE quoted
+            "uncovered_count": uncovered_count_block,
         }
 
     return {
@@ -5159,6 +5180,7 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
     incumbent_threshold = parameters.get("incumbent_keep_threshold_pct", th["min_savings_pct_to_switch"])
     carve_threshold = parameters.get("carve_threshold", th["carve_out_min_savings_pct"])
     carve_threshold_dollar = parameters.get("carve_threshold_dollar", th["carve_out_min_savings_annual_dollar"])
+    uom_suspect_ratio = parameters.get("uom_suspect_ratio", th["uom_suspect_ratio"])
     exclude_uom = parameters.get("exclude_uom_disc", strategy == "lowest_qualified")
     exclude_subs = parameters.get("exclude_substitutes", strategy == "lowest_qualified")
 
@@ -5166,13 +5188,21 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
     n_no_award = 0
     n_manual = 0
     n_carved = 0
+    n_suspect_carves_held = 0  # carves that would have fired but were UOM-suspect → kept at winner price
     n_locked = 0          # locks that successfully forced an award this scenario
     n_locks_unhonored = 0 # locks where the locked supplier didn't bid this item
-    award_total = 0.0
-    historical_total = 0.0
+    # Apples-to-apples covered tracking — savings math uses these.
+    # Legacy "all-items" totals also kept for backwards-compat with existing
+    # snapshots / decision-summary surfaces, but the headline + chip captions
+    # read covered_* (the no-bid items shouldn't masquerade as savings).
+    covered_award_total = 0.0
+    covered_historical_total = 0.0
+    uncovered_count = 0
+    uncovered_historical_total = 0.0
     items_switched = 0
     incumbent_retained = 0
     by_supplier = {}
+    items_by_supplier = {}     # parallel dict — # of items per supplier (not just $)
 
     for it in items:
         rfq_key = it["key"]
@@ -5205,12 +5235,17 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
                 })
                 n_manual += 1
                 if price is not None and price > 0:
-                    award_total += price * qty
-                historical_total += hist_price * qty
-                by_supplier[sup] = by_supplier.get(sup, 0) + (price or 0) * qty
+                    covered_award_total += price * qty
+                    covered_historical_total += hist_price * qty
+                    by_supplier[sup] = by_supplier.get(sup, 0) + price * qty
+                    items_by_supplier[sup] = items_by_supplier.get(sup, 0) + 1
+                else:
+                    # Manual override to a supplier with no priced bid → uncovered
+                    uncovered_historical_total += hist_price * qty
+                    uncovered_count += 1
                 continue
             else:
-                # Explicit "no award" override
+                # Explicit "no award" override — uncovered
                 awards.append({
                     "rfq_key": rfq_key, "item_num": it["item_num"], "description": it["description"],
                     "qty_24mo": qty, "awarded_supplier": None, "awarded_price": None,
@@ -5219,7 +5254,8 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
                     "decision_basis": f"MANUAL: {ov.get('reason') or 'no award'}",
                 })
                 n_no_award += 1
-                historical_total += hist_price * qty
+                uncovered_historical_total += hist_price * qty
+                uncovered_count += 1
                 continue
 
         # Item lock — analyst-confirmed pin to a specific supplier. Applies
@@ -5239,9 +5275,10 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
                     incumbent_retained += 1
                 else:
                     items_switched += 1
-                award_total += price * qty
-                historical_total += hist_price * qty
+                covered_award_total += price * qty
+                covered_historical_total += hist_price * qty
                 by_supplier[locked_sup] = by_supplier.get(locked_sup, 0) + price * qty
+                items_by_supplier[locked_sup] = items_by_supplier.get(locked_sup, 0) + 1
                 awards.append({
                     "rfq_key": rfq_key, "item_num": it["item_num"], "description": it["description"],
                     "qty_24mo": qty, "awarded_supplier": locked_sup, "awarded_price": price,
@@ -5281,7 +5318,8 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
                 "decision_basis": "NO_BID — no eligible supplier",
             })
             n_no_award += 1
-            historical_total += hist_price * qty
+            uncovered_historical_total += hist_price * qty
+            uncovered_count += 1
             continue
 
         # Pick the awarded supplier per strategy
@@ -5306,6 +5344,15 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
             # absolute floor (>=carve_threshold_dollar). Mirrors the rule in
             # compute_consolidation_analysis so the headline analysis and the
             # saved-scenario evaluation never disagree.
+            #
+            # UOM-suspect guard (parity with compute_consolidation_analysis):
+            # if the cheapest other supplier's bid is UOM_DISC, OR the price
+            # ratio target/chosen >= uom_suspect_ratio (e.g. >20×, almost
+            # certainly per-each-vs-per-package), the savings is fake. Hold
+            # the award at the consolidate target's price and count the
+            # carve as suspect — this prevents the headline savings from
+            # claiming UOM-mismatch dollars the carve-out drawer says are
+            # NOT counted.
             target_bid = next((c for c in candidates if c[0] == consolidate_supplier), None)
             if target_bid:
                 target_price = target_bid[1]
@@ -5314,9 +5361,18 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
                 fires_pct = pct_savings >= carve_threshold
                 fires_dollar = annual_savings >= carve_threshold_dollar
                 if fires_pct or fires_dollar:
-                    rule = "BOTH" if (fires_pct and fires_dollar) else ("PCT" if fires_pct else "DOLLAR")
-                    decision = f"CARVE[{rule}]: {chosen_sup} saves {pct_savings*100:.0f}% / ${annual_savings:,.0f}/yr vs {consolidate_supplier}"
-                    n_carved += 1
+                    is_uom_suspect = (
+                        chosen_status == BID_STATUS_UOM_DISC
+                        or (chosen_price > 0 and target_price / chosen_price >= uom_suspect_ratio)
+                    )
+                    if is_uom_suspect:
+                        chosen_sup, chosen_price, chosen_status = target_bid
+                        decision = f"SUSPECT_CARVE_HELD: {target_bid[0]} kept (UOM-suspect carve to other supplier — verify before counting savings)"
+                        n_suspect_carves_held += 1
+                    else:
+                        rule = "BOTH" if (fires_pct and fires_dollar) else ("PCT" if fires_pct else "DOLLAR")
+                        decision = f"CARVE[{rule}]: {chosen_sup} saves {pct_savings*100:.0f}% / ${annual_savings:,.0f}/yr vs {consolidate_supplier}"
+                        n_carved += 1
                 else:
                     chosen_sup, chosen_price, chosen_status = target_bid
                     decision = f"CONSOLIDATE_TO {consolidate_supplier}"
@@ -5331,9 +5387,10 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
             items_switched += 1
 
         award_value = chosen_price * qty
-        award_total += award_value
-        historical_total += hist_price * qty
+        covered_award_total += award_value
+        covered_historical_total += hist_price * qty
         by_supplier[chosen_sup] = by_supplier.get(chosen_sup, 0) + award_value
+        items_by_supplier[chosen_sup] = items_by_supplier.get(chosen_sup, 0) + 1
 
         decision_with_warning = (
             f"{decision} — {lock_warning}" if lock_warning else decision
@@ -5346,6 +5403,12 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
             "decision_basis": decision_with_warning,
         })
 
+    # Apples-to-apples savings — only items that actually got an award contribute
+    # to BOTH sides of the math. Unquoted items are surfaced separately via
+    # `uncovered_*` so they stop masquerading as savings (the bug that made the
+    # headline number disagree with the carve-out drawer's "$X NOT counted" line).
+    covered_savings_total = covered_historical_total - covered_award_total
+    covered_savings_pct = (covered_savings_total / covered_historical_total * 100.0) if covered_historical_total else 0.0
     return {
         "strategy": strategy,
         "parameters": parameters,
@@ -5354,49 +5417,69 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
         "n_no_award": n_no_award,
         "n_manual_overrides": n_manual,
         "n_carved": n_carved,
+        "n_suspect_carves_held": n_suspect_carves_held,
         "n_locked": n_locked,
         "n_locks_unhonored": n_locks_unhonored,
         "items_switched": items_switched,
         "incumbent_retained": incumbent_retained,
-        "award_total": award_total,
-        "historical_total": historical_total,
-        "savings_total": historical_total - award_total,
-        "savings_pct": (historical_total - award_total) / historical_total * 100.0 if historical_total else 0.0,
+        # Apples-to-apples — the truthful headline number.
+        "covered_award_total": covered_award_total,
+        "covered_historical_total": covered_historical_total,
+        "covered_savings_total": covered_savings_total,
+        "covered_savings_pct": covered_savings_pct,
+        # No-bid items, surfaced as a follow-up signal — never folded into savings.
+        "uncovered_count": uncovered_count,
+        "uncovered_historical_total": uncovered_historical_total,
         "award_by_supplier": by_supplier,
+        "items_by_supplier": items_by_supplier,
         "awards": awards,
     }
 
 
 def _summarize_eval_for_headline(evaluated: dict, consolidate_supplier: str = None) -> dict:
     """Compress a full _evaluate_scenario result into the slim shape the
-    headline card needs: which supplier wins the most $, totals, savings,
-    carve-out count. Used only for the chip-strip pre-compute — never mutates
-    state. Picks `supplier_primary` as the supplier with the largest awarded
-    $ (concentration) so the headline's "AWARD TO X" reads true even when
-    a strategy splits awards across suppliers.
+    headline card needs. Used only for the chip-strip pre-compute — never
+    mutates state.
+
+    Picks `supplier_primary` as the supplier with the largest awarded $.
+    Also reports `supplier_primary_items` (item count to that supplier) so
+    the headline can show "1,500 items going to Grainger" instead of
+    "11,169 items" (the latter included unquoted items as if they were
+    awarded).
+
+    Surfaces `uncovered_*` so the headline + drawer teasers can show the
+    no-bid items as a distinct follow-up signal (don't silently fold them
+    into savings).
     """
     by_sup = evaluated.get("award_by_supplier") or {}
-    award_total = evaluated.get("award_total") or 0.0
+    items_by_sup = evaluated.get("items_by_supplier") or {}
+    covered_award = evaluated.get("covered_award_total") or 0.0
     primary_sup = None
     primary_value = 0.0
     if by_sup:
         primary_sup, primary_value = max(by_sup.items(), key=lambda kv: kv[1] or 0.0)
-    primary_pct = (primary_value / award_total * 100.0) if award_total else 0.0
+    primary_pct = (primary_value / covered_award * 100.0) if covered_award else 0.0
+    primary_items = items_by_sup.get(primary_sup, 0) if primary_sup else 0
     return {
         "supplier_primary": primary_sup,
         "supplier_primary_value": primary_value,
         "supplier_primary_pct": primary_pct,
-        "award_total": award_total,
-        "historical_total": evaluated.get("historical_total") or 0.0,
-        "savings_total": evaluated.get("savings_total") or 0.0,
-        "savings_pct": evaluated.get("savings_pct") or 0.0,
+        "supplier_primary_items": primary_items,
+        "covered_award_total": covered_award,
+        "covered_historical_total": evaluated.get("covered_historical_total") or 0.0,
+        "covered_savings_total": evaluated.get("covered_savings_total") or 0.0,
+        "covered_savings_pct": evaluated.get("covered_savings_pct") or 0.0,
+        "uncovered_count": evaluated.get("uncovered_count") or 0,
+        "uncovered_historical_total": evaluated.get("uncovered_historical_total") or 0.0,
         "n_items": evaluated.get("n_items") or 0,
         "n_awarded": evaluated.get("n_awarded") or 0,
         "n_carved": evaluated.get("n_carved") or 0,
+        "n_suspect_carves_held": evaluated.get("n_suspect_carves_held") or 0,
         "n_locked": evaluated.get("n_locked") or 0,
         "n_locks_unhonored": evaluated.get("n_locks_unhonored") or 0,
         "n_no_award": evaluated.get("n_no_award") or 0,
         "award_by_supplier": dict(by_sup),
+        "items_by_supplier": dict(items_by_sup),
         "consolidate_supplier": consolidate_supplier,
     }
 
@@ -5446,6 +5529,14 @@ def compute_headline_strategies(consolidate_supplier: str = None) -> dict:
                 suppliers_with_priced.append(sup)
                 break
 
+    # Incumbent-not-bidding signal — used by the UI to explain why
+    # Incumbent Preferred ends up identical to Lowest Price (the incumbent
+    # has no priced bid → strategy falls through to lowest for every item).
+    incumbent_name = _STATE.get("supplier_name") or ""
+    incumbent_is_bidding = bool(incumbent_name) and any(
+        s.lower() == incumbent_name.lower() for s in suppliers_with_priced
+    )
+
     consol = compute_consolidation_analysis()
     candidates = consol.get("candidates") or []
     default_consolidate = candidates[0]["supplier"] if candidates else None
@@ -5484,6 +5575,8 @@ def compute_headline_strategies(consolidate_supplier: str = None) -> dict:
         "default_consolidate_supplier": default_consolidate,
         "available_consolidate_suppliers": suppliers_with_priced,
         "manual_overrides": manual_overrides,
+        "incumbent_name": incumbent_name,
+        "incumbent_is_bidding": incumbent_is_bidding,
         "thresholds": {
             "carve_out_min_savings_pct": th["carve_out_min_savings_pct"],
             "carve_out_min_savings_annual_dollar": th["carve_out_min_savings_annual_dollar"],
@@ -5555,13 +5648,15 @@ def save_award_scenario(name: str, strategy: str, parameters: dict = None,
         "saved_at": datetime.now().isoformat(),
         "totals": {k: evaluated[k] for k in
                    ("n_items", "n_awarded", "n_no_award", "n_manual_overrides",
-                    "n_carved", "items_switched", "incumbent_retained",
-                    "award_total", "historical_total", "savings_total",
-                    "savings_pct", "award_by_supplier")},
+                    "n_carved", "n_suspect_carves_held", "items_switched", "incumbent_retained",
+                    "covered_award_total", "covered_historical_total",
+                    "covered_savings_total", "covered_savings_pct",
+                    "uncovered_count", "uncovered_historical_total",
+                    "award_by_supplier", "items_by_supplier")},
     }
     log_event(
         "save_award_scenario",
-        f"strategy={strategy} / award_total=${evaluated['award_total']:,.0f} / savings=${evaluated['savings_total']:,.0f}",
+        f"strategy={strategy} / award=${evaluated['covered_award_total']:,.0f} / savings=${evaluated['covered_savings_total']:,.0f} / uncovered={evaluated['uncovered_count']}",
         related=name,
     )
     return sc[name]
@@ -5612,9 +5707,11 @@ def compare_award_scenarios(name_a: str, name_b: str) -> dict:
         "scenario_a": {"name": name_a, **summary_a},
         "scenario_b": {"name": name_b, **summary_b},
         "summary_delta": {
-            "award_total":     b["award_total"]     - a["award_total"],
-            "historical_total":b["historical_total"]- a["historical_total"],
-            "savings_total":   b["savings_total"]   - a["savings_total"],
+            "covered_award_total":      b["covered_award_total"]      - a["covered_award_total"],
+            "covered_historical_total": b["covered_historical_total"] - a["covered_historical_total"],
+            "covered_savings_total":    b["covered_savings_total"]    - a["covered_savings_total"],
+            "uncovered_count":          b["uncovered_count"]          - a["uncovered_count"],
+            "uncovered_historical_total": b["uncovered_historical_total"] - a["uncovered_historical_total"],
             "items_switched":  b["items_switched"]  - a["items_switched"],
             "incumbent_retained": b["incumbent_retained"] - a["incumbent_retained"],
             "n_awarded":       b["n_awarded"]       - a["n_awarded"],
@@ -6543,13 +6640,16 @@ def gen_decision_log_xlsx(scenario_name: str, rfq_id: str = "",
         ("Strategy parameters", json.dumps(sc.get("parameters") or {}, default=str) or "{}"),
         ("Items in scenario", evaluated.get("n_items")),
         ("Items awarded", evaluated.get("n_awarded")),
-        ("Items not awarded", evaluated.get("n_no_award")),
+        ("Items not awarded (no priced bid)", evaluated.get("n_no_award")),
+        ("Items uncovered (no bid available)", evaluated.get("uncovered_count")),
+        ("Uncovered historical $", evaluated.get("uncovered_historical_total")),
         ("Manual overrides", evaluated.get("n_manual_overrides")),
         ("Carve-outs (consolidation)", evaluated.get("n_carved", 0)),
-        ("Total awarded value (annualized)", evaluated.get("award_total")),
-        ("Historical baseline (annualized)", evaluated.get("historical_total")),
-        ("Estimated annual savings", evaluated.get("savings_total")),
-        ("Estimated savings %", f"{evaluated.get('savings_pct', 0):.1f}%"),
+        ("Suspect carves held at winner price", evaluated.get("n_suspect_carves_held", 0)),
+        ("Total awarded value", evaluated.get("covered_award_total")),
+        ("Historical baseline (covered items only)", evaluated.get("covered_historical_total")),
+        ("Estimated savings (covered apples-to-apples)", evaluated.get("covered_savings_total")),
+        ("Estimated savings %", f"{evaluated.get('covered_savings_pct', 0):.1f}%"),
         ("", ""),
         ("Decided by", decided_by),
         ("Decision date", generated_at.strftime("%Y-%m-%d %H:%M")),
@@ -6888,15 +6988,17 @@ def gen_internal_award_summary_xlsx(scenario_name: str, rfq_id: str = "") -> byt
     ws[f"A{ws.max_row}"].font = LABEL_FONT
     ws.append(["Items in scenario", evaluated["n_items"]])
     ws.append(["Items awarded", evaluated["n_awarded"]])
-    ws.append(["Items with no award", evaluated["n_no_award"]])
+    ws.append(["Items uncovered (no bid available)", evaluated["uncovered_count"]])
     ws.append(["Items switched (vs incumbent)", evaluated["items_switched"]])
     ws.append(["Items kept with incumbent", evaluated["incumbent_retained"]])
     ws.append(["Manual overrides", evaluated["n_manual_overrides"]])
     ws.append(["Carve-outs (consolidate strategy only)", evaluated.get("n_carved", 0)])
+    ws.append(["Suspect carves held at winner price", evaluated.get("n_suspect_carves_held", 0)])
     ws.append([])
-    ws.append(["Award total (annualized)", evaluated["award_total"]])
-    ws.append(["Historical baseline (annualized)", evaluated["historical_total"]])
-    ws.append(["Estimated annual savings", evaluated["savings_total"]])
+    ws.append(["Award total", evaluated["covered_award_total"]])
+    ws.append(["Historical baseline (covered items only)", evaluated["covered_historical_total"]])
+    ws.append(["Estimated savings (apples-to-apples)", evaluated["covered_savings_total"]])
+    ws.append(["Uncovered historical (no-bid items, NOT in savings)", evaluated["uncovered_historical_total"]])
     ws.append(["Savings %", f"{evaluated['savings_pct']:.1f}%"])
     for r in (8, 9, 10, 11, 12, 13, 14):
         c = ws.cell(row=r, column=2)
@@ -7946,23 +8048,34 @@ def compute_decision_summary_metrics(scenario_name: str = None) -> dict:
         "rfq_id": _STATE.get("rfq_id") or "",
         "supplier_name": _STATE.get("supplier_name") or "",
         "n_items": len(items),
-        "historical_baseline": historical_baseline,
+        "historical_baseline_all_items": historical_baseline,    # all items, all hist spend (for context only — NOT the savings denominator)
         "auto_recommendation": {
             "strategy": "lowest_qualified",
             "supplier_primary": auto_summary["supplier_primary"],
-            "award_total": auto_summary["award_total"],
-            "savings_vs_history": auto_summary["savings_total"],
-            "savings_pct": auto_summary["savings_pct"],
+            "supplier_primary_items": auto_summary["supplier_primary_items"],
+            "covered_award_total": auto_summary["covered_award_total"],
+            "covered_historical_total": auto_summary["covered_historical_total"],
+            "covered_savings_total": auto_summary["covered_savings_total"],
+            "covered_savings_pct": auto_summary["covered_savings_pct"],
+            "uncovered_count": auto_summary["uncovered_count"],
+            "uncovered_historical_total": auto_summary["uncovered_historical_total"],
         },
         "active_award": {
             "scenario_name": scenario_name,
             "strategy": active_strategy,
             "supplier_primary": active_summary["supplier_primary"],
-            "award_total": active_summary["award_total"],
-            "savings_vs_history": active_summary["savings_total"],
-            "savings_vs_auto": (auto_summary["award_total"] - active_summary["award_total"]),
-            "savings_pct": active_summary["savings_pct"],
+            "supplier_primary_items": active_summary["supplier_primary_items"],
+            "covered_award_total": active_summary["covered_award_total"],
+            "covered_historical_total": active_summary["covered_historical_total"],
+            "covered_savings_total": active_summary["covered_savings_total"],
+            "covered_savings_pct": active_summary["covered_savings_pct"],
+            "uncovered_count": active_summary["uncovered_count"],
+            "uncovered_historical_total": active_summary["uncovered_historical_total"],
+            # Uplift from manual curation = auto's award $ minus active's award $.
+            # Both totals use covered-only math, so this delta is apples-to-apples.
+            "savings_vs_auto": auto_summary["covered_award_total"] - active_summary["covered_award_total"],
             "n_carved": active_summary["n_carved"],
+            "n_suspect_carves_held": active_summary["n_suspect_carves_held"],
         },
         "analyst_work": {
             "n_locks": len(item_locks),
@@ -8001,7 +8114,9 @@ def _build_decision_narrative(metrics: dict) -> str:
     auto = m["auto_recommendation"]
     active = m["active_award"]
     n_items = m["n_items"]
-    hist = m["historical_baseline"]
+    hist_all = m["historical_baseline_all_items"]
+    covered_hist = active["covered_historical_total"]
+    uncovered_hist = active["uncovered_historical_total"]
 
     # Helpers
     def _money(v):
@@ -8020,9 +8135,12 @@ def _build_decision_narrative(metrics: dict) -> str:
         n_priced_total += sum(1 for b in (sup_data.get("bids") or []) if b.get("status") == BID_STATUS_PRICED)
 
     p1 = (
-        f"This RFQ analysis covered {n_items:,} items with a historical baseline of "
-        f"{_money(hist)} (Σ qty_24mo × last-paid price). "
-        f"{n_suppliers} supplier(s) responded with {n_priced_total:,} priced bids in total."
+        f"This RFQ covered {n_items:,} items with a total historical spend of "
+        f"{_money(hist_all)} (Σ qty_24mo × last-paid price across every item). "
+        f"{n_suppliers} supplier(s) responded with {n_priced_total:,} priced bids. "
+        f"Of the {n_items:,} items, {active['uncovered_count']:,} got NO priced bid from any supplier "
+        f"({_money(uncovered_hist)} of historical spend) — these need a follow-up RFQ and are "
+        f"NOT included in the savings number below."
     )
 
     rec_counts = sw["n_recommendations"]
@@ -8069,18 +8187,19 @@ def _build_decision_narrative(metrics: dict) -> str:
         p4 += f"(≥{int(round(m['thresholds'].get('carve_out_min_savings_pct', 0)*100))}% savings OR "
         p4 += f"≥${m['thresholds'].get('carve_out_min_savings_annual_dollar', 0):,.0f}/yr)."
 
-    # Cost avoidance vs savings — the two reporting numbers
-    cost_avoid = active['savings_vs_history']
+    # Cost avoidance vs savings — the two reporting numbers, both apples-to-apples
+    # (covered items only — unquoted items were called out in p1).
+    cost_avoid = active['covered_savings_total']
     uplift = active['savings_vs_auto']
     p5 = (
-        f"COST AVOIDANCE (active award vs historical paid baseline): {_money(cost_avoid)} "
-        f"({_pct(active['savings_pct'])}). "
+        f"COST AVOIDANCE (active award vs historical baseline of the awarded items): "
+        f"{_money(cost_avoid)} ({_pct(active['covered_savings_pct'])}). "
     )
     if abs(uplift) >= 1.0:
         sign = "saved an additional" if uplift > 0 else "cost an additional"
         p5 += (
-            f"SAVINGS UPLIFT FROM MANUAL CURATION (active vs no-touch auto baseline of "
-            f"{_money(auto['award_total'])}): {sign} {_money(abs(uplift))} versus simply "
+            f"SAVINGS UPLIFT FROM MANUAL CURATION (active award $ vs no-touch auto baseline "
+            f"of {_money(auto['covered_award_total'])}): {sign} {_money(abs(uplift))} versus simply "
             f"taking the lowest-qualified bid as-is."
         )
     else:
@@ -8139,23 +8258,28 @@ def gen_decision_summary_xlsx(scenario_name: str = None, rfq_id: str = "") -> by
     ws.cell(row=3, column=1, value=f"RFQ: {metrics['rfq_id'] or '(unset)'}    Source supplier: {metrics['supplier_name'] or '(unset)'}    Generated: {datetime.now().isoformat(timespec='seconds')}").font = MONO
     ws.row_dimensions[2].height = 28
     ws.cell(row=5, column=1, value="HEADLINE").font = H
+    aa = metrics['active_award']
     rows = [
         ("Items in RFQ", f"{metrics['n_items']:,}"),
-        ("Historical baseline (qty × last-paid)", f"${metrics['historical_baseline']:,.2f}"),
-        ("Award strategy", metrics['active_award']['strategy']),
-        ("Award supplier (primary)", metrics['active_award']['supplier_primary'] or "(none)"),
-        ("Award total", f"${metrics['active_award']['award_total']:,.2f}"),
-        ("Cost avoidance vs historical", f"${metrics['active_award']['savings_vs_history']:,.2f}  ({metrics['active_award']['savings_pct']:+.1f}%)"),
-        ("Savings vs no-touch auto baseline", f"${metrics['active_award']['savings_vs_auto']:,.2f}"),
-        ("Carve-outs in active award", f"{metrics['active_award']['n_carved']:,}"),
+        ("Total historical spend (all items)", f"${metrics['historical_baseline_all_items']:,.2f}"),
+        ("— Items with no priced bid (need follow-up RFQ)", f"{aa['uncovered_count']:,}  /  ${aa['uncovered_historical_total']:,.2f}"),
+        ("— Covered items (the savings comparison set)", f"${aa['covered_historical_total']:,.2f}"),
+        ("", ""),
+        ("Award strategy", aa['strategy']),
+        ("Award supplier (primary)", f"{aa['supplier_primary'] or '(none)'}  ({aa['supplier_primary_items']:,} items)"),
+        ("Award total", f"${aa['covered_award_total']:,.2f}"),
+        ("Cost avoidance vs historical (covered items only)", f"${aa['covered_savings_total']:,.2f}  ({aa['covered_savings_pct']:+.1f}%)"),
+        ("Savings uplift vs no-touch auto baseline", f"${aa['savings_vs_auto']:,.2f}"),
+        ("Carve-outs in active award", f"{aa['n_carved']:,}"),
+        ("Suspect carves held at winner price (UOM verify needed)", f"{aa['n_suspect_carves_held']:,}"),
     ]
     for i, (k, v) in enumerate(rows, start=6):
         ws.cell(row=i, column=1, value=k).font = MONO
         ws.cell(row=i, column=2, value=v).font = MONO
-    ws.cell(row=15, column=1, value="NARRATIVE").font = H
-    # Narrative split into rows by paragraph for readability
+    narrative_start = 6 + len(rows) + 2
+    ws.cell(row=narrative_start, column=1, value="NARRATIVE").font = H
     paras = narrative.split("\n\n")
-    cur = 16
+    cur = narrative_start + 1
     for p in paras:
         ws.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=4)
         c = ws.cell(row=cur, column=1, value=p)
@@ -8280,26 +8404,31 @@ def gen_decision_summary_xlsx(scenario_name: str = None, rfq_id: str = "") -> by
     ws5 = wb.create_sheet("5_CostAvoid_vs_Savings")
     _banner(ws5, ncols=4)
     ws5.cell(row=2, column=1, value="THE TWO REPORTING NUMBERS — cost avoidance and savings tracked separately").font = H
-    ws5.cell(row=3, column=1, value="Cost Avoidance (CA) = historical_baseline − active_award_total. Used for leadership reporting against budgeted spend.").font = MONO
-    ws5.cell(row=4, column=1, value="Savings (S) = no-touch_auto_award_total − active_award_total. Quantifies the lift from manual curation.").font = MONO
+    ws5.cell(row=3, column=1, value="Cost Avoidance = covered_historical_total − covered_award_total. APPLES-TO-APPLES on awarded items only. Used for leadership reporting against budgeted spend.").font = MONO
+    ws5.cell(row=4, column=1, value="Savings Uplift = no-touch_auto.covered_award_total − active.covered_award_total. Quantifies the lift from manual curation.").font = MONO
+    ws5.cell(row=5, column=1, value="Uncovered items (no priced bid) are tracked separately — they do NOT inflate either number.").font = MONO
     headers5 = ["Metric", "Auto recommendation", "Active award", "Delta"]
     for i, h in enumerate(headers5, start=1):
-        ws5.cell(row=6, column=i, value=h).font = H
+        ws5.cell(row=7, column=i, value=h).font = H
     auto = metrics["auto_recommendation"]; active = metrics["active_award"]
     table5 = [
         ("Strategy", auto["strategy"], active["strategy"], "—"),
         ("Primary supplier", auto["supplier_primary"], active["supplier_primary"], "—"),
-        ("Award total", auto["award_total"], active["award_total"], active["award_total"] - auto["award_total"]),
-        ("Cost avoidance vs historical", auto["savings_vs_history"], active["savings_vs_history"], active["savings_vs_history"] - auto["savings_vs_history"]),
-        ("Savings vs auto baseline", 0.0, active["savings_vs_auto"], active["savings_vs_auto"]),
+        ("Award total (covered)", auto["covered_award_total"], active["covered_award_total"], active["covered_award_total"] - auto["covered_award_total"]),
+        ("Historical baseline (covered)", auto["covered_historical_total"], active["covered_historical_total"], active["covered_historical_total"] - auto["covered_historical_total"]),
+        ("Cost avoidance (apples-to-apples)", auto["covered_savings_total"], active["covered_savings_total"], active["covered_savings_total"] - auto["covered_savings_total"]),
+        ("Cost avoidance %", f"{auto['covered_savings_pct']:.1f}%", f"{active['covered_savings_pct']:.1f}%", "—"),
+        ("Uncovered items (no bid)", auto["uncovered_count"], active["uncovered_count"], active["uncovered_count"] - auto["uncovered_count"]),
+        ("Uncovered historical $", auto["uncovered_historical_total"], active["uncovered_historical_total"], active["uncovered_historical_total"] - auto["uncovered_historical_total"]),
+        ("Savings uplift vs auto baseline", 0.0, active["savings_vs_auto"], active["savings_vs_auto"]),
     ]
-    for i, row in enumerate(table5, start=7):
+    for i, row in enumerate(table5, start=8):
         for j, v in enumerate(row, start=1):
             c = ws5.cell(row=i, column=j, value=v)
             c.font = MONO
             if isinstance(v, (int, float)) and j > 1:
                 c.number_format = "$#,##0.00"
-    ws5.column_dimensions["A"].width = 36
+    ws5.column_dimensions["A"].width = 44
     for col in ("B", "C", "D"):
         ws5.column_dimensions[col].width = 24
 
@@ -8351,7 +8480,7 @@ def gen_decision_summary_xlsx(scenario_name: str = None, rfq_id: str = "") -> by
 
     log_event(
         "gen_decision_summary_xlsx",
-        f"strategy={metrics['active_award']['strategy']} CA=${metrics['active_award']['savings_vs_history']:,.0f} uplift=${metrics['active_award']['savings_vs_auto']:,.0f}",
+        f"strategy={metrics['active_award']['strategy']} CA=${metrics['active_award']['covered_savings_total']:,.0f} uplift=${metrics['active_award']['savings_vs_auto']:,.0f}",
         related=scenario_name,
     )
 

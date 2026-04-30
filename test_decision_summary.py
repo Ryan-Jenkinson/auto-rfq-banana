@@ -122,21 +122,22 @@ def test_metrics_after_manual_work():
 
 
 def test_cost_avoidance_vs_savings():
-    """The two reporting numbers must be tracked separately. Without manual
-    overrides, the active award (consolidate_to default supplier) and the
-    auto recommendation (lowest_qualified) can BOTH have a cost-avoidance
-    number — but the savings-vs-auto number is the DELTA between them."""
+    """The two reporting numbers must be tracked separately AND must use
+    apples-to-apples covered-only math. Cost avoidance = covered_historical -
+    covered_award. Savings uplift = auto.covered_award - active.covered_award."""
     _reset_state(); _seed()
     set_thresholds({"carve_out_min_savings_pct": 0.20, "carve_out_min_savings_annual_dollar": 3000.0})
     m = compute_decision_summary_metrics()
     auto = m["auto_recommendation"]
     active = m["active_award"]
-    # cost avoidance vs history must equal historical_baseline − award_total
-    assert abs(auto["savings_vs_history"] - (m["historical_baseline"] - auto["award_total"])) < 0.01
-    assert abs(active["savings_vs_history"] - (m["historical_baseline"] - active["award_total"])) < 0.01
-    # savings_vs_auto is the difference of award totals
-    assert abs(active["savings_vs_auto"] - (auto["award_total"] - active["award_total"])) < 0.01
-    print(f"PASS  cost_avoidance_vs_savings  (auto_award=${auto['award_total']:,.0f}, active_award=${active['award_total']:,.0f}, CA=${active['savings_vs_history']:,.0f}, uplift=${active['savings_vs_auto']:,.0f})")
+    # CA must equal covered_historical_total - covered_award_total
+    assert abs(auto["covered_savings_total"] - (auto["covered_historical_total"] - auto["covered_award_total"])) < 0.01
+    assert abs(active["covered_savings_total"] - (active["covered_historical_total"] - active["covered_award_total"])) < 0.01
+    # Savings uplift = auto award - active award (both apples-to-apples)
+    assert abs(active["savings_vs_auto"] - (auto["covered_award_total"] - active["covered_award_total"])) < 0.01
+    # Covered baseline never EXCEEDS the all-items baseline
+    assert auto["covered_historical_total"] <= m["historical_baseline_all_items"] + 0.01
+    print(f"PASS  cost_avoidance_vs_savings  (auto=${auto['covered_award_total']:,.0f}, active=${active['covered_award_total']:,.0f}, CA=${active['covered_savings_total']:,.0f}, uplift=${active['savings_vs_auto']:,.0f}, uncovered={active['uncovered_count']} items / ${active['uncovered_historical_total']:,.0f})")
 
 
 def test_follow_up_lifecycle():
@@ -164,10 +165,11 @@ def test_narrative_text_present():
     flag_item_for_follow_up("B", "verify post-PO")
     m = compute_decision_summary_metrics()
     narrative = _build_decision_narrative(m)
-    assert "RFQ analysis covered" in narrative
+    assert "RFQ covered" in narrative
     assert "supplier(s) responded" in narrative
     assert "manual curation" in narrative or "no manual curation" in narrative
     assert "COST AVOIDANCE" in narrative
+    assert "NOT included in the savings number" in narrative
     print("PASS  narrative_text_present")
 
 
