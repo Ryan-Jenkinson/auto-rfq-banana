@@ -4788,6 +4788,10 @@ def serialize_state() -> dict:
         # Survives save/load AND a JSON colleague-share so the master
         # audit record stays intact across sessions.
         "exclusion_log":        _STATE.get("exclusion_log", []),
+        # Round 2/Rn focused-RFQ selection — the analyst's picks from the
+        # comparison matrix for the next negotiation round.
+        "round2_selection":     _STATE.get("round2_selection", []),
+        "current_round":        _STATE.get("current_round", 1),
     }
 
 
@@ -5006,6 +5010,13 @@ def restore_state(payload: dict) -> None:
         # module so we trust shape, but cap to a defensive max so a hand-
         # edited save can't blow memory.
         _STATE["exclusion_log"] = list(payload["exclusion_log"])[:10000]
+    if "round2_selection" in payload and isinstance(payload["round2_selection"], list):
+        _STATE["round2_selection"] = sorted({str(n) for n in payload["round2_selection"] if n})
+    if "current_round" in payload:
+        try:
+            _STATE["current_round"] = max(1, int(payload["current_round"]))
+        except (TypeError, ValueError):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -6725,6 +6736,778 @@ def gen_internal_award_summary_xlsx(scenario_name: str, rfq_id: str = "") -> byt
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Round 2 / Rn focused-RFQ generator + intake.
+#
+# After Round 1 bids come back, the analyst typically wants to push back on
+# specific items where one supplier was uncompetitive vs another. The R2
+# flow lets them:
+#   1. Select a small set of items in the comparison matrix.
+#   2. Generate per-supplier focused xlsx files — read-only context + R1
+#      echo (their prior price as gray context) + a Reference Price
+#      computed from our cleaned trend (linear regression on priced order
+#      lines, outliers excluded, projected to anchor date) + a small
+#      supplier-input column block (8 fields vs 17 in R1).
+#   3. Drop the returned R2 file into the same step-4 dropzone — parser
+#      detects the round=2 hidden marker and OVERWRITES that supplier's
+#      R1 bids for items that came back with new prices, leaving items
+#      they didn't re-quote untouched.
+#
+# State:
+#   _STATE["round2_selection"]  list of item_num the analyst has marked for R2
+#   _STATE["current_round"]     int (defaults to 1; R2 generator bumps to 2;
+#                                    Rn generator passes round_num explicitly)
+#   _STATE["bids"][supplier]["bids"][i]["round_history"]  list of prior
+#       (round_num, price, status, ts) snapshots so the audit trail shows
+#       the negotiation arc per item.
+# ---------------------------------------------------------------------------
+
+REFERENCE_PRICE_BANNER = (
+    "REFERENCE PRICE COLUMN — what it is and how to use it.  "
+    "Based on our internal purchase history for each item, the Reference Price "
+    "is what our trend math (least-squares linear regression on priced order "
+    "lines, with analyst-confirmed outlier orders excluded, projected to today's "
+    "anchor date) suggests a competitive bid should be in line with. This same "
+    "reference is shared with every supplier participating in this round — it's "
+    "our read of the data, not a supplier-specific number. IF YOUR QUOTE DIVERGES "
+    "SIGNIFICANTLY FROM THIS REFERENCE, FLAG IT IN THE NOTES COLUMN — especially "
+    "when the divergence is from a unit-of-measure mismatch we may have missed "
+    "(e.g., we may list 'EA' while your catalog sells in boxes of 10). Catching "
+    "those early avoids confusion in the comparison stage. Reference is left "
+    "blank for items where our trend confidence is low (R-squared < 0.2 or fewer "
+    "than 3 priced orders)."
+)
+
+
+def list_round2_selection() -> list:
+    """Return the currently-selected item_nums for the next R2/Rn batch."""
+    return list(_STATE.get("round2_selection", []) or [])
+
+
+def set_round2_selection(item_nums) -> dict:
+    """Persist the analyst's R2-selection set. Idempotent + dedup'd."""
+    cleaned = sorted({str(n) for n in (item_nums or []) if n})
+    _STATE["round2_selection"] = cleaned
+    return {"n_selected": len(cleaned), "selection": cleaned}
+
+
+def clear_round2_selection() -> dict:
+    _STATE["round2_selection"] = []
+    return {"n_selected": 0, "selection": []}
+
+
+def _compute_reference_price(item_num: str):
+    """Reference price for one item — uses the cleaned-set trend + anchor.
+
+    Returns ``(price, confidence, reason)`` where price is float|None,
+    confidence is "high"|"medium"|"low"|None, and reason is a short
+    explanation suitable for the bid intake parser to surface in
+    `notes` when the supplier's bid diverges from this reference.
+
+    Mirrors get_item_history's trend computation but skips the spike /
+    bid-overlay machinery — we only need the projected price + a
+    confidence label here.
+    """
+    if not item_num:
+        return (None, None, "no item")
+    key = norm_pn(item_num)
+    po_lines = _STATE.get("po_lines_by_key", {}).get(key, [])
+    if not po_lines:
+        return (None, None, "no priced order history")
+    sorted_lines = sorted(po_lines, key=lambda r: r[0] or "")
+    excluded = set(_STATE.get("item_exclusions", {}).get(item_num, []) or [])
+    cleaned = [ln for idx, ln in enumerate(sorted_lines) if idx not in excluded]
+    first_dt = None
+    xs, ys = [], []
+    for ln in cleaned:
+        if not ln[0] or ln[2] is None:
+            continue
+        try:
+            d = datetime.fromisoformat(ln[0])
+        except ValueError:
+            continue
+        if first_dt is None:
+            first_dt = d
+        xs.append((d - first_dt).days)
+        ys.append(float(ln[2]))
+    if len(xs) < 3:
+        return (None, "low", f"only {len(xs)} priced orders after exclusions")
+    slope, intercept, r2 = _linear_fit(xs, ys)
+    if slope is None or r2 is None:
+        return (None, "low", "trend not fittable")
+    if r2 < 0.2:
+        return (None, "low", f"R² {r2:.2f} — too noisy to project confidently")
+    confidence = "high" if r2 >= 0.6 else "medium"
+    anchor = _STATE.get("data_anchor_date")
+    expected = None
+    if anchor and first_dt:
+        try:
+            anchor_dt = datetime.fromisoformat(anchor)
+            anchor_x = (anchor_dt - first_dt).days
+            expected = slope * anchor_x + intercept
+        except ValueError:
+            return (None, confidence, "could not parse anchor date")
+    if expected is None or expected <= 0:
+        # Trend extrapolated to a zero/negative price is meaningless.
+        return (None, confidence, "trend projects an invalid price")
+    return (float(expected), confidence, f"R² {r2:.2f}")
+
+
+def gen_round2_rfq_xlsx(
+    supplier_name: str,
+    item_nums,
+    round_num: int = 2,
+    rfq_id: str = "",
+    response_due_date: str = "",
+    contact_name: str = "",
+    contact_email: str = "",
+    include_r1_echo: bool = True,
+    include_reference_price: bool = True,
+) -> bytes:
+    """Build a focused R2/R3/Rn xlsx for one supplier.
+
+    Strict isolation: the file contains only this supplier's prior bid data
+    (R1 echo) + Andersen's own historical-trend reference. NO cross-supplier
+    bid data leaks. The Reference Price is per-item Andersen-internal
+    analytics, safe to share with every bidder participating in this round
+    (the banner makes that explicit so the supplier isn't confused).
+
+    Args:
+        supplier_name: exact name (must match a key in _STATE["bids"] for
+            R1-echo data to populate; if absent, R1-echo cells stay blank).
+        item_nums: list of display item numbers to include.
+        round_num: 2 by default; pass 3 for R3, etc.
+        rfq_id, response_due_date, contact_name, contact_email: passed
+            through into the Instructions tab; same shape as gen_outbound_rfq_xlsx.
+        include_r1_echo: when True (default), surface R1 quote price + UOM
+            + notes as a gray read-only column block. False = no echo.
+        include_reference_price: when True (default), surface the per-item
+            Reference Price + the explanatory banner. False = no reference.
+
+    Returns: xlsx bytes. Filename convention (caller decides):
+        Round{round_num}_RFQ_{supplier_safe}_{rfq_id}.xlsx
+    """
+    if not supplier_name:
+        raise ValueError("supplier_name required")
+    if not item_nums:
+        raise ValueError("at least one item_num required")
+    if round_num < 2:
+        raise ValueError(f"round_num must be ≥ 2 (got {round_num})")
+
+    items_state = _STATE.get("items", []) or []
+    items_by_num = {it.get("item_num"): it for it in items_state}
+    selected_items = [items_by_num[n] for n in item_nums if n in items_by_num]
+    if not selected_items:
+        raise ValueError("no selected item_nums match the current item list")
+
+    # Pull the supplier's R1 bid lookup once.
+    parsed = (_STATE.get("bids", {}) or {}).get(supplier_name) or {}
+    r1_by_key = {}
+    for b in parsed.get("bids", []) or []:
+        rk = b.get("rfq_key")
+        if not rk:
+            continue
+        prev = r1_by_key.get(rk)
+        # If the supplier had multiple lines for the same item (qty break /
+        # alt SKU), pick the canonical one — same priority used in the
+        # per-item modal overlay (PRICED > UOM_DISC > SUBSTITUTE), then
+        # lowest effective_price within ties.
+        prio = {"PRICED": 0, "UOM_DISC": 1, "SUBSTITUTE": 2,
+                "NEED_INFO": 3, "NO_BID": 4}.get(b.get("status") or "", 9)
+        eff = b.get("effective_price") if (b.get("effective_price") and b["effective_price"] > 0) else 1e12
+        if prev is None:
+            r1_by_key[rk] = (prio, eff, b)
+        else:
+            if (prio, eff) < (prev[0], prev[1]):
+                r1_by_key[rk] = (prio, eff, b)
+    r1_resolved = {k: tup[2] for k, tup in r1_by_key.items()}
+
+    wb = Workbook()
+
+    # ---- TAB 1: Instructions ----
+    ws = wb.active
+    ws.title = "Instructions"
+    rfq_id_for_display = rfq_id or _STATE.get("rfq_id") or ""
+    _write_banner_row(ws, 1,
+                      f"REQUEST FOR QUOTATION  ·  ROUND {round_num}  ·  {rfq_id_for_display}",
+                      span_cols=4, font_size=20, height=46)
+    ws.append([])
+    rows = [
+        ("Supplier",          supplier_name),
+        ("Round",             f"{round_num} (focused list — {len(selected_items)} item(s))"),
+        ("Response due",      response_due_date or "—"),
+        ("Contact (Andersen)",contact_name or "—"),
+        ("Contact email",     contact_email or "—"),
+        ("Round-trip data",   "Hidden columns 'item_key' + 'rfq_line_id' + 'round' on the response template are used to match your file back to our items. Do not modify or delete these columns."),
+        ("Confidentiality",   "Pricing in this RFQ and your responses are confidential between Andersen and your company."),
+        ("Validity",          "Quotes should remain firm for at least 90 days unless otherwise noted in the Valid Through column."),
+    ]
+    for label, value in rows:
+        ws.append([label, value])
+        cell_label = ws.cell(row=ws.max_row, column=1)
+        cell_label.font = Font(bold=True, color=COLOR_TEXT_INK)
+        cell_label.fill = _fill(COLOR_REFERENCE_GRAY)
+        cell_label.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+        cell_val = ws.cell(row=ws.max_row, column=2)
+        cell_val.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 95
+
+    # Reference-price banner — only when include_reference_price is on.
+    if include_reference_price:
+        ws.append([])
+        ref_row = ws.max_row + 1
+        ws.cell(row=ref_row, column=1, value=REFERENCE_PRICE_BANNER)
+        ws.merge_cells(start_row=ref_row, start_column=1, end_row=ref_row, end_column=2)
+        ref_cell = ws.cell(row=ref_row, column=1)
+        ref_cell.font = Font(bold=False, color=COLOR_TEXT_INK, size=11)
+        ref_cell.fill = _fill(COLOR_INFO_BLUE)
+        ref_cell.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+        ws.row_dimensions[ref_row].height = 160
+
+    # ---- TAB 2: Response Template (the one supplier fills out) ----
+    ws2 = wb.create_sheet("Round 2 Response")
+
+    # Build the headers dynamically based on toggles.
+    ref_cols = [
+        "Andersen Item #",          # A
+        "EAM Part #",               # B
+        "Manufacturer Part #",      # C
+        "Manufacturer",             # D
+        "Description",              # E
+        "Annual Qty",               # F
+        "Our UOM",                  # G
+    ]
+    r1_cols = []
+    if include_r1_echo:
+        r1_cols = [
+            f"R{round_num - 1} echo: Quote Price",   # H
+            f"R{round_num - 1} echo: Quote UOM",     # I
+            f"R{round_num - 1} echo: Notes",          # J
+        ]
+    ref_price_cols = []
+    if include_reference_price:
+        ref_price_cols = [
+            "Reference Price (Andersen-projected)",  # K
+            "Reference confidence",                  # L
+        ]
+    response_cols = [
+        f"R{round_num} Quote Price",          # supplier yellow
+        f"R{round_num} Quote UOM",
+        f"R{round_num} Your Part #",
+        f"R{round_num} Lead Time Days",
+        f"R{round_num} No Bid",
+        f"R{round_num} No Bid Reason",
+        f"R{round_num} Notes",
+        f"R{round_num} Valid Through Date",
+    ]
+    hidden_cols = ["item_key", "rfq_line_id", "round"]
+
+    headers = ref_cols + r1_cols + ref_price_cols + response_cols + hidden_cols
+    n_total = len(headers)
+    n_ref = len(ref_cols)
+    n_r1 = len(r1_cols)
+    n_refprice = len(ref_price_cols)
+    n_response = len(response_cols)
+    n_hidden = len(hidden_cols)
+
+    # Banner with reference-price explanation embedded for at-a-glance reading.
+    _write_banner_row(ws2, 1,
+                      f"RFQ ROUND {round_num}  ·  {len(selected_items)} ITEM(S)  ·  {supplier_name}",
+                      span_cols=n_total, font_size=18, height=42)
+    ws2.append([])
+
+    # Reference banner repeated above the table (more useful here than buried in instructions).
+    if include_reference_price:
+        ws2.cell(row=ws2.max_row + 1, column=1, value=REFERENCE_PRICE_BANNER)
+        merged_row = ws2.max_row
+        ws2.merge_cells(start_row=merged_row, start_column=1, end_row=merged_row, end_column=n_total)
+        ref_cell = ws2.cell(row=merged_row, column=1)
+        ref_cell.font = Font(bold=False, color=COLOR_TEXT_INK, size=11)
+        ref_cell.fill = _fill(COLOR_INFO_BLUE)
+        ref_cell.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+        ws2.row_dimensions[merged_row].height = 130
+        ws2.append([])
+
+    # Header row
+    ws2.append(headers)
+    header_row_idx = ws2.max_row
+    border = _border()
+    for c_idx in range(1, n_total + 1):
+        cell = ws2.cell(row=header_row_idx, column=c_idx)
+        cell.font = Font(bold=True, color=COLOR_TEXT_LIGHT, size=10)
+        if c_idx <= n_ref:
+            cell.fill = _fill(COLOR_BRAND_DARK)
+        elif c_idx <= n_ref + n_r1:
+            cell.fill = _fill(COLOR_BAND_DARK)  # R1 echo — secondary band
+        elif c_idx <= n_ref + n_r1 + n_refprice:
+            cell.fill = _fill(COLOR_BRAND_DARK)
+            cell.font = Font(bold=True, color=COLOR_BRAND_AMBER, size=10)  # amber-on-dark for the reference
+        elif c_idx <= n_ref + n_r1 + n_refprice + n_response:
+            cell.fill = _fill(COLOR_BRAND_AMBER)
+            cell.font = Font(bold=True, color=COLOR_TEXT_INK, size=10)
+        else:
+            cell.fill = _fill("CCCCCC")  # hidden round-trip
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
+        cell.border = border
+    ws2.row_dimensions[header_row_idx].height = 38
+
+    # Data rows
+    for i, it in enumerate(selected_items, start=1):
+        rfq_line_id = f"{rfq_id_for_display or 'rfq'}-r{round_num}-{i:05d}"
+        rk = it.get("key") or norm_pn(it.get("item_num") or "")
+        b = r1_resolved.get(rk) if include_r1_echo else None
+        r1_price = b.get("effective_price") if b else None
+        r1_uom = (b.get("uom") if b else "") or ""
+        r1_notes = (b.get("notes") if b else "") or ""
+
+        ref_price = ref_conf = ref_reason = None
+        if include_reference_price:
+            ref_price, ref_conf, ref_reason = _compute_reference_price(it.get("item_num"))
+
+        row_vals = [
+            it.get("item_num"),                                                  # A
+            it.get("eam_pn") or "",                                              # B
+            it.get("mfg_pn") or "",                                              # C
+            it.get("mfg_name") or "",                                            # D
+            it.get("description") or "",                                         # E
+            it.get("qty_24mo") or 0,                                             # F
+            it.get("uom") or "",                                                 # G
+        ]
+        if include_r1_echo:
+            row_vals += [r1_price, r1_uom, r1_notes]
+        if include_reference_price:
+            row_vals += [ref_price, ref_conf or "—"]
+        # Yellow response cells (8 of them) start blank
+        row_vals += [None] * n_response
+        row_vals += [it.get("key") or "", rfq_line_id, round_num]
+        ws2.append(row_vals)
+
+    # Color-code data rows
+    n_data_rows = len(selected_items)
+    REF_FILL = _fill(COLOR_REFERENCE_GRAY)
+    YELLOW_FILL = _fill(COLOR_RESPONSE_YELLOW)
+    R1_ECHO_FILL = _fill("D7DBE3")     # slightly darker gray to distinguish R1 echo
+    REFPRICE_FILL = _fill("FFF8E1")    # very pale amber — calls attention but stays in palette
+    data_start = header_row_idx + 1
+    for r_idx in range(data_start, data_start + n_data_rows):
+        # Reference cols (1..n_ref) — read-only gray
+        for c_idx in range(1, n_ref + 1):
+            c = ws2.cell(row=r_idx, column=c_idx)
+            c.fill = REF_FILL
+            c.border = border
+            c.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+        # R1 echo (next n_r1 cols) — slightly darker gray
+        for c_idx in range(n_ref + 1, n_ref + n_r1 + 1):
+            c = ws2.cell(row=r_idx, column=c_idx)
+            c.fill = R1_ECHO_FILL
+            c.border = border
+            c.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+        # Reference price (next n_refprice cols) — pale amber (read-only)
+        for c_idx in range(n_ref + n_r1 + 1, n_ref + n_r1 + n_refprice + 1):
+            c = ws2.cell(row=r_idx, column=c_idx)
+            c.fill = REFPRICE_FILL
+            c.border = border
+            c.alignment = Alignment(vertical="top", wrap_text=True, indent=1)
+        # Response cells (next n_response cols) — supplier-input yellow
+        for c_idx in range(n_ref + n_r1 + n_refprice + 1, n_ref + n_r1 + n_refprice + n_response + 1):
+            c = ws2.cell(row=r_idx, column=c_idx)
+            c.fill = YELLOW_FILL
+            c.border = border
+
+    # Number formats
+    # Annual Qty (col F, idx 6)
+    for r in ws2.iter_rows(min_row=data_start, min_col=6, max_col=6):
+        for c in r: c.number_format = "#,##0"
+    # R1 echo price (col H, idx 8) when present
+    if include_r1_echo:
+        for r in ws2.iter_rows(min_row=data_start, min_col=n_ref + 1, max_col=n_ref + 1):
+            for c in r: c.number_format = "$#,##0.00"
+    # Reference price (col K) when present
+    if include_reference_price:
+        ref_col_idx = n_ref + n_r1 + 1
+        for r in ws2.iter_rows(min_row=data_start, min_col=ref_col_idx, max_col=ref_col_idx):
+            for c in r:
+                if c.value is None:
+                    continue
+                c.number_format = "$#,##0.00"
+    # R2 quote price (first response col)
+    rprice_col_idx = n_ref + n_r1 + n_refprice + 1
+    for r in ws2.iter_rows(min_row=data_start, min_col=rprice_col_idx, max_col=rprice_col_idx):
+        for c in r: c.number_format = "$#,##0.00"
+
+    # Hide round-trip cols
+    for c_idx in range(n_total - n_hidden + 1, n_total + 1):
+        ws2.column_dimensions[get_column_letter(c_idx)].hidden = True
+
+    # Autosize visible cols
+    autosize(ws2, min_w=10, max_w=44)
+    ws2.freeze_panes = ws2.cell(row=data_start, column=n_ref + 1).coordinate
+
+    log_event(
+        f"round_{round_num}_rfq_generated",
+        f"{supplier_name}: {len(selected_items)} items"
+        + (" + ref-price" if include_reference_price else "")
+        + (" + R1 echo" if include_r1_echo else ""),
+        related=supplier_name,
+    )
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def gen_round2_rfqs_for_selection(
+    selected_item_nums,
+    suppliers,
+    round_num: int = 2,
+    rfq_id: str = "",
+    response_due_date: str = "",
+    contact_name: str = "",
+    contact_email: str = "",
+    include_r1_echo: bool = True,
+    include_reference_price: bool = True,
+) -> dict:
+    """Batch wrapper — produces one xlsx per supplier for the selection.
+
+    Returns ``{supplier: bytes}`` dict so the JS caller can write all of
+    them at once. Errors per-supplier are caught and surfaced as an
+    ``errors`` dict so a single bad supplier doesn't kill the batch.
+    """
+    out = {}
+    errors = {}
+    for sup in suppliers:
+        try:
+            out[sup] = gen_round2_rfq_xlsx(
+                supplier_name=sup,
+                item_nums=selected_item_nums,
+                round_num=round_num,
+                rfq_id=rfq_id,
+                response_due_date=response_due_date,
+                contact_name=contact_name,
+                contact_email=contact_email,
+                include_r1_echo=include_r1_echo,
+                include_reference_price=include_reference_price,
+            )
+        except Exception as e:
+            errors[sup] = str(e)
+    return {"files": out, "errors": errors,
+            "n_items": len(selected_item_nums or []),
+            "n_suppliers": len(out)}
+
+
+def parse_round2_supplier_bid(file_bytes, supplier_name: str = None) -> dict:
+    """Parse a returned R2/Rn xlsx. Detects round_num from the hidden
+    'round' column on the response template.
+
+    Returns ``{round, supplier, items: [{rfq_key, item_num, price, uom,
+    status, notes, ...}], n_repriced, n_no_bid, n_blank}``. The caller
+    (typically ingest_round2_supplier_bid) uses this to overwrite the
+    R1 bids in place.
+    """
+    if not isinstance(file_bytes, (bytes, bytearray)):
+        file_bytes = bytes(file_bytes)
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    # Look for the "Round 2 Response" tab; fall back to the first sheet.
+    target_ws = None
+    for name in wb.sheetnames:
+        if name.lower().startswith("round") and "response" in name.lower():
+            target_ws = wb[name]
+            break
+    if target_ws is None:
+        target_ws = wb[wb.sheetnames[0]]
+
+    # Find the header row — it has "Andersen Item #" in the first cell of a row.
+    header_row_idx = None
+    headers = None
+    for r_idx in range(1, 25):
+        try:
+            row = next(target_ws.iter_rows(min_row=r_idx, max_row=r_idx, values_only=True), None)
+        except Exception:
+            break
+        if row is None:
+            continue
+        if row and row[0] and "andersen item" in str(row[0]).lower():
+            header_row_idx = r_idx
+            headers = [str(c) if c is not None else "" for c in row]
+            break
+    if not header_row_idx or not headers:
+        wb.close()
+        return {"error": "Could not locate the response-template header row.",
+                "supplier": supplier_name, "round": None}
+
+    # Map header → column index.
+    cols = {}
+    for i, h in enumerate(headers):
+        hl = h.lower().strip()
+        if "item_key" in hl or hl == "item_key":
+            cols["item_key"] = i
+        elif "rfq_line_id" in hl:
+            cols["rfq_line_id"] = i
+        elif hl == "round":
+            cols["round"] = i
+        elif "andersen item" in hl:
+            cols["item_num"] = i
+        elif "quote price" in hl and "echo" not in hl:
+            cols["quote_price"] = i
+        elif "quote uom" in hl and "echo" not in hl:
+            cols["quote_uom"] = i
+        elif "your part" in hl and "echo" not in hl:
+            cols["your_part"] = i
+        elif "lead time" in hl:
+            cols["lead_time"] = i
+        elif "no bid" in hl and "reason" not in hl:
+            cols["no_bid"] = i
+        elif "no bid reason" in hl:
+            cols["no_bid_reason"] = i
+        elif "valid through" in hl:
+            cols["valid_through"] = i
+        elif hl.endswith("notes") and "echo" not in hl:
+            cols["notes"] = i
+
+    items_out = []
+    n_repriced = n_no_bid = n_blank = 0
+    detected_round = None
+
+    for row in target_ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        if row is None:
+            continue
+        # Skip obvious blank rows
+        non_blank = sum(1 for v in row if v is not None and str(v).strip())
+        if non_blank == 0:
+            continue
+        item_num_raw = row[cols["item_num"]] if "item_num" in cols and cols["item_num"] < len(row) else None
+        if not item_num_raw:
+            continue
+        item_key_raw = row[cols["item_key"]] if "item_key" in cols and cols["item_key"] < len(row) else None
+        rfq_key = norm_pn(item_key_raw or item_num_raw)
+        if "round" in cols and cols["round"] < len(row):
+            try:
+                rnd = int(row[cols["round"]]) if row[cols["round"]] is not None else None
+                if rnd is not None and detected_round is None:
+                    detected_round = rnd
+            except (ValueError, TypeError):
+                pass
+        price = safe_float(row[cols["quote_price"]]) if "quote_price" in cols and cols["quote_price"] < len(row) else None
+        uom = norm_text(row[cols["quote_uom"]]) if "quote_uom" in cols and cols["quote_uom"] < len(row) else ""
+        no_bid = row[cols["no_bid"]] if "no_bid" in cols and cols["no_bid"] < len(row) else None
+        no_bid_truthy = bool(no_bid) and str(no_bid).strip().lower() in ("y", "yes", "true", "1", "x", "no bid")
+        notes = norm_text(row[cols["notes"]]) if "notes" in cols and cols["notes"] < len(row) else ""
+
+        if no_bid_truthy:
+            status = BID_STATUS_NO_BID
+            n_no_bid += 1
+        elif price is not None and price > 0:
+            status = BID_STATUS_PRICED
+            n_repriced += 1
+        else:
+            # Blank in R2 = leave R1 alone — don't accidentally erase a good R1 bid
+            n_blank += 1
+            continue
+
+        items_out.append({
+            "rfq_key": rfq_key,
+            "item_num": str(item_num_raw),
+            "quote_price": price,
+            "quote_uom": uom,
+            "status": status,
+            "your_part": norm_text(row[cols["your_part"]]) if "your_part" in cols and cols["your_part"] < len(row) else "",
+            "lead_time_days": safe_float(row[cols["lead_time"]]) if "lead_time" in cols and cols["lead_time"] < len(row) else None,
+            "no_bid_reason": norm_text(row[cols["no_bid_reason"]]) if "no_bid_reason" in cols and cols["no_bid_reason"] < len(row) else "",
+            "notes": notes,
+            "valid_through": norm_text(row[cols["valid_through"]]) if "valid_through" in cols and cols["valid_through"] < len(row) else "",
+        })
+
+    wb.close()
+    return {
+        "supplier": supplier_name,
+        "round": detected_round or 2,
+        "items": items_out,
+        "n_repriced": n_repriced,
+        "n_no_bid": n_no_bid,
+        "n_blank": n_blank,
+    }
+
+
+def ingest_round2_supplier_bid(file_bytes, supplier_name: str) -> dict:
+    """Parse + overwrite the supplier's R1 bids in place for items the R2
+    file came back with new prices. Items the supplier left blank in R2
+    keep their R1 bids untouched. NO_BID in R2 explicitly overwrites the
+    R1 bid with a NO_BID record (analyst can see they actively declined).
+
+    Each item that gets overwritten has the prior bid's price + status
+    appended to ``round_history`` on the new bid record, so the
+    negotiation arc is auditable per item.
+
+    Args:
+        file_bytes: the returned R2 xlsx bytes.
+        supplier_name: explicit supplier (since the file itself is the
+            same shape regardless of who returned it). Required.
+
+    Returns:
+        ``{supplier, round, n_repriced, n_unchanged_r1, n_no_bid_overwrites,
+           n_new_items, items: [...]}``
+    """
+    if not supplier_name:
+        return {"error": "supplier_name required"}
+    parsed = parse_round2_supplier_bid(file_bytes, supplier_name=supplier_name)
+    if "error" in parsed:
+        return parsed
+    round_num = parsed.get("round") or 2
+    items = parsed.get("items", []) or []
+
+    bids_by_supplier = _STATE.setdefault("bids", {})
+    if supplier_name not in bids_by_supplier:
+        # Treat as a fresh supplier whose first bid happened to be Rn — store
+        # the bids list directly.
+        bids_by_supplier[supplier_name] = {
+            "supplier": supplier_name,
+            "bids": [],
+            "summary": {"n_lines": 0, "n_priced": 0, "n_no_bid": 0,
+                        "n_need_info": 0, "n_uom_disc": 0, "n_substitute": 0,
+                        "total_quoted_value": 0.0},
+            "format": f"round_{round_num}",
+        }
+    parsed_state = bids_by_supplier[supplier_name]
+    existing = parsed_state.get("bids", []) or []
+    existing_by_key = {b.get("rfq_key"): b for b in existing if b.get("rfq_key")}
+
+    n_repriced = 0
+    n_no_bid_overwrites = 0
+    n_new_items = 0
+
+    items_state = _STATE.get("items", []) or []
+    items_by_key = {it.get("key"): it for it in items_state}
+
+    log = _STATE.setdefault("exclusion_log", [])
+    ts = datetime.now().isoformat()
+
+    for r2 in items:
+        rk = r2.get("rfq_key")
+        prior = existing_by_key.get(rk)
+        prior_price = prior.get("effective_price") if prior else None
+        prior_status = prior.get("status") if prior else None
+
+        item_dict = items_by_key.get(rk) or {}
+        qty = item_dict.get("qty_24mo") or 0
+
+        new_price = r2.get("quote_price")
+        new_status = r2.get("status")
+
+        # Build the new bid record (mirrors the shape parse_supplier_bid emits).
+        history = list((prior or {}).get("round_history") or [])
+        if prior:
+            history.append({
+                "round": (prior.get("round") or 1),
+                "price": prior_price,
+                "status": prior_status,
+                "timestamp": (prior.get("recorded_at") or ""),
+            })
+
+        new_bid = {
+            "rfq_key": rk,
+            "item_num": r2.get("item_num"),
+            "part_number": (prior.get("part_number") if prior else "") or "",
+            "eam_pn": (prior.get("eam_pn") if prior else "") or "",
+            "mfg_name": item_dict.get("mfg_name") or (prior.get("mfg_name") if prior else "") or "",
+            "description": item_dict.get("description") or (prior.get("description") if prior else "") or "",
+            "commodity": item_dict.get("commodity") or "",
+            "qty": qty,
+            "uom": r2.get("quote_uom") or (item_dict.get("uom") or ""),
+            "quoted_price": new_price,
+            "verified_price": None,
+            "effective_price": new_price if new_status == BID_STATUS_PRICED else None,
+            "notes": r2.get("notes") or "",
+            "status": new_status,
+            "alt_part": r2.get("your_part") or "",
+            "has_substitute": False,
+            "round": round_num,
+            "round_history": history,
+            "recorded_at": ts,
+        }
+
+        if prior:
+            # Overwrite in place (preserving list order so row-by-row UIs stay stable).
+            for i, b in enumerate(existing):
+                if b.get("rfq_key") == rk:
+                    existing[i] = new_bid
+                    break
+            if new_status == BID_STATUS_NO_BID:
+                n_no_bid_overwrites += 1
+            else:
+                n_repriced += 1
+        else:
+            existing.append(new_bid)
+            n_new_items += 1
+
+        # Master data-quality log: capture the negotiation outcome.
+        log.append({
+            "timestamp": ts,
+            "app_source": "auto-rfq-banana",
+            "event_type": f"round_{round_num}_overwrite",
+            "rfq_id": _STATE.get("rfq_id") or "",
+            "supplier_name": supplier_name,
+            "item_num": r2.get("item_num"),
+            "description": item_dict.get("description") or "",
+            "mfg_name": item_dict.get("mfg_name") or "",
+            "mfg_pn": item_dict.get("mfg_pn") or "",
+            "uom": item_dict.get("uom") or "",
+            "line_idx": None,
+            "line_date": "",
+            "line_qty": qty,
+            "line_unit_price": new_price,
+            "line_total": (new_price or 0) * (qty or 0) if (new_price and qty) else None,
+            "line_po": "",
+            "line_uom": r2.get("quote_uom") or "",
+            "median_before": prior_price,   # the supplier's prior round price (for delta calc)
+            "avg_before": None,
+            "n_other_lines_before": None,
+            "ratio_to_median": (new_price / prior_price) if (prior_price and new_price and prior_price > 0) else None,
+            "pct_diff_median": (((new_price / prior_price) - 1.0) * 100.0) if (prior_price and new_price and prior_price > 0) else None,
+            "pct_diff_avg": None,
+            "notes": f"R{round_num} overwrite: prior {prior_status or 'NEW'} ${prior_price or 0:.2f} → {new_status} ${new_price or 0:.2f}",
+        })
+
+    # Refresh aggregate summary on the supplier's parsed-state.
+    n_priced = sum(1 for b in existing if b.get("status") == BID_STATUS_PRICED)
+    total_value = 0.0
+    for b in existing:
+        ep = b.get("effective_price")
+        q = b.get("qty")
+        if ep and q:
+            total_value += float(ep) * float(q)
+    parsed_state["summary"] = {
+        "n_lines": len(existing),
+        "n_priced": n_priced,
+        "n_no_bid": sum(1 for b in existing if b.get("status") == BID_STATUS_NO_BID),
+        "n_need_info": sum(1 for b in existing if b.get("status") == BID_STATUS_NEED_INFO),
+        "n_uom_disc": sum(1 for b in existing if b.get("status") == BID_STATUS_UOM_DISC),
+        "n_substitute": sum(1 for b in existing if b.get("status") == BID_STATUS_SUBSTITUTE),
+        "total_quoted_value": total_value,
+    }
+    parsed_state["bids"] = existing
+
+    # Bump current_round counter for the dialog to default the next batch.
+    _STATE["current_round"] = max(_STATE.get("current_round", 1) or 1, round_num)
+
+    n_unchanged = max(0, len(existing) - n_repriced - n_no_bid_overwrites - n_new_items)
+    log_event(
+        f"round_{round_num}_bids_loaded",
+        f"{supplier_name}: {n_repriced} repriced, {n_no_bid_overwrites} declined, {n_new_items} new, {n_unchanged} unchanged",
+        related=supplier_name,
+    )
+
+    return {
+        "supplier": supplier_name,
+        "round": round_num,
+        "n_repriced": n_repriced,
+        "n_no_bid_overwrites": n_no_bid_overwrites,
+        "n_new_items": n_new_items,
+        "n_unchanged_r1": n_unchanged,
+        "items": items,
+    }
 
 
 # ---------------------------------------------------------------------------
