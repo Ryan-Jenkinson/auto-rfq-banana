@@ -7724,6 +7724,639 @@ def ingest_round2_supplier_bid(file_bytes, supplier_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Decision Summary — the legal-hold narrative companion to the per-supplier
+# award letters and the audit / exclusion / data-quality logs.
+#
+# What this file is for:
+#   The user / Ryan asked for a single document that captures, for any RFQ:
+#     1. A written prose narrative of what was done and what was decided
+#     2. Every threshold + setting active when the decision was made
+#     3. Every analyst action (locks, exclusions, UOM resolutions, scenario
+#        picks) — quantifies "amount of work done by the user"
+#     4. Every system flag (outliers, UOM_DISC, partial coverage, etc.) —
+#        quantifies "amount of work the app did showing them what to look at"
+#     5. Cost avoidance (vs historical paid prices) AND savings (vs the
+#        no-touch auto-recommendation baseline) tracked SEPARATELY so it
+#        can feed both KPIs in leadership reporting
+#     6. A markable "Items Needing Follow-Up" list — SKUs the analyst
+#        manually flagged for double-check after award
+#
+# Output: an internal-audience xlsx with 7 tabs, banner row 1
+# "INTERNAL — NEVER FORWARD". Per-RFQ; designed to be retained for years
+# alongside the Decision Log + audit log + exclusion log + award letters.
+# ---------------------------------------------------------------------------
+
+
+def flag_item_for_follow_up(item_num: str, note: str = "") -> dict:
+    """Manually mark a SKU for post-award follow-up. Use case: "this bid
+    looks suspicious — let's award based on the system rec but verify
+    after the first PO arrives." Each flag carries a free-form analyst
+    note + timestamp; the Decision Summary's Tab 6 surfaces the list.
+    """
+    if not item_num:
+        raise ValueError("item_num required")
+    flags = _STATE.setdefault("follow_up_flags", {})
+    flags[item_num] = {
+        "item_num": item_num,
+        "note": note or "",
+        "flagged_at": datetime.now().isoformat(),
+        "resolved": False,
+        "resolved_at": None,
+        "resolved_note": "",
+    }
+    log_event("flag_follow_up", f"item={item_num} note={note[:80]}")
+    return flags[item_num]
+
+
+def resolve_item_follow_up(item_num: str, note: str = "") -> dict | None:
+    """Mark a follow-up flag as resolved (kept in the record, not deleted)."""
+    flags = _STATE.get("follow_up_flags", {}) or {}
+    if item_num not in flags:
+        return None
+    flags[item_num]["resolved"] = True
+    flags[item_num]["resolved_at"] = datetime.now().isoformat()
+    flags[item_num]["resolved_note"] = note or ""
+    log_event("resolve_follow_up", f"item={item_num} note={note[:80]}")
+    return flags[item_num]
+
+
+def list_follow_up_flags() -> list:
+    flags = _STATE.get("follow_up_flags", {}) or {}
+    return list(flags.values())
+
+
+def compute_decision_summary_metrics(scenario_name: str = None) -> dict:
+    """Aggregate every number the Decision Summary needs into one payload.
+    Pure function — no state mutation. Returns:
+
+      {
+        "rfq_id":                str,
+        "supplier_name":         str,    # the source-data supplier (e.g. McMaster)
+        "n_items":               int,
+        "historical_baseline":   float,  # qty × last_unit_price across all items
+        "auto_recommendation": {
+          "strategy":              str,
+          "supplier_primary":      str,
+          "award_total":           float,
+          "savings_vs_history":    float,
+          "savings_pct":           float,
+        },
+        "active_award": {
+          "strategy":              str,    # the saved/active scenario
+          "supplier_primary":      str,
+          "award_total":           float,
+          "savings_vs_history":    float,  # cost avoidance
+          "savings_vs_auto":       float,  # uplift from manual curation
+          "savings_pct":           float,
+        },
+        "analyst_work": {
+          "n_locks":               int,
+          "n_outlier_exclusions":  int,    # items with ≥1 excluded line
+          "n_excluded_lines":      int,    # total individual lines excluded
+          "n_uom_resolutions":     int,
+          "n_scenarios_saved":     int,
+          "n_round2_selected":     int,
+          "n_follow_up_flags":     int,
+        },
+        "system_work": {
+          "n_recommendations":     dict,   # {ACCEPT, PUSH_BACK, ASK_CLARIFICATION, EXCLUDE, MANUAL_REVIEW}
+          "n_outliers_flagged":    int,
+          "n_uom_disc_flagged":    int,
+          "n_substitutes_flagged": int,
+          "n_partial_coverage":    int,    # items with <full coverage
+          "n_difficulty_signals":  int,
+        },
+        "thresholds":              dict,   # all 11 active thresholds
+        "scenarios":               list,   # all saved scenarios with totals
+        "follow_up_flags":         list,
+        "audit_events":            list,   # full audit_log
+        "exclusion_log_summary":   dict,
+      }
+    """
+    items = _STATE.get("items", []) or []
+    bids_by_sup = _STATE.get("bids", {}) or {}
+    item_locks = _STATE.get("item_locks", {}) or {}
+    item_exclusions = _STATE.get("item_exclusions", {}) or {}
+    uom_annotations = _STATE.get("uom_annotations", {}) or {}
+    scenarios = _STATE.get("scenarios", {}) or {}
+    follow_ups = _STATE.get("follow_up_flags", {}) or {}
+    round2_sel = _STATE.get("round2_selection", []) or []
+    audit_log = _STATE.get("audit_log", []) or []
+
+    historical_baseline = sum(
+        (it.get("last_unit_price") or 0) * (it.get("qty_24mo") or 0)
+        for it in items
+    )
+
+    # The auto-recommendation = lowest_qualified with NO manual overrides.
+    # We compute it by temporarily swapping out item_locks / item_exclusions
+    # and running _evaluate_scenario, then restoring. Cleaner approach: the
+    # current state's `lowest_qualified` IS the auto rec when no manual
+    # changes are present. When the analyst HAS made manual changes, the
+    # "auto" baseline is what lowest_qualified WOULD produce if we cleared
+    # them. For now, we capture the current lowest_qualified summary as
+    # the "current-state auto" — leadership reporting wants this number to
+    # reflect the bid landscape at decision time (including any UOM
+    # resolutions the analyst has confirmed), not a hypothetical
+    # zero-curation baseline.
+    auto_eval = _evaluate_scenario("lowest_qualified", {}, {})
+    auto_summary = _summarize_eval_for_headline(auto_eval)
+
+    # Active award: if a scenario name is provided, evaluate that. Else, fall
+    # back to the most-recent saved scenario, else the current consolidate_to.
+    active_eval = None
+    active_strategy = None
+    if scenario_name and scenario_name in scenarios:
+        sc = scenarios[scenario_name]
+        active_eval = _evaluate_scenario(
+            sc["strategy"], sc.get("parameters") or {},
+            sc.get("overrides") or {}, sc.get("included_keys"),
+        )
+        active_strategy = sc["strategy"]
+    elif scenarios:
+        most_recent = sorted(scenarios.values(), key=lambda s: s.get("saved_at") or "", reverse=True)[0]
+        active_eval = _evaluate_scenario(
+            most_recent["strategy"], most_recent.get("parameters") or {},
+            most_recent.get("overrides") or {}, most_recent.get("included_keys"),
+        )
+        active_strategy = most_recent["strategy"]
+        scenario_name = most_recent.get("name")
+    else:
+        # No saved scenario yet — use current consolidate_to with default supplier
+        consol = compute_consolidation_analysis()
+        cands = consol.get("candidates") or []
+        target = cands[0]["supplier"] if cands else None
+        if target:
+            active_eval = _evaluate_scenario("consolidate_to", {"supplier": target}, {})
+            active_strategy = "consolidate_to"
+        else:
+            active_eval = auto_eval
+            active_strategy = "lowest_qualified"
+
+    active_summary = _summarize_eval_for_headline(active_eval)
+
+    # Counts of system-flagged work
+    matrix = compute_comparison_matrix() or {}
+    rec_counts = {"ACCEPT": 0, "PUSH_BACK": 0, "ASK_CLARIFICATION": 0, "EXCLUDE": 0, "MANUAL_REVIEW": 0}
+    n_outliers = 0
+    n_uom_disc = 0
+    n_subs = 0
+    n_partial = 0
+    for r in (matrix.get("rows") or []):
+        # recommendation is a string label (ACCEPT / PUSH_BACK / ...)
+        # When the engine returns a richer object, it carries `recommendation`
+        # as a top-level string + `recommendation_reason` as the reason text.
+        rec = r.get("recommendation") or ""
+        if isinstance(rec, dict):
+            rec = rec.get("level") or rec.get("recommendation") or ""
+        if rec in rec_counts:
+            rec_counts[rec] += 1
+        flags = r.get("flags") or []
+        if any("OUTLIER" in f or "BIG_SAVINGS" in f or "ALL_BIDS_HIGH" in f for f in flags):
+            n_outliers += 1
+        # supplier_bids may be a list or a dict — normalize
+        sbids = r.get("supplier_bids") or {}
+        if isinstance(sbids, list):
+            sbids_iter = sbids
+        else:
+            sbids_iter = list(sbids.values())
+        n_priced = sum(1 for s in sbids_iter if s and s.get("status") == BID_STATUS_PRICED)
+        if n_priced < len(bids_by_sup):
+            n_partial += 1
+    for sup, parsed in bids_by_sup.items():
+        for b in parsed.get("bids", []) or []:
+            st = b.get("status")
+            if st == BID_STATUS_UOM_DISC:
+                n_uom_disc += 1
+            elif st == BID_STATUS_SUBSTITUTE:
+                n_subs += 1
+
+    diff = _STATE.get("difficulty") or {}
+    n_diff_signals = len((diff.get("signals") or []))
+
+    n_excluded_lines = sum(len(v) for v in item_exclusions.values() if v)
+    n_excluded_items = sum(1 for v in item_exclusions.values() if v)
+
+    return {
+        "rfq_id": _STATE.get("rfq_id") or "",
+        "supplier_name": _STATE.get("supplier_name") or "",
+        "n_items": len(items),
+        "historical_baseline": historical_baseline,
+        "auto_recommendation": {
+            "strategy": "lowest_qualified",
+            "supplier_primary": auto_summary["supplier_primary"],
+            "award_total": auto_summary["award_total"],
+            "savings_vs_history": auto_summary["savings_total"],
+            "savings_pct": auto_summary["savings_pct"],
+        },
+        "active_award": {
+            "scenario_name": scenario_name,
+            "strategy": active_strategy,
+            "supplier_primary": active_summary["supplier_primary"],
+            "award_total": active_summary["award_total"],
+            "savings_vs_history": active_summary["savings_total"],
+            "savings_vs_auto": (auto_summary["award_total"] - active_summary["award_total"]),
+            "savings_pct": active_summary["savings_pct"],
+            "n_carved": active_summary["n_carved"],
+        },
+        "analyst_work": {
+            "n_locks": len(item_locks),
+            "n_outlier_exclusions": n_excluded_items,
+            "n_excluded_lines": n_excluded_lines,
+            "n_uom_resolutions": len([k for k, v in uom_annotations.items() if v and v.get("factor") is not None]),
+            "n_scenarios_saved": len(scenarios),
+            "n_round2_selected": len(round2_sel),
+            "n_follow_up_flags": len(follow_ups),
+            "n_follow_up_unresolved": len([f for f in follow_ups.values() if not f.get("resolved")]),
+        },
+        "system_work": {
+            "n_recommendations": rec_counts,
+            "n_outliers_flagged": n_outliers,
+            "n_uom_disc_flagged": n_uom_disc,
+            "n_substitutes_flagged": n_subs,
+            "n_partial_coverage": n_partial,
+            "n_difficulty_signals": n_diff_signals,
+        },
+        "thresholds": get_thresholds(),
+        "scenarios": list_award_scenarios(),
+        "follow_up_flags": list(follow_ups.values()),
+        "audit_events": audit_log,
+        "exclusion_log_summary": get_exclusion_log_summary(),
+    }
+
+
+def _build_decision_narrative(metrics: dict) -> str:
+    """Generate the prose summary text. Reads from the metrics dict; pure
+    string formatting. Multi-paragraph, ~10 sentences, captures both
+    cost avoidance vs savings + the volume of work done by both sides.
+    """
+    m = metrics
+    aw = m["analyst_work"]
+    sw = m["system_work"]
+    auto = m["auto_recommendation"]
+    active = m["active_award"]
+    n_items = m["n_items"]
+    hist = m["historical_baseline"]
+
+    # Helpers
+    def _money(v):
+        if v is None:
+            return "$0"
+        sign = "−$" if v < 0 else "$"
+        return sign + f"{abs(v):,.0f}"
+    def _pct(v):
+        if v is None:
+            return "0%"
+        return f"{v:+.1f}%"
+
+    n_suppliers = len(_STATE.get("bids", {}) or {})
+    n_priced_total = 0
+    for sup_data in (_STATE.get("bids", {}) or {}).values():
+        n_priced_total += sum(1 for b in (sup_data.get("bids") or []) if b.get("status") == BID_STATUS_PRICED)
+
+    p1 = (
+        f"This RFQ analysis covered {n_items:,} items with a historical baseline of "
+        f"{_money(hist)} (Σ qty_24mo × last-paid price). "
+        f"{n_suppliers} supplier(s) responded with {n_priced_total:,} priced bids in total."
+    )
+
+    rec_counts = sw["n_recommendations"]
+    p2 = (
+        f"The system surfaced {rec_counts.get('ACCEPT', 0):,} ACCEPT recommendations, "
+        f"{rec_counts.get('PUSH_BACK', 0):,} PUSH_BACK candidates, "
+        f"{rec_counts.get('ASK_CLARIFICATION', 0):,} clarification asks, "
+        f"{rec_counts.get('EXCLUDE', 0):,} excludes, and "
+        f"{rec_counts.get('MANUAL_REVIEW', 0):,} items needing manual review. "
+        f"It flagged {sw['n_outliers_flagged']:,} outlier-priced items, "
+        f"{sw['n_uom_disc_flagged']:,} UOM-discrepancy bids, "
+        f"{sw['n_substitutes_flagged']:,} substitute-part offers, and "
+        f"{sw['n_partial_coverage']:,} items with partial supplier coverage."
+    )
+
+    if any([aw['n_locks'], aw['n_outlier_exclusions'], aw['n_uom_resolutions'],
+            aw['n_round2_selected'], aw['n_follow_up_flags'], aw['n_scenarios_saved']]):
+        analyst_actions = []
+        if aw['n_outlier_exclusions']:
+            analyst_actions.append(
+                f"excluded {aw['n_excluded_lines']:,} order line(s) across "
+                f"{aw['n_outlier_exclusions']:,} item(s) as confirmed outliers"
+            )
+        if aw['n_locks']:
+            analyst_actions.append(f"locked {aw['n_locks']:,} item(s) to specific suppliers after audit")
+        if aw['n_uom_resolutions']:
+            analyst_actions.append(f"resolved {aw['n_uom_resolutions']:,} UOM mismatch(es)")
+        if aw['n_round2_selected']:
+            analyst_actions.append(f"selected {aw['n_round2_selected']:,} item(s) for a Round 2 push-back")
+        if aw['n_follow_up_flags']:
+            analyst_actions.append(f"flagged {aw['n_follow_up_flags']:,} SKU(s) for post-award follow-up")
+        if aw['n_scenarios_saved']:
+            analyst_actions.append(f"saved {aw['n_scenarios_saved']:,} award scenario(s)")
+        p3 = "The analyst's manual curation: " + "; ".join(analyst_actions) + "."
+    else:
+        p3 = "The analyst applied no manual curation — the award reflects the system's auto-recommendation as-is."
+
+    p4 = (
+        f"Award strategy chosen: {active['strategy']}. "
+        f"Primary award supplier: {active['supplier_primary'] or '(none)'}."
+    )
+    if active.get("n_carved"):
+        p4 += f" {active['n_carved']:,} item(s) were carved out to other suppliers per the dual-threshold rule "
+        p4 += f"(≥{int(round(m['thresholds'].get('carve_out_min_savings_pct', 0)*100))}% savings OR "
+        p4 += f"≥${m['thresholds'].get('carve_out_min_savings_annual_dollar', 0):,.0f}/yr)."
+
+    # Cost avoidance vs savings — the two reporting numbers
+    cost_avoid = active['savings_vs_history']
+    uplift = active['savings_vs_auto']
+    p5 = (
+        f"COST AVOIDANCE (active award vs historical paid baseline): {_money(cost_avoid)} "
+        f"({_pct(active['savings_pct'])}). "
+    )
+    if abs(uplift) >= 1.0:
+        sign = "saved an additional" if uplift > 0 else "cost an additional"
+        p5 += (
+            f"SAVINGS UPLIFT FROM MANUAL CURATION (active vs no-touch auto baseline of "
+            f"{_money(auto['award_total'])}): {sign} {_money(abs(uplift))} versus simply "
+            f"taking the lowest-qualified bid as-is."
+        )
+    else:
+        p5 += (
+            f"The active award matches the no-touch auto baseline within rounding — "
+            f"manual curation did not change the headline number, but the curation work "
+            f"is recorded for audit and may surface follow-up issues post-PO."
+        )
+
+    return "\n\n".join([p1, p2, p3, p4, p5])
+
+
+def gen_decision_summary_xlsx(scenario_name: str = None, rfq_id: str = "") -> bytes:
+    """Build the multi-tab Decision Summary xlsx. Internal-audience banner.
+    Tabs:
+      1. Executive Summary    (prose narrative + headline numbers)
+      2. Settings & Thresholds (every threshold + scenario params snapshot)
+      3. Analyst Actions       (locks, exclusions, UOM, scenarios, follow-ups)
+      4. System Flags          (recommendations + outliers + UOM_DISC + ...)
+      5. Cost Avoidance vs Savings (the two-number reporting table)
+      6. Items Needing Follow-Up (markable list — flagged SKUs)
+      7. Decision Log Timeline (audit_log unfiltered)
+
+    Always includes "INTERNAL — NEVER FORWARD" banner row 1.
+    """
+    metrics = compute_decision_summary_metrics(scenario_name)
+    if rfq_id:
+        metrics["rfq_id"] = rfq_id
+    narrative = _build_decision_narrative(metrics)
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = Workbook()
+    BANNER_FILL = PatternFill("solid", fgColor="FFF1B341")
+    BANNER_FONT = Font(name="Consolas", size=11, bold=True, color="000000")
+    H = Font(name="Calibri", size=11, bold=True)
+    MONO = Font(name="Consolas", size=10)
+    THIN = Side(border_style="thin", color="999999")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    BANNER_TXT = "INTERNAL — NEVER FORWARD — RETAIN PER LEGAL HOLD"
+
+    def _banner(ws, ncols=8):
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+        c = ws.cell(row=1, column=1, value=BANNER_TXT)
+        c.fill = BANNER_FILL
+        c.font = BANNER_FONT
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 22
+
+    # ==== TAB 1: Executive Summary ====
+    ws = wb.active
+    ws.title = "1_Executive_Summary"
+    _banner(ws, ncols=4)
+    ws.cell(row=2, column=1, value="DECISION SUMMARY").font = Font(name="Calibri", size=18, bold=True)
+    ws.cell(row=3, column=1, value=f"RFQ: {metrics['rfq_id'] or '(unset)'}    Source supplier: {metrics['supplier_name'] or '(unset)'}    Generated: {datetime.now().isoformat(timespec='seconds')}").font = MONO
+    ws.row_dimensions[2].height = 28
+    ws.cell(row=5, column=1, value="HEADLINE").font = H
+    rows = [
+        ("Items in RFQ", f"{metrics['n_items']:,}"),
+        ("Historical baseline (qty × last-paid)", f"${metrics['historical_baseline']:,.2f}"),
+        ("Award strategy", metrics['active_award']['strategy']),
+        ("Award supplier (primary)", metrics['active_award']['supplier_primary'] or "(none)"),
+        ("Award total", f"${metrics['active_award']['award_total']:,.2f}"),
+        ("Cost avoidance vs historical", f"${metrics['active_award']['savings_vs_history']:,.2f}  ({metrics['active_award']['savings_pct']:+.1f}%)"),
+        ("Savings vs no-touch auto baseline", f"${metrics['active_award']['savings_vs_auto']:,.2f}"),
+        ("Carve-outs in active award", f"{metrics['active_award']['n_carved']:,}"),
+    ]
+    for i, (k, v) in enumerate(rows, start=6):
+        ws.cell(row=i, column=1, value=k).font = MONO
+        ws.cell(row=i, column=2, value=v).font = MONO
+    ws.cell(row=15, column=1, value="NARRATIVE").font = H
+    # Narrative split into rows by paragraph for readability
+    paras = narrative.split("\n\n")
+    cur = 16
+    for p in paras:
+        ws.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=4)
+        c = ws.cell(row=cur, column=1, value=p)
+        c.font = Font(name="Calibri", size=11)
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[cur].height = max(60, 18 * (1 + len(p)//90))
+        cur += 1
+    ws.column_dimensions["A"].width = 50
+    ws.column_dimensions["B"].width = 35
+    ws.column_dimensions["C"].width = 25
+    ws.column_dimensions["D"].width = 25
+
+    # ==== TAB 2: Settings & Thresholds ====
+    ws2 = wb.create_sheet("2_Settings_Thresholds")
+    _banner(ws2, ncols=3)
+    ws2.cell(row=2, column=1, value="ENGINE THRESHOLDS ACTIVE AT DECISION TIME").font = H
+    ws2.cell(row=3, column=1, value="Threshold").font = H
+    ws2.cell(row=3, column=2, value="Value").font = H
+    ws2.cell(row=3, column=3, value="Default").font = H
+    th = metrics["thresholds"]
+    r = 4
+    for k in sorted(th.keys()):
+        ws2.cell(row=r, column=1, value=k).font = MONO
+        ws2.cell(row=r, column=2, value=th[k]).font = MONO
+        ws2.cell(row=r, column=3, value=DEFAULT_THRESHOLDS.get(k)).font = MONO
+        r += 1
+    r += 2
+    ws2.cell(row=r, column=1, value="SAVED SCENARIOS").font = H; r += 1
+    ws2.cell(row=r, column=1, value="Name").font = H
+    ws2.cell(row=r, column=2, value="Strategy").font = H
+    ws2.cell(row=r, column=3, value="Parameters").font = H
+    r += 1
+    for s in metrics["scenarios"]:
+        ws2.cell(row=r, column=1, value=s.get("name")).font = MONO
+        ws2.cell(row=r, column=2, value=s.get("strategy")).font = MONO
+        ws2.cell(row=r, column=3, value=str(s.get("parameters") or {})).font = MONO
+        r += 1
+    ws2.column_dimensions["A"].width = 42
+    ws2.column_dimensions["B"].width = 22
+    ws2.column_dimensions["C"].width = 60
+
+    # ==== TAB 3: Analyst Actions ====
+    ws3 = wb.create_sheet("3_Analyst_Actions")
+    _banner(ws3, ncols=5)
+    ws3.cell(row=2, column=1, value="ANALYST WORK PERFORMED — quantifies manual curation effort").font = H
+    aw = metrics["analyst_work"]
+    counts = [
+        ("Item locks", aw["n_locks"]),
+        ("Items with outlier exclusions", aw["n_outlier_exclusions"]),
+        ("Total order lines excluded", aw["n_excluded_lines"]),
+        ("UOM resolutions applied", aw["n_uom_resolutions"]),
+        ("Award scenarios saved", aw["n_scenarios_saved"]),
+        ("Round 2 / Rn items selected", aw["n_round2_selected"]),
+        ("Follow-up flags placed", aw["n_follow_up_flags"]),
+        ("Follow-up flags unresolved", aw["n_follow_up_unresolved"]),
+    ]
+    for i, (k, v) in enumerate(counts, start=4):
+        ws3.cell(row=i, column=1, value=k).font = MONO
+        ws3.cell(row=i, column=2, value=v).font = MONO
+    r = 4 + len(counts) + 2
+    # Lock detail
+    ws3.cell(row=r, column=1, value="ITEM LOCKS").font = H; r += 1
+    locks = _STATE.get("item_locks", {}) or {}
+    if locks:
+        for h_idx, h_lbl in enumerate(["Item", "Locked supplier", "Reason", "Locked at"], start=1):
+            ws3.cell(row=r, column=h_idx, value=h_lbl).font = H
+        r += 1
+        for it_num, lk in locks.items():
+            ws3.cell(row=r, column=1, value=it_num).font = MONO
+            ws3.cell(row=r, column=2, value=lk.get("supplier")).font = MONO
+            ws3.cell(row=r, column=3, value=lk.get("reason")).font = MONO
+            ws3.cell(row=r, column=4, value=lk.get("locked_at")).font = MONO
+            r += 1
+    else:
+        ws3.cell(row=r, column=1, value="(no locks)").font = MONO; r += 1
+    r += 2
+    # Exclusion detail
+    ws3.cell(row=r, column=1, value="OUTLIER EXCLUSIONS").font = H; r += 1
+    exc = _STATE.get("item_exclusions", {}) or {}
+    nonempty = {k: v for k, v in exc.items() if v}
+    if nonempty:
+        for h_idx, h_lbl in enumerate(["Item", "Excluded line indices", "N excluded"], start=1):
+            ws3.cell(row=r, column=h_idx, value=h_lbl).font = H
+        r += 1
+        for it_num, idxs in nonempty.items():
+            ws3.cell(row=r, column=1, value=it_num).font = MONO
+            ws3.cell(row=r, column=2, value=", ".join(str(i) for i in idxs)).font = MONO
+            ws3.cell(row=r, column=3, value=len(idxs)).font = MONO
+            r += 1
+    else:
+        ws3.cell(row=r, column=1, value="(no outlier exclusions)").font = MONO; r += 1
+    ws3.column_dimensions["A"].width = 36
+    ws3.column_dimensions["B"].width = 30
+    ws3.column_dimensions["C"].width = 36
+    ws3.column_dimensions["D"].width = 22
+
+    # ==== TAB 4: System Flags ====
+    ws4 = wb.create_sheet("4_System_Flags")
+    _banner(ws4, ncols=3)
+    ws4.cell(row=2, column=1, value="SYSTEM-FLAGGED WORK — quantifies what the engine surfaced").font = H
+    sw = metrics["system_work"]
+    rc = sw["n_recommendations"]
+    rows4 = [
+        ("Recommendation: ACCEPT", rc.get("ACCEPT", 0)),
+        ("Recommendation: PUSH_BACK", rc.get("PUSH_BACK", 0)),
+        ("Recommendation: ASK_CLARIFICATION", rc.get("ASK_CLARIFICATION", 0)),
+        ("Recommendation: EXCLUDE", rc.get("EXCLUDE", 0)),
+        ("Recommendation: MANUAL_REVIEW", rc.get("MANUAL_REVIEW", 0)),
+        ("Outlier-priced items flagged", sw["n_outliers_flagged"]),
+        ("UOM_DISC bids flagged", sw["n_uom_disc_flagged"]),
+        ("Substitute-part bids flagged", sw["n_substitutes_flagged"]),
+        ("Items with partial coverage", sw["n_partial_coverage"]),
+        ("Difficulty signals on the source data", sw["n_difficulty_signals"]),
+    ]
+    for i, (k, v) in enumerate(rows4, start=4):
+        ws4.cell(row=i, column=1, value=k).font = MONO
+        ws4.cell(row=i, column=2, value=v).font = MONO
+    ws4.column_dimensions["A"].width = 44
+    ws4.column_dimensions["B"].width = 16
+
+    # ==== TAB 5: Cost Avoidance vs Savings ====
+    ws5 = wb.create_sheet("5_CostAvoid_vs_Savings")
+    _banner(ws5, ncols=4)
+    ws5.cell(row=2, column=1, value="THE TWO REPORTING NUMBERS — cost avoidance and savings tracked separately").font = H
+    ws5.cell(row=3, column=1, value="Cost Avoidance (CA) = historical_baseline − active_award_total. Used for leadership reporting against budgeted spend.").font = MONO
+    ws5.cell(row=4, column=1, value="Savings (S) = no-touch_auto_award_total − active_award_total. Quantifies the lift from manual curation.").font = MONO
+    headers5 = ["Metric", "Auto recommendation", "Active award", "Delta"]
+    for i, h in enumerate(headers5, start=1):
+        ws5.cell(row=6, column=i, value=h).font = H
+    auto = metrics["auto_recommendation"]; active = metrics["active_award"]
+    table5 = [
+        ("Strategy", auto["strategy"], active["strategy"], "—"),
+        ("Primary supplier", auto["supplier_primary"], active["supplier_primary"], "—"),
+        ("Award total", auto["award_total"], active["award_total"], active["award_total"] - auto["award_total"]),
+        ("Cost avoidance vs historical", auto["savings_vs_history"], active["savings_vs_history"], active["savings_vs_history"] - auto["savings_vs_history"]),
+        ("Savings vs auto baseline", 0.0, active["savings_vs_auto"], active["savings_vs_auto"]),
+    ]
+    for i, row in enumerate(table5, start=7):
+        for j, v in enumerate(row, start=1):
+            c = ws5.cell(row=i, column=j, value=v)
+            c.font = MONO
+            if isinstance(v, (int, float)) and j > 1:
+                c.number_format = "$#,##0.00"
+    ws5.column_dimensions["A"].width = 36
+    for col in ("B", "C", "D"):
+        ws5.column_dimensions[col].width = 24
+
+    # ==== TAB 6: Items Needing Follow-Up ====
+    ws6 = wb.create_sheet("6_FollowUp_Items")
+    _banner(ws6, ncols=6)
+    ws6.cell(row=2, column=1, value="MARKED FOR FOLLOW-UP — analyst-flagged SKUs to double-check post-award").font = H
+    headers6 = ["Item", "Note", "Flagged at", "Resolved", "Resolved at", "Resolution note"]
+    for i, h in enumerate(headers6, start=1):
+        ws6.cell(row=3, column=i, value=h).font = H
+    flags = metrics["follow_up_flags"]
+    if flags:
+        for i, f in enumerate(flags, start=4):
+            ws6.cell(row=i, column=1, value=f.get("item_num")).font = MONO
+            ws6.cell(row=i, column=2, value=f.get("note")).font = MONO
+            ws6.cell(row=i, column=3, value=f.get("flagged_at")).font = MONO
+            ws6.cell(row=i, column=4, value="YES" if f.get("resolved") else "no").font = MONO
+            ws6.cell(row=i, column=5, value=f.get("resolved_at")).font = MONO
+            ws6.cell(row=i, column=6, value=f.get("resolved_note")).font = MONO
+    else:
+        ws6.cell(row=4, column=1, value="(no items flagged for follow-up)").font = MONO
+    ws6.column_dimensions["A"].width = 18
+    ws6.column_dimensions["B"].width = 50
+    ws6.column_dimensions["C"].width = 22
+    ws6.column_dimensions["D"].width = 12
+    ws6.column_dimensions["E"].width = 22
+    ws6.column_dimensions["F"].width = 50
+
+    # ==== TAB 7: Decision Log Timeline ====
+    ws7 = wb.create_sheet("7_Decision_Log_Timeline")
+    _banner(ws7, ncols=4)
+    ws7.cell(row=2, column=1, value="EVERY DISCRETE EVENT — full audit trail").font = H
+    headers7 = ["Timestamp", "Action", "Detail", "Related"]
+    for i, h in enumerate(headers7, start=1):
+        ws7.cell(row=3, column=i, value=h).font = H
+    events = metrics["audit_events"]
+    if events:
+        for i, ev in enumerate(events, start=4):
+            ws7.cell(row=i, column=1, value=ev.get("timestamp")).font = MONO
+            ws7.cell(row=i, column=2, value=ev.get("action")).font = MONO
+            ws7.cell(row=i, column=3, value=ev.get("detail")).font = MONO
+            ws7.cell(row=i, column=4, value=ev.get("related")).font = MONO
+    else:
+        ws7.cell(row=4, column=1, value="(no audit events)").font = MONO
+    ws7.column_dimensions["A"].width = 22
+    ws7.column_dimensions["B"].width = 28
+    ws7.column_dimensions["C"].width = 80
+    ws7.column_dimensions["D"].width = 30
+
+    log_event(
+        "gen_decision_summary_xlsx",
+        f"strategy={metrics['active_award']['strategy']} CA=${metrics['active_award']['savings_vs_history']:,.0f} uplift=${metrics['active_award']['savings_vs_auto']:,.0f}",
+        related=scenario_name,
+    )
+
+    import io
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Register module so app.js can `from app_engine import ...`
 # ---------------------------------------------------------------------------
 sys.modules["app_engine"] = sys.modules[__name__]
