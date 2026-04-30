@@ -1258,6 +1258,11 @@ def get_item_history(item_num: str) -> dict:
         "n_priced_after_exclusion": len(xs),
         "exclusions": sorted(excluded_set),
         "lock": locked_record,
+        # Follow-up flag state for the per-item modal's flag-for-follow-up
+        # button. None = no flag yet; otherwise the full record incl. note,
+        # resolved status, and timestamps so the UI can render the right
+        # button label ("Flag" / "Flagged: <note>" / "✓ Resolved: <note>").
+        "follow_up": (_STATE.get("follow_up_flags") or {}).get(item_num),
         "summary": {
             "po_count": item["po_count"] if item else 0,
             "qty_12mo": item["qty_12mo"] if item else 0,

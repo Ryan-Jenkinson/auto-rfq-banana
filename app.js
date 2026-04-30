@@ -3867,6 +3867,7 @@ function _ensureItemModal() {
           <div id="im-eyebrow" style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">ITEM HISTORY</div>
           <div id="im-title" style="font-size:24px;font-weight:600;color:var(--ink-0);font-family:var(--mono);letter-spacing:0.01em;line-height:1.2;"></div>
           <div id="im-sub" style="font-size:13px;color:var(--ink-1);margin-top:6px;line-height:1.4;"></div>
+          <div id="im-followup-row" style="margin-top:10px;display:flex;align-items:center;gap:10px;"></div>
         </div>
         <button id="im-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;flex-shrink:0;margin-left:14px;">×</button>
       </div>
@@ -4015,6 +4016,14 @@ function _renderItemHistory(h) {
   if (h.mfg_pn) subParts.push(`mfg pn: ${h.mfg_pn}`);
   if (h.uom) subParts.push(`uom: ${h.uom}${h.uom_mixed ? ' (mixed!)' : ''}`);
   document.getElementById('im-sub').textContent = subParts.join(' · ');
+
+  // Follow-up flag — analyst can mark this SKU for post-award double-check.
+  // Surfaces in Decision Summary Tab 6 (Items_Needing_Follow_Up). The button
+  // is a state toggle; clicking it prompts for an optional note and either
+  // sets the flag (flag_item_for_follow_up) or marks an existing flag
+  // resolved (resolve_item_follow_up) — resolved flags are kept on the
+  // record, just marked done.
+  _renderFollowUpButton(h.item_num, h.follow_up || null);
 
   // Summary tiles (mini KPI ribbon)
   const s = h.summary || {};
@@ -4504,6 +4513,66 @@ set_item_lock(_item_num_in, _supplier_in, _reason_in)
     await _refreshItemHistoryModal(itemNum);
   } catch (err) {
     console.error('[item-lock] toggle failed', err);
+  }
+}
+
+function _renderFollowUpButton(itemNum, follow) {
+  const row = document.getElementById('im-followup-row');
+  if (!row) return;
+  // 3 states: NEW (no flag) | FLAGGED (flag exists, not resolved) | RESOLVED (flag exists, resolved)
+  const state = !follow ? 'NEW' : (follow.resolved ? 'RESOLVED' : 'FLAGGED');
+  let label, color, title;
+  if (state === 'NEW') {
+    label = '🔖 Flag for follow-up';
+    color = 'var(--ink-2)';
+    title = 'Mark this SKU for post-award double-check. The flag surfaces in Decision Summary Tab 6 ("Items Needing Follow-Up") with a note + timestamp. Use when you want to ship the award now but verify the bid later (suspicious price, unfamiliar mfg, etc.).';
+  } else if (state === 'FLAGGED') {
+    const note = follow.note ? ` — "${follow.note}"` : '';
+    label = `🔖 Flagged${note}`;
+    color = 'var(--accent)';
+    title = `Already flagged${note}. Click to mark resolved (the flag stays on the record, just marked done).`;
+  } else {
+    const note = follow.resolved_note ? ` — "${follow.resolved_note}"` : '';
+    label = `✓ Follow-up resolved${note}`;
+    color = 'var(--green)';
+    title = 'Follow-up was flagged and later resolved. Click to re-flag.';
+  }
+  row.innerHTML = `
+    <button type="button" id="im-followup-btn" data-item="${_escapeHtml(itemNum)}" data-state="${state}"
+      title="${title.replace(/"/g, '&quot;')}"
+      style="background:transparent;border:1px solid ${color};color:${color};font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:0.04em;padding:5px 12px;border-radius:3px;cursor:pointer;text-transform:uppercase;">${label}</button>
+  `;
+  const btn = document.getElementById('im-followup-btn');
+  if (btn) btn.addEventListener('click', () => _handleFollowUpClick(itemNum, state));
+}
+
+async function _handleFollowUpClick(itemNum, state) {
+  if (!_pyAppLoaded || !_py) return;
+  let pyFn, defaultNote;
+  if (state === 'NEW' || state === 'RESOLVED') {
+    // Re-flag (or first flag) — prompt for a note
+    const note = prompt('What needs verifying after award? (free-form note — saved with the flag in the Decision Summary)', '') || '';
+    pyFn = 'flag_item_for_follow_up';
+    defaultNote = note;
+  } else {
+    // Resolve
+    const note = prompt('Optional resolution note (free-form — what did you find?)', '') || '';
+    pyFn = 'resolve_item_follow_up';
+    defaultNote = note;
+  }
+  try {
+    _py.globals.set('_item_num_in', itemNum);
+    _py.globals.set('_note_in', defaultNote);
+    await _py.runPythonAsync(`
+from app_engine import ${pyFn}
+${pyFn}(_item_num_in, _note_in)
+`);
+    if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) _saveMgr.markDirty();
+    await _refreshItemHistoryModal(itemNum);
+    _showItemModalSavePulse(state === 'FLAGGED' ? '✓ Marked resolved' : '✓ Flagged for follow-up', 'ok');
+  } catch (err) {
+    console.error('[follow-up toggle]', err);
+    _showItemModalSavePulse('✗ Save failed', 'err');
   }
 }
 
