@@ -3153,10 +3153,10 @@ function _openSnapshotActions(name) {
     b.addEventListener('click', () => { div.remove(); action(); });
     return b;
   };
-  div.appendChild(button('📨 Generate award letters', 'One xlsx per awarded supplier; strict cross-supplier isolation. Use to email each supplier their award.', () => _scenarioAction('letters', name)));
-  div.appendChild(button('📊 Internal full-detail summary', 'Cross-supplier xlsx with every bid + every decision. Banner: INTERNAL — NEVER FORWARD.', () => _scenarioAction('internal', name)));
-  div.appendChild(button('📜 Decision Log (legal-hold)', 'Per-item legal-hold record. Retain for several years.', () => _scenarioAction('decision', name)));
-  div.appendChild(button('× Delete snapshot', 'Removes the snapshot from the saved set. Does not undo any letters/logs already exported.', async () => {
+  div.appendChild(button('Generate award letters →', 'One xlsx per awarded supplier; strict cross-supplier isolation. Use to email each supplier their award.', () => _scenarioAction('letters', name)));
+  div.appendChild(button('Internal full-detail summary →', 'Cross-supplier xlsx with every bid + every decision. Banner: INTERNAL — NEVER FORWARD.', () => _scenarioAction('internal', name)));
+  div.appendChild(button('Decision Log (legal-hold) →', 'Per-item legal-hold record. Retain for several years.', () => _scenarioAction('decision', name)));
+  div.appendChild(button('Delete snapshot ✕', 'Removes the snapshot from the saved set. Does not undo any letters/logs already exported.', async () => {
     if (!confirm(`Delete snapshot "${name}"?`)) return;
     _py.globals.set('_scen_del_in', name);
     await _py.runPythonAsync(`
