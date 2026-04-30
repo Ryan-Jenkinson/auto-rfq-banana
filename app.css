@@ -351,3 +351,14 @@ tr.kbd-focus.last-viewed-row {
 }
 .matrix-cell:hover { background: rgba(255,183,51,0.08); }
 .matrix-supplier-emphasized { background: rgba(255,183,51,0.05); }
+
+/* Round 2 selection — a cyan stripe on the left edge of selected rows in
+   the comparison matrix, distinguishable from the green last-viewed-row
+   trail (different stage of the workflow, different cue color). The R2
+   checkbox cell stops click-bubbling so toggling doesn't open the modal. */
+tr.r2-selected {
+  background: rgba(86,210,255,0.07) !important;
+  box-shadow: inset 4px 0 0 var(--cyan);
+}
+.r2-cell { cursor: default; }
+.r2-cell input[type="checkbox"] { transform: scale(1.15); }

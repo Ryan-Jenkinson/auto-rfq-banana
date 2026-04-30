@@ -1771,6 +1771,11 @@ let _loadedBids = {};   // {supplier_name: parsed_result}
 let _matrixFilter = { coverage: null, recommendation: null, supplier: null, outliersOnly: false, typoOnly: false };
 let _lastMatrixData = null;
 
+// Round 2 / Rn focused-RFQ selection — Set of item_num picked from the
+// comparison matrix for the next negotiation round. Synced to Python state
+// via set_round2_selection on every change so save/reload preserves picks.
+let _round2Selection = new Set();
+
 async function _onAddBidClick() {
   const input = $('bid-file-input');
   input.value = '';
@@ -1784,27 +1789,78 @@ async function _onBidFileSelected(file) {
   const suggest = stem
     .replace(/^Andersen[\s_-]*/i, '')
     .replace(/[\s_-]*RFQ.*/i, '')
+    .replace(/[\s_-]*Round[\s_]*\d+.*/i, '')
+    .replace(/[\s_-]*R\d+.*/i, '')
     .replace(/[\s_-]*\d+[\.\-]\d+.*/g, '')
     .replace(/[\s_-]+/g, ' ')
     .trim() || stem;
   const name = prompt(`Supplier name for "${file.name}":`, suggest);
   if (!name) return;
 
-  // Read + parse
+  // Detect Round-2/Rn vs Round-1 by sheet-name + filename heuristic. Round
+  // files have a "Round N Response" sheet (set by gen_round2_rfq_xlsx)
+  // and/or a "Round" / "R2" / "R3" hint in the filename. We let Python
+  // make the final routing call so a stray filename can't misroute.
+  const looksLikeRoundN = /round[\s_]*[2-9]\d*|^r[2-9]\d*[\s_]/i.test(file.name) || /round[\s_]*[2-9]\d*/i.test(file.name);
+
   $('bid-add-btn').disabled = true;
-  $('bid-add-btn').textContent = 'Parsing…';
+  $('bid-add-btn').textContent = looksLikeRoundN ? 'Parsing R2…' : 'Parsing…';
   try {
     const buf = await file.arrayBuffer();
     const bytes = new Uint8Array(buf);
     _py.globals.set('_bid_bytes', bytes);
     _py.globals.set('_bid_supplier', name);
+    _py.globals.set('_likely_rn', looksLikeRoundN);
+    // Try R2/Rn ingest first if the filename hint is there. The Python
+    // function returns {error: ...} when the file's not actually a Round
+    // file (e.g., user named a R1 file "Round 1" by mistake) and we fall
+    // back to the standard R1 intake. Otherwise we go straight to R1.
     const out = await _py.runPythonAsync(`
 import json
-from app_engine import ingest_supplier_bid
-json.dumps(ingest_supplier_bid(_bid_bytes.to_py(), _bid_supplier), default=str)
+from app_engine import ingest_supplier_bid, ingest_round2_supplier_bid, parse_round2_supplier_bid
+result = None
+routed_via = "round_1"
+if _likely_rn:
+    # Sniff first — only commit to R2 ingest if the parser confirms.
+    sniff = parse_round2_supplier_bid(_bid_bytes.to_py(), supplier_name=_bid_supplier)
+    if not sniff.get("error") and sniff.get("items") and (sniff.get("round") or 0) >= 2:
+        result = ingest_round2_supplier_bid(_bid_bytes.to_py(), _bid_supplier)
+        result["routed_via"] = f"round_{result.get('round', 2)}"
+    else:
+        result = ingest_supplier_bid(_bid_bytes.to_py(), _bid_supplier)
+        result["routed_via"] = "round_1_fallback_after_round_sniff"
+else:
+    result = ingest_supplier_bid(_bid_bytes.to_py(), _bid_supplier)
+    result["routed_via"] = routed_via
+json.dumps(result, default=str)
 `);
     const parsed = JSON.parse(out);
-    _loadedBids[name] = parsed;
+    if (parsed.routed_via && parsed.routed_via.startsWith('round_') && parsed.routed_via !== 'round_1' && parsed.routed_via !== 'round_1_fallback_after_round_sniff') {
+      // Round-N overwrite path — surface the result via a focused toast
+      // (we don't replace _loadedBids since R2 is an overwrite, not a
+      // fresh bid set; the underlying _STATE["bids"][supplier]["bids"]
+      // was patched in place and the next _refreshBidViews picks it up).
+      alert(
+        `Round ${parsed.round} ingest for ${parsed.supplier}:\n` +
+        `  • ${parsed.n_repriced} item(s) repriced\n` +
+        `  • ${parsed.n_no_bid_overwrites} explicit decline(s)\n` +
+        `  • ${parsed.n_new_items} new item(s) (not in R1)\n` +
+        `  • ${parsed.n_unchanged_r1} R1 bid(s) untouched (blank in R2)\n\n` +
+        `Comparison matrix below will refresh with the new prices.`
+      );
+      // Refresh _loadedBids from Python's _STATE["bids"] so the intake
+      // panel shows the updated counts.
+      const refreshed = await _py.runPythonAsync(`
+import json
+from app_engine import _STATE
+json.dumps((_STATE.get('bids', {}) or {}).get(${JSON.stringify(name)}, {}), default=str)
+`);
+      try {
+        _loadedBids[name] = JSON.parse(refreshed);
+      } catch (_) { /* swallow */ }
+    } else {
+      _loadedBids[name] = parsed;
+    }
     _saveMgr.markDirty();
     await _refreshBidViews();
   } catch (err) {
@@ -1969,16 +2025,20 @@ async function _refreshConsolidationAndMatrix() {
 
   const out = await _py.runPythonAsync(`
 import json
-from app_engine import compute_comparison_matrix, compute_consolidation_analysis, list_award_scenarios, compute_clean_savings_summary
+from app_engine import compute_comparison_matrix, compute_consolidation_analysis, list_award_scenarios, compute_clean_savings_summary, list_round2_selection
 result = {
   "matrix": compute_comparison_matrix(),
   "consolidation": compute_consolidation_analysis(),
   "scenarios": list_award_scenarios(),
   "clean_savings": compute_clean_savings_summary(),
+  "round2_selection": list_round2_selection(),
 }
 json.dumps(result, default=str)
 `);
   const data = JSON.parse(out);
+  // Rehydrate the round-2 selection from saved Python state so a reloaded
+  // session shows the analyst's prior R2 picks intact.
+  _round2Selection = new Set(data.round2_selection || []);
   _renderBidCoverageKPIs(data.matrix);
   _renderCleanSavingsPanel(data.clean_savings);
   _renderConsolidation(data.consolidation);
@@ -2925,9 +2985,13 @@ function _renderComparisonMatrix(matrix) {
   let html = `<h2 style="margin-top:0;">Comparison matrix · ${totalShown.toLocaleString()} items shown <span style="color:var(--ink-2);font-size:14px;font-weight:400;">(of ${totalAll.toLocaleString()} total · click any KPI tile, recommendation chip, or supplier card to filter)</span></h2>`;
   html += pillBar;
   html += recDistHtml;
+  // Round 2 selection toolbar — quick-selects + count + Generate button.
+  // Renders only if at least one supplier has bid (otherwise R2 doesn't apply yet).
+  html += _renderRound2Toolbar(filtered, rows);
   html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:70vh;">';
   html += '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);">';
   html += `<thead style="background:var(--bg-2);position:sticky;top:0;z-index:1;"><tr>
+    <th title="Tick to select this item for the next Round 2 / Rn focused-RFQ batch. Use to push back on items where bids look uncompetitive — selected items get sent to picked suppliers for a re-quote, with the historical-trend reference price shown for context." style="padding:10px;text-align:center;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;width:36px;">R2</th>
     <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Item #</th>
     <th style="padding:10px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Description</th>
     <th style="padding:10px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.1em;">Qty 24mo</th>
@@ -2972,14 +3036,34 @@ function _renderComparisonMatrix(matrix) {
         if (b.status === 'SUBSTITUTE') cellContent += ' †';
         cellColor = isLow ? 'var(--green)' : 'var(--ink-0)';
       }
-      cells += `<td class="matrix-cell${emph}" data-cell-item="${_escapeHtml(r.item_num)}" data-cell-supplier="${_escapeHtml(sup)}" title="${cellTitle}" style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);color:${cellColor};font-weight:${isLow ? '700' : '400'};">${cellContent}</td>`;
+      // R2 delta indicator — when this bid has round_history, append a
+      // small "R2" badge with the prior price in the tooltip so the
+      // analyst can see who sharpened their pencil and by how much.
+      const roundHist = (b.round_history || []);
+      let r2Badge = '';
+      if (roundHist.length && b.price != null) {
+        const prior = roundHist[roundHist.length - 1];
+        const priorPrice = prior && prior.price;
+        if (priorPrice != null && priorPrice > 0) {
+          const delta = ((b.price / priorPrice) - 1.0) * 100;
+          const arrow = delta < 0 ? '↓' : (delta > 0 ? '↑' : '·');
+          const deltaColor = delta < 0 ? 'var(--green)' : delta > 0 ? 'var(--red)' : 'var(--ink-2)';
+          r2Badge = `<span style="font-size:9px;color:${deltaColor};margin-left:4px;letter-spacing:0.04em;" title="Round ${b.round || 2} — was $${priorPrice.toFixed(2)} in R${(prior.round || 1)}, now $${b.price.toFixed(2)} (${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%)">R${b.round || 2}${arrow}</span>`;
+          cellTitle = `R${b.round || 2} update: prior $${priorPrice.toFixed(2)} → $${b.price.toFixed(2)} (${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%). ${cellTitle}`;
+        }
+      }
+      cells += `<td class="matrix-cell${emph}" data-cell-item="${_escapeHtml(r.item_num)}" data-cell-supplier="${_escapeHtml(sup)}" title="${cellTitle}" style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);color:${cellColor};font-weight:${isLow ? '700' : '400'};">${cellContent}${r2Badge}</td>`;
     }
     const covColor = r.coverage === 'FULL' ? 'var(--green)' : r.coverage === 'PARTIAL' ? 'var(--accent)' : r.coverage === 'SINGLE' ? 'var(--cyan)' : 'var(--red)';
     const rec = r.recommendation || 'MANUAL_REVIEW';
     const recColor = _MATRIX_REC_COLORS[rec] || 'var(--ink-1)';
     const recLbl = _MATRIX_REC_LABELS[rec] || rec;
     const recReason = r.recommendation_reason || '';
-    html += `<tr class="clickable-row" style="border-bottom:1px solid rgba(122,109,115,0.25);" data-comp-item="${_escapeHtml(r.item_num)}" data-row-rec="${rec}">
+    const isSelectedR2 = _round2Selection.has(r.item_num);
+    html += `<tr class="clickable-row${isSelectedR2 ? ' r2-selected' : ''}" style="border-bottom:1px solid rgba(122,109,115,0.25);" data-comp-item="${_escapeHtml(r.item_num)}" data-row-rec="${rec}">
+      <td style="padding:6px 8px;text-align:center;" class="r2-cell">
+        <input type="checkbox" class="r2-row-check" data-r2-item="${_escapeHtml(r.item_num)}" ${isSelectedR2 ? 'checked' : ''} title="Tick to include this item in the next Round 2 batch — pushes the supplier(s) for a sharper-pencil re-quote with their R1 echo + reference price shown." style="cursor:pointer;accent-color:var(--accent);">
+      </td>
       <td style="padding:8px 10px;color:var(--ink-0);">${_escapeHtml(r.item_num)}</td>
       <td style="padding:8px 10px;color:var(--ink-1);max-width:240px;">${_escapeHtml(_truncate(r.description, 50))}</td>
       <td style="padding:8px 10px;text-align:right;color:var(--ink-0);">${(r.qty_24mo||0).toLocaleString()}</td>
@@ -2989,11 +3073,13 @@ function _renderComparisonMatrix(matrix) {
       <td style="padding:8px 10px;color:${recColor};font-size:11px;font-weight:600;cursor:pointer;text-decoration:underline dotted;" title="${_escapeHtml(recReason)} · click to filter to ${_MATRIX_REC_LABELS[rec] || rec}" data-rec-row-filter="${rec}">${recLbl}</td>
     </tr>`;
   }
+  // colspan accounts for the new R2 column (+1 from prior layout)
+  const totalCols = suppliers.length + 7;
   if (filtered.length > cap) {
-    html += `<tr><td colspan="${suppliers.length + 6}" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${(filtered.length - cap).toLocaleString()} more items hidden (sort by qty × hist price desc — narrow the filters to bring more into view)</td></tr>`;
+    html += `<tr><td colspan="${totalCols}" style="padding:14px;text-align:center;color:var(--ink-2);">… and ${(filtered.length - cap).toLocaleString()} more items hidden (sort by qty × hist price desc — narrow the filters to bring more into view)</td></tr>`;
   }
   if (!slice.length) {
-    html += `<tr><td colspan="${suppliers.length + 6}" style="padding:24px;text-align:center;color:var(--ink-2);">No items match the active filter set. <button type="button" class="matrix-filter-clear" data-pill-clear-all style="margin-left:8px;">clear all filters</button></td></tr>`;
+    html += `<tr><td colspan="${totalCols}" style="padding:24px;text-align:center;color:var(--ink-2);">No items match the active filter set. <button type="button" class="matrix-filter-clear" data-pill-clear-all style="margin-left:8px;">clear all filters</button></td></tr>`;
   }
   html += '</tbody></table></div>';
   html += '<div style="margin-top:8px;color:var(--ink-2);font-size:11px;font-family:var(--mono);">⚠ = UOM discrepancy noted by supplier &nbsp;·&nbsp; † = substitute part offered &nbsp;·&nbsp; <strong style="color:var(--green);">green</strong> = lowest non-flagged bid &nbsp;·&nbsp; click any cell to open the per-item drill-down</div>';
@@ -3045,11 +3131,42 @@ function _renderComparisonMatrix(matrix) {
     });
   });
 
+  // R2 row checkbox → toggle the round-2 selection set + sync to Python.
+  el.querySelectorAll('.r2-row-check').forEach(cb => {
+    cb.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+    });
+    cb.addEventListener('change', (ev) => {
+      const itemNum = ev.target.getAttribute('data-r2-item');
+      if (ev.target.checked) _round2Selection.add(itemNum);
+      else _round2Selection.delete(itemNum);
+      _round2SyncSelectionToPython();
+      _round2RefreshToolbar();
+      // Toggle the .r2-selected class on the row for the visual cue
+      const tr = ev.target.closest('tr');
+      if (tr) tr.classList.toggle('r2-selected', ev.target.checked);
+    });
+  });
+
+  // R2 quick-select / clear / generate buttons (rendered in the toolbar above).
+  const r2SelPushback = document.getElementById('r2-select-pushback');
+  const r2SelOver25 = document.getElementById('r2-select-over25');
+  const r2SelSingle = document.getElementById('r2-select-single');
+  const r2Clear = document.getElementById('r2-clear');
+  const r2Gen = document.getElementById('r2-generate');
+  if (r2SelPushback) r2SelPushback.addEventListener('click', () => _round2QuickSelect('pushback'));
+  if (r2SelOver25) r2SelOver25.addEventListener('click', () => _round2QuickSelect('over25'));
+  if (r2SelSingle) r2SelSingle.addEventListener('click', () => _round2QuickSelect('single'));
+  if (r2Clear) r2Clear.addEventListener('click', () => _round2QuickSelect('clear'));
+  if (r2Gen) r2Gen.addEventListener('click', _round2OpenGenerateDialog);
+
   // Row click (anywhere outside a cell that has its own handler) → open per-item modal.
   // tabindex="0" enables arrow-key navigation across the matrix rows too.
   el.querySelectorAll('tr[data-comp-item]').forEach(tr => {
     tr.setAttribute('tabindex', '0');
     tr.addEventListener('click', (ev) => {
+      // R2 checkbox is its own click target; let it handle, don't open modal.
+      if (ev.target.closest('.r2-cell') || ev.target.classList.contains('r2-row-check')) return;
       // If a child cell already handled it, our listener still fires due to
       // bubble — but the cell's handler called stopPropagation, so this
       // path only runs for clicks on the non-cell row chrome.
@@ -3057,6 +3174,249 @@ function _renderComparisonMatrix(matrix) {
     });
     tr.addEventListener('focus', () => _setKbFocusRow(tr));
   });
+}
+
+// ----------------------------------------------------------------------------
+// Round 2 / Rn toolbar — selection counter + quick-selects + generate button.
+// Sits above the comparison-matrix table; only rendered when at least one
+// supplier has bid R1 (otherwise R2 doesn't apply yet).
+// ----------------------------------------------------------------------------
+function _renderRound2Toolbar(filteredRows, allRows) {
+  if (!_lastMatrixData || !(_lastMatrixData.suppliers || []).length) return '';
+  const sel = _round2Selection;
+  const dollarsCovered = (allRows || []).reduce((sum, r) => {
+    if (sel.has(r.item_num)) {
+      sum += (r.qty_24mo || 0) * (r.last_unit_price || 0);
+    }
+    return sum;
+  }, 0);
+  const fmt$ = (n) => '$' + (n || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+  const hasSelection = sel.size > 0;
+  return `
+    <div id="r2-toolbar" style="display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:12px 14px;margin-bottom:14px;background:rgba(86,210,255,0.05);border:1px solid var(--cyan);border-radius:6px;font-family:var(--mono);font-size:12px;color:var(--ink-1);">
+      <span style="color:var(--cyan);font-weight:700;letter-spacing:0.06em;text-transform:uppercase;font-size:11px;">ROUND 2 / RN SELECTION</span>
+      <button type="button" class="btn ghost" id="r2-select-pushback" title="Select every item the engine recommended PUSH_BACK — typically the most useful R2 starting set." style="padding:5px 10px;font-size:11px;">SELECT ALL PUSH_BACK</button>
+      <button type="button" class="btn ghost" id="r2-select-over25" title="Select every item where at least one bid is &gt;25% above the lowest bid — the spread suggests room to negotiate." style="padding:5px 10px;font-size:11px;">SELECT WIDE-SPREAD ITEMS</button>
+      <button type="button" class="btn ghost" id="r2-select-single" title="Select every single-source item (1 bid only) to push other suppliers to enter the running." style="padding:5px 10px;font-size:11px;">SELECT SINGLE-SOURCE</button>
+      ${hasSelection ? `<button type="button" class="btn ghost" id="r2-clear" title="Clear the entire R2 selection set." style="padding:5px 10px;font-size:11px;">CLEAR SELECTION</button>` : ''}
+      <span style="margin-left:auto;color:var(--ink-1);" id="r2-count-label">
+        <strong style="color:${hasSelection ? 'var(--cyan)' : 'var(--ink-2)'};">${sel.size.toLocaleString()}</strong>
+        item${sel.size === 1 ? '' : 's'} selected
+        ${hasSelection ? `· est. ${fmt$(dollarsCovered)} 24-mo spend covered` : ''}
+      </span>
+      ${hasSelection ? `<button type="button" class="btn primary" id="r2-generate" title="Open the Round 2 generation dialog — pick suppliers + Quote-Terms options + click Generate to download per-supplier xlsx files." style="padding:6px 14px;font-size:12px;">GENERATE ROUND 2 RFQ FILES…</button>` : ''}
+    </div>
+  `;
+}
+
+function _round2RefreshToolbar() {
+  // Re-render only the toolbar without re-rendering the entire matrix.
+  // Saves 1-2 seconds on a large dataset and preserves scroll position.
+  const existing = document.getElementById('r2-toolbar');
+  if (!existing || !_lastMatrixData) return;
+  const html = _renderRound2Toolbar(null, _lastMatrixData.rows || []);
+  if (!html) { existing.remove(); return; }
+  // Replace the existing toolbar element with the new HTML.
+  const wrap = document.createElement('div');
+  wrap.innerHTML = html;
+  const fresh = wrap.firstElementChild;
+  existing.replaceWith(fresh);
+  // Re-bind handlers.
+  const r2SelPushback = document.getElementById('r2-select-pushback');
+  const r2SelOver25 = document.getElementById('r2-select-over25');
+  const r2SelSingle = document.getElementById('r2-select-single');
+  const r2Clear = document.getElementById('r2-clear');
+  const r2Gen = document.getElementById('r2-generate');
+  if (r2SelPushback) r2SelPushback.addEventListener('click', () => _round2QuickSelect('pushback'));
+  if (r2SelOver25) r2SelOver25.addEventListener('click', () => _round2QuickSelect('over25'));
+  if (r2SelSingle) r2SelSingle.addEventListener('click', () => _round2QuickSelect('single'));
+  if (r2Clear) r2Clear.addEventListener('click', () => _round2QuickSelect('clear'));
+  if (r2Gen) r2Gen.addEventListener('click', _round2OpenGenerateDialog);
+}
+
+function _round2QuickSelect(kind) {
+  if (!_lastMatrixData || !_lastMatrixData.rows) return;
+  const rows = _lastMatrixData.rows;
+  if (kind === 'clear') {
+    _round2Selection.clear();
+  } else if (kind === 'pushback') {
+    for (const r of rows) {
+      if ((r.recommendation || '') === 'PUSH_BACK') _round2Selection.add(r.item_num);
+    }
+  } else if (kind === 'over25') {
+    for (const r of rows) {
+      const prices = Object.values(r.bids || {})
+        .map(b => (b && b.price != null && b.price > 0) ? b.price : null)
+        .filter(p => p != null);
+      if (prices.length < 2) continue;
+      const min = Math.min(...prices);
+      const max = Math.max(...prices);
+      if (min > 0 && (max - min) / min >= 0.25) _round2Selection.add(r.item_num);
+    }
+  } else if (kind === 'single') {
+    for (const r of rows) {
+      if ((r.coverage || '') === 'SINGLE') _round2Selection.add(r.item_num);
+    }
+  }
+  _round2SyncSelectionToPython();
+  // Full matrix re-render so the per-row checkboxes reflect the new state.
+  if (_lastMatrixData) _renderComparisonMatrix(_lastMatrixData);
+}
+
+async function _round2SyncSelectionToPython() {
+  if (!_pyAppLoaded || !_py) return;
+  try {
+    _py.globals.set('_r2_sel_in', [..._round2Selection]);
+    await _py.runPythonAsync(`
+from app_engine import set_round2_selection
+set_round2_selection(list(_r2_sel_in))
+`);
+    if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) _saveMgr.markDirty();
+  } catch (err) {
+    console.error('[round2 sync]', err);
+  }
+}
+
+function _round2OpenGenerateDialog() {
+  if (!_round2Selection.size) return;
+  // Suppliers that bid R1 — defaults to all checked. Pulled from
+  // _loadedBids since that's the canonical "who bid" list.
+  const suppliers = Object.keys(_loadedBids || {});
+  if (!suppliers.length) {
+    alert('No suppliers have bid yet — load at least one R1 bid before generating Round 2.');
+    return;
+  }
+  let modal = document.getElementById('r2-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'r2-modal';
+    modal.style.cssText = 'position:fixed;inset:0;z-index:5500;background:rgba(8,12,22,0.78);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:24px;';
+    document.body.appendChild(modal);
+  }
+  modal.style.display = 'flex';
+  const supplierRows = suppliers.map(s =>
+    `<label style="display:block;margin-bottom:6px;color:var(--ink-0);font-family:var(--mono);font-size:12px;">
+      <input type="checkbox" class="r2-sup-pick" value="${_escapeHtml(s)}" checked style="vertical-align:middle;margin-right:8px;accent-color:var(--accent);">
+      ${_escapeHtml(s)}
+      <span style="color:var(--ink-2);font-size:11px;margin-left:6px;">(bid R1)</span>
+    </label>`
+  ).join('');
+  modal.innerHTML = `
+    <div style="background:var(--bg-1);border:1px solid var(--line);border-radius:8px;max-width:680px;width:100%;max-height:88vh;overflow:auto;padding:28px 32px;box-shadow:0 24px 80px rgba(0,0,0,0.6);font-family:var(--ui);">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px;">
+        <div>
+          <div style="font-size:10px;color:var(--ink-2);font-family:var(--mono);letter-spacing:0.16em;text-transform:uppercase;font-weight:600;margin-bottom:6px;">ROUND 2 RFQ — FOCUSED LIST</div>
+          <h2 style="margin:0;font-size:20px;color:var(--ink-0);">Generate per-supplier Round 2 files</h2>
+          <p style="margin:8px 0 0;color:var(--ink-1);font-size:13px;line-height:1.55;">
+            ${_round2Selection.size} item${_round2Selection.size === 1 ? '' : 's'} selected.
+            Each supplier you tick gets a focused xlsx with their R1 echo + the Andersen-projected reference price + 8 supplier-input fields. Strict isolation: no cross-supplier data leaks into any file.
+          </p>
+        </div>
+        <button id="r2-modal-close" type="button" style="background:transparent;border:1px solid var(--line);color:var(--ink-1);font-size:18px;line-height:1;padding:6px 12px;border-radius:4px;cursor:pointer;">×</button>
+      </div>
+      <div style="margin-bottom:14px;">
+        <label style="display:block;font-size:12px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;margin-bottom:8px;font-family:var(--mono);">Send to</label>
+        ${supplierRows}
+      </div>
+      <div style="margin-bottom:14px;padding:12px 14px;background:var(--bg-2);border:1px solid var(--line);border-radius:4px;">
+        <label style="display:block;margin-bottom:8px;color:var(--ink-0);font-family:var(--mono);font-size:12px;">
+          <input type="checkbox" id="r2-include-r1-echo" checked style="vertical-align:middle;margin-right:8px;accent-color:var(--accent);">
+          Include R1 echo column (their prior price + UOM + notes as gray context)
+        </label>
+        <label style="display:block;color:var(--ink-0);font-family:var(--mono);font-size:12px;">
+          <input type="checkbox" id="r2-include-reference" checked style="vertical-align:middle;margin-right:8px;accent-color:var(--accent);">
+          Include Reference Price column (Andersen-projected from cleaned trend, with explanatory banner)
+        </label>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:baseline;margin-bottom:14px;">
+        <label style="color:var(--ink-1);font-family:var(--mono);font-size:12px;">
+          Round number
+          <input type="number" id="r2-round-num" value="2" min="2" max="9" style="width:60px;background:var(--bg-2);color:var(--ink-0);border:1px solid var(--line);border-radius:3px;padding:4px 8px;font-family:var(--mono);font-size:12px;margin-left:6px;">
+        </label>
+        <label style="color:var(--ink-1);font-family:var(--mono);font-size:12px;">
+          Response due
+          <input type="date" id="r2-due-date" style="background:var(--bg-2);color:var(--ink-0);border:1px solid var(--line);border-radius:3px;padding:4px 8px;font-family:var(--mono);font-size:12px;margin-left:6px;">
+        </label>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <button id="r2-modal-cancel" class="btn ghost" type="button">Cancel</button>
+        <button id="r2-modal-go" class="btn primary" type="button">GENERATE</button>
+      </div>
+    </div>
+  `;
+  const close = () => { modal.style.display = 'none'; };
+  document.getElementById('r2-modal-close').addEventListener('click', close);
+  document.getElementById('r2-modal-cancel').addEventListener('click', close);
+  modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+  document.getElementById('r2-modal-go').addEventListener('click', _round2GenerateBatch);
+}
+
+async function _round2GenerateBatch() {
+  const picks = [...document.querySelectorAll('.r2-sup-pick')]
+    .filter(cb => cb.checked).map(cb => cb.value);
+  if (!picks.length) {
+    alert('Pick at least one supplier.');
+    return;
+  }
+  const includeR1 = document.getElementById('r2-include-r1-echo').checked;
+  const includeRef = document.getElementById('r2-include-reference').checked;
+  const roundNum = parseInt(document.getElementById('r2-round-num').value || '2', 10);
+  const dueDate = document.getElementById('r2-due-date').value || '';
+  const items = [..._round2Selection];
+
+  const goBtn = document.getElementById('r2-modal-go');
+  goBtn.disabled = true;
+  goBtn.textContent = 'BUILDING…';
+  try {
+    _py.globals.set('_r2_items_in', items);
+    _py.globals.set('_r2_suppliers_in', picks);
+    _py.globals.set('_r2_round_in', roundNum);
+    _py.globals.set('_r2_due_in', dueDate);
+    _py.globals.set('_r2_inc_r1', includeR1);
+    _py.globals.set('_r2_inc_ref', includeRef);
+    const out = await _py.runPythonAsync(`
+import json, base64
+from app_engine import gen_round2_rfqs_for_selection
+result = gen_round2_rfqs_for_selection(
+  selected_item_nums=list(_r2_items_in),
+  suppliers=list(_r2_suppliers_in),
+  round_num=int(_r2_round_in),
+  response_due_date=str(_r2_due_in or ''),
+  include_r1_echo=bool(_r2_inc_r1),
+  include_reference_price=bool(_r2_inc_ref),
+)
+encoded = {sup: base64.b64encode(b).decode('ascii') for sup, b in result['files'].items()}
+json.dumps({"files": encoded, "errors": result.get("errors", {}), "n_items": result.get("n_items", 0)})
+`);
+    const result = JSON.parse(out);
+    const errs = result.errors || {};
+    const successCount = Object.keys(result.files || {}).length;
+    // Trigger one download per supplier.
+    for (const [sup, b64] of Object.entries(result.files || {})) {
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const safeSup = sup.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const ts = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `Round${roundNum}_RFQ_${safeSup}_${ts}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }
+    let msg = `Generated ${successCount} Round ${roundNum} file${successCount === 1 ? '' : 's'} (${result.n_items || 0} items each).`;
+    if (Object.keys(errs).length) {
+      msg += `\n\nErrors:\n` + Object.entries(errs).map(([s, e]) => `  • ${s}: ${e}`).join('\n');
+    }
+    alert(msg);
+    document.getElementById('r2-modal').style.display = 'none';
+  } catch (err) {
+    console.error('[round2 generate]', err);
+    alert('Round 2 generation failed: ' + (err.message || err));
+  } finally {
+    goBtn.disabled = false;
+    goBtn.textContent = 'GENERATE';
+  }
 }
 
 // ==========================================================================
