@@ -3026,11 +3026,15 @@ function _renderComparisonMatrix(matrix) {
         if (b.status === 'SUBSTITUTE') cellContent += ' †';
         cellColor = isLow ? 'var(--green)' : 'var(--ink-0)';
       }
-      // R2 delta indicator — when this bid has round_history, append a
-      // small "R2" badge with the prior price in the tooltip so the
-      // analyst can see who sharpened their pencil and by how much.
+      // R2 delta indicator — when this bid has round_history, the cell
+      // gets a strong visual treatment: cyan-tinted background, cyan
+      // left-edge stripe, italic price, and a delta badge. Scannable
+      // at-a-glance across the whole matrix so the analyst can spot
+      // every R2 update without zooming in on individual cells.
       const roundHist = (b.round_history || []);
       let r2Badge = '';
+      let r2CellClass = '';
+      let r2InlineStyle = '';
       if (roundHist.length && b.price != null) {
         const prior = roundHist[roundHist.length - 1];
         const priorPrice = prior && prior.price;
@@ -3038,11 +3042,19 @@ function _renderComparisonMatrix(matrix) {
           const delta = ((b.price / priorPrice) - 1.0) * 100;
           const arrow = delta < 0 ? '↓' : (delta > 0 ? '↑' : '·');
           const deltaColor = delta < 0 ? 'var(--green)' : delta > 0 ? 'var(--red)' : 'var(--ink-2)';
-          r2Badge = `<span style="font-size:9px;color:${deltaColor};margin-left:4px;letter-spacing:0.04em;" title="Round ${b.round || 2} — was $${priorPrice.toFixed(2)} in R${(prior.round || 1)}, now $${b.price.toFixed(2)} (${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%)">R${b.round || 2}${arrow}</span>`;
+          r2Badge = `<span style="font-size:9px;color:${deltaColor};margin-left:4px;letter-spacing:0.04em;font-weight:700;" title="Round ${b.round || 2} — was $${priorPrice.toFixed(2)} in R${(prior.round || 1)}, now $${b.price.toFixed(2)} (${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%)">R${b.round || 2}${arrow}${Math.abs(delta).toFixed(0)}%</span>`;
           cellTitle = `R${b.round || 2} update: prior $${priorPrice.toFixed(2)} → $${b.price.toFixed(2)} (${delta >= 0 ? '+' : ''}${delta.toFixed(0)}%). ${cellTitle}`;
+          r2CellClass = ' matrix-cell-r2';
+          // Inline override on the cell color: italics + cyan-leaning so
+          // it's distinct from the green/lowest cue without losing the
+          // "this is the lowest bid" signal when both apply.
+          r2InlineStyle = isLow
+            ? `color:var(--green);font-weight:700;font-style:italic;`
+            : `color:var(--cyan);font-weight:600;font-style:italic;`;
         }
       }
-      cells += `<td class="matrix-cell${emph}" data-cell-item="${_escapeHtml(r.item_num)}" data-cell-supplier="${_escapeHtml(sup)}" title="${cellTitle}" style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);color:${cellColor};font-weight:${isLow ? '700' : '400'};">${cellContent}${r2Badge}</td>`;
+      const baseStyle = r2InlineStyle || `color:${cellColor};font-weight:${isLow ? '700' : '400'};`;
+      cells += `<td class="matrix-cell${emph}${r2CellClass}" data-cell-item="${_escapeHtml(r.item_num)}" data-cell-supplier="${_escapeHtml(sup)}" title="${cellTitle}" style="padding:8px 10px;text-align:right;border-left:1px solid var(--line);${baseStyle}">${cellContent}${r2Badge}</td>`;
     }
     const covColor = r.coverage === 'FULL' ? 'var(--green)' : r.coverage === 'PARTIAL' ? 'var(--accent)' : r.coverage === 'SINGLE' ? 'var(--cyan)' : 'var(--red)';
     const rec = r.recommendation || 'MANUAL_REVIEW';

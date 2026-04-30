@@ -362,3 +362,16 @@ tr.r2-selected {
 }
 .r2-cell { cursor: default; }
 .r2-cell input[type="checkbox"] { transform: scale(1.15); }
+
+/* Cells where a Round 2 / Rn return overwrote the R1 price get a strong
+   cyan tint + a 3px right-edge stripe so the analyst can scan the whole
+   matrix and spot every re-quoted price at a glance. The italic + cyan
+   color (or italic + green when this cell is also the lowest) carries
+   the cue inline; the right-edge stripe is the row-level scannability. */
+.matrix-cell-r2 {
+  background: rgba(86,210,255,0.14) !important;
+  box-shadow: inset -3px 0 0 var(--cyan);
+}
+.matrix-cell-r2:hover {
+  background: rgba(86,210,255,0.22) !important;
+}
