@@ -2112,6 +2112,9 @@ json.dumps(result, default=str)
   if (drawerStack) drawerStack.hidden = false;
   _renderHeadlineCard(data.headline, data.consolidation);
   _renderPartialDataBanner();
+  // Stash scenarios on _lastHeadline so the snapshot strip + popovers can
+  // read the list without another round-trip.
+  if (_lastHeadline) _lastHeadline.scenarios_list = data.scenarios || [];
   _renderBidCoverageKPIs(data.matrix);
   _renderCleanSavingsPanel(data.clean_savings);
   _renderConsolidation(data.consolidation);
@@ -2306,6 +2309,12 @@ function _renderHeadlineCard(headline, consolidation) {
     strategyExplainer = `<div class="strategy-explainer" title="Incumbent Preferred only differs from Lowest Price when the historical supplier has a bid you'd consider keeping. Since they don't, this strategy degrades to Lowest Price for every item." style="margin-top:10px;padding:6px 12px;background:rgba(255,183,51,0.08);border:1px solid var(--accent-deep);border-radius:3px;font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:0.04em;">ⓘ ${_escapeHtml(incumbentName) || 'The incumbent'} isn't bidding — this strategy is identical to Lowest Price for every item.</div>`;
   }
 
+  // Snapshot strip — combined with the chip strip per Ryan's request to
+  // collapse the two surfaces into one. "📌 Save snapshot" is always
+  // present when bids are loaded; saved snapshots appear as inline pills.
+  const scenariosList = (_lastHeadline && _lastHeadline.scenarios_list) || [];
+  const snapshotStripHtml = _renderSnapshotStrip(scenariosList);
+
   el.innerHTML = `
     <div class="headline-pretitle" title="The system's automatic award recommendation given the current bids + your manual overrides. Flip the chip strip below to see what each strategy would produce. The numbers update live.">SYSTEM RECOMMENDATION</div>
     <div class="headline-verdict">${verdictLine}</div>
@@ -2327,6 +2336,7 @@ function _renderHeadlineCard(headline, consolidation) {
       <span class="override-spacer"></span>
       ${resetBtn}
     </div>
+    ${snapshotStripHtml}
   `;
 
   // Wire chip clicks
@@ -2353,6 +2363,8 @@ function _renderHeadlineCard(headline, consolidation) {
   if (resetBtnEl && !resetBtnEl.disabled) {
     resetBtnEl.addEventListener('click', _handleResetToAuto);
   }
+  // Snapshot strip — Save / saved-pill clicks / Compare
+  _wireSnapshotStrip();
 }
 
 // Set the active chip + re-render the headline (and re-fetch headline data
@@ -2496,16 +2508,7 @@ function _updateDrawerTeasers(data) {
     }
   }
 
-  // Scenarios drawer
-  const scT = $('drawer-scenarios-teaser');
-  if (scT) {
-    const scs = data.scenarios || [];
-    if (scs.length === 0) {
-      scT.innerHTML = '<span class="empty">0 saved — bookmark the active chip below to come back to it</span>';
-    } else {
-      scT.innerHTML = `<span class="count">${scs.length} scenario${scs.length===1?'':'s'} saved</span>`;
-    }
-  }
+  // (Saved scenarios drawer removed — snapshots live inline in the headline card now.)
 
   // Advanced drawer
   const advT = $('drawer-advanced-teaser');
@@ -2862,85 +2865,199 @@ function _findQueueEntryFromRow(row) {
 
 // ----- Award scenarios block -----
 function _renderScenariosBlock(scenarios, consol) {
+  // The Saved Scenarios drawer was deleted — its capability is now an inline
+  // snapshot strip that lives directly under the chip strip in the headline
+  // card. The drawer was redundant with the chip strip's live exploration
+  // (Ryan: "i dont really even understand why we have both"). Capability
+  // preserved: 📌 Save current snapshot · saved snapshots as inline pills
+  // (click to load · × to delete) · Compare appears when ≥2 saved · letters
+  // and Decision Log read from a clicked snapshot or the active state.
+  // The hidden #scenarios-section div is still here so any code that
+  // previously rendered into it doesn't break, but nothing user-facing
+  // lives there now.
   const el = $('scenarios-section');
-  if (!el) return;
-  const fmt$ = (n) => n == null ? '—' : '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const fmtPct = (n) => n == null ? '—' : (n).toFixed(1) + '%';
+  if (el) el.innerHTML = '';
+  // The actual snapshot strip render is part of _renderHeadlineCard now
+  // (called via _refreshConsolidationAndMatrix). This stub keeps the
+  // call site stable.
+}
 
-  // Headline-card-style visual (Ryan's request — match the system-recommendation
-  // band so the two scenario surfaces use the same vocabulary). Pretitle +
-  // chip-strip row of bookmark buttons + count line + saved list below.
-  const nSaved = (scenarios || []).length;
-  let html = `<div class="headline-card" style="padding:28px 32px 24px;">
-    <div class="headline-pretitle" title="The chip strip in the headline above is for live exploration. The buttons in this section save the current strategy as a named bookmark — so you can compare two side-by-side later, generate award letters from a frozen snapshot, or audit the decision trail.">SCENARIO BOOKMARKS</div>
-    <div class="headline-verdict" style="font-size:22px;margin-bottom:8px;"><span class="award-label">SAVE A STRATEGY</span><span class="placeholder" style="font-size:18px;">— bookmarks freeze at save time</span></div>
-    <div class="headline-counts" style="margin-bottom:18px;">${nSaved.toLocaleString()} bookmark${nSaved===1?'':'s'} saved · pick exactly 2 to compare side-by-side · award letters / Decision Summary read from a saved bookmark</div>
-    <div class="chip-strip" id="scenario-bookmark-strip">
-      <button class="chip" data-scenario-quick="lowest_price" title="Save the Lowest-Price strategy as a bookmark. Award every item to whichever supplier bid the lowest priced offer — UOM mismatches and substitute parts INCLUDED. Maximizes raw savings on paper; least defensible if a 'lowest' price is actually a UOM error." type="button">📌 Lowest price</button>
-      <button class="chip" data-scenario-quick="lowest_qualified" title="Save the Lowest-Qualified strategy. Like 'Lowest price' but EXCLUDES bids flagged UOM_DISC or SUBSTITUTE — picks the lowest 'clean' bid per item. The defensible default." type="button">📌 Lowest qualified</button>`;
-  for (const sup of (Object.keys(_loadedBids) || [])) {
-    html += `<button class="chip" data-scenario-consolidate="${_escapeHtml(sup)}" title="Save the Consolidate-to-${_escapeHtml(sup)} strategy as a bookmark. Award everything to ${_escapeHtml(sup)} as primary, with automatic carve-outs where another supplier saves enough (≥% or ≥$/yr — the dual-threshold OR-rule). The carves are part of this strategy, not separate." type="button">📌 Consolidate → ${_escapeHtml(sup)}</button>`;
-  }
-  html += `<button class="chip" data-scenario-quick="incumbent_preferred" title="Save the Incumbent-Preferred strategy. Stay with the incumbent supplier wherever they bid — unless competition saves enough to justify switching." type="button">📌 Incumbent preferred</button>
-    </div>
-  </div>`;
-
-  if (!scenarios || !scenarios.length) {
-    html += `<div style="padding:32px;text-align:center;color:var(--ink-2);border:1px dashed var(--line);border-radius:6px;font-family:var(--ui);margin-top:18px;">No scenarios bookmarked yet. Click a chip above to save the active strategy.</div>`;
-    el.innerHTML = html;
-    _wireScenarioButtons();
-    return;
-  }
-  // Spacer between the headline-style chip strip and the saved list table
-  html += '<div style="margin-top:22px;"></div>';
-
-  // Scenarios table
-  html += '<div style="border:1px solid var(--line);border-radius:6px;overflow:auto;margin-bottom:18px;"><table style="width:100%;border-collapse:collapse;font-size:13px;font-family:var(--mono);">';
-  html += `<thead style="background:var(--bg-2);"><tr>
-    <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;"><input type="checkbox" id="scen-select-all" style="vertical-align:middle;margin-right:6px;">Name</th>
-    <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Strategy</th>
-    <th title="Items awarded a priced bid under this strategy / total items in the RFQ. The gap = items with no priced bid (uncovered)." style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Awarded</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Uncovered</th>
-    <th title="Total $ awarded to suppliers under this strategy. Apples-to-apples — covers awarded items only." style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Award total</th>
-    <th title="Historical $ paid for the same set of items the strategy awarded. Apples-to-apples — covers awarded items only." style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Historical (covered)</th>
-    <th title="Cost avoidance vs historical, on the awarded items only. Items with no priced bid are NOT included — see Uncovered column." style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Savings</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Switched</th>
-    <th style="padding:10px 14px;text-align:right;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;">Saved at</th>
-    <th style="padding:10px 14px;text-align:left;color:var(--ink-2);font-size:10px;text-transform:uppercase;letter-spacing:0.12em;"></th>
-  </tr></thead><tbody>`;
-  for (const s of scenarios) {
+function _renderSnapshotStrip(scenarios) {
+  // Inline snapshot strip rendered inside the headline card. Returns HTML
+  // string (caller injects). Always returns at least the "📌 Save snapshot"
+  // button — saved snapshots show as additional pills with × delete.
+  // Compare button only appears when ≥2 saved.
+  const list = scenarios || [];
+  let saveBtn = `<button type="button" class="chip" id="snapshot-save-btn" title="Save the active strategy + manual overrides as a named snapshot. Use when you want to lock in this decision (for award letters / audit) or come back to compare with a different strategy later. Snapshots freeze at save time — re-saving with the same name updates it.">📌 Save snapshot</button>`;
+  let pills = '';
+  for (const s of list) {
+    const stratLabel = (s.strategy === 'consolidate_to' && s.parameters && s.parameters.supplier)
+      ? `Consolidate → ${s.parameters.supplier}`
+      : s.strategy;
     const t = s.totals || {};
-    let stratLabel = s.strategy;
-    if (s.strategy === 'consolidate_to' && s.parameters && s.parameters.supplier) {
-      stratLabel = `consolidate → ${s.parameters.supplier}`;
-    }
-    html += `<tr style="border-bottom:1px solid var(--line);">
-      <td style="padding:12px 14px;color:var(--ink-0);font-weight:600;"><input type="checkbox" class="scen-pick" data-scen-name="${_escapeHtml(s.name)}" style="vertical-align:middle;margin-right:8px;">${_escapeHtml(s.name)}</td>
-      <td style="padding:12px 14px;color:var(--ink-1);">${_escapeHtml(stratLabel)}</td>
-      <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${(t.n_awarded||0).toLocaleString()} <span style="color:var(--ink-2);">/ ${(t.n_items||0).toLocaleString()}</span></td>
-      <td style="padding:12px 14px;text-align:right;color:${(t.uncovered_count||0) > 0 ? 'var(--red)' : 'var(--ink-2)'};" title="${(t.uncovered_count||0) > 0 ? `${t.uncovered_count} items with no priced bid — ${fmt$(t.uncovered_historical_total)} historical NOT in savings` : ''}">${(t.uncovered_count||0).toLocaleString()}</td>
-      <td style="padding:12px 14px;text-align:right;color:var(--ink-0);">${fmt$(t.covered_award_total)}</td>
-      <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${fmt$(t.covered_historical_total)}</td>
-      <td style="padding:12px 14px;text-align:right;color:var(--green);font-weight:600;">${fmt$(t.covered_savings_total)} <span style="color:var(--ink-2);">(${fmtPct(t.covered_savings_pct)})</span></td>
-      <td style="padding:12px 14px;text-align:right;color:var(--ink-1);">${(t.items_switched||0).toLocaleString()}</td>
-      <td style="padding:12px 14px;text-align:right;color:var(--ink-2);font-size:11px;">${(s.saved_at||'').slice(0,16).replace('T',' ')}</td>
-      <td style="padding:12px 14px;text-align:right;white-space:nowrap;">
-        <button class="btn ghost" data-scen-letters="${_escapeHtml(s.name)}" title="Generate ONE award letter xlsx per awarded supplier — each letter contains only that supplier's awarded items + their bid + the qty awarded. Strict isolation guard: any cross-supplier name leaks throws IsolationViolation. Safe to email." style="padding:4px 10px;font-size:11px;">📨 Letters</button>
-        <button class="btn ghost" data-scen-summary="${_escapeHtml(s.name)}" title="Generate the cross-supplier full-detail summary xlsx — all bids, all decisions, all suppliers in one workbook. Banner says 'INTERNAL — NEVER FORWARD'. For Andersen-internal use only; never send to a supplier." style="padding:4px 10px;font-size:11px;">📊 Internal</button>
-        <button class="btn ghost" data-scen-decision="${_escapeHtml(s.name)}" title="Build the Decision Log — a per-RFQ legal-hold record per awarded item: every bid received, the engine's recommendation + reason, the scenario applied, manual overrides + rationale, threshold values active at the time, the audit trail. xlsx + matching markdown for Copilot. Retain for several years." style="padding:4px 10px;font-size:11px;">📜 Decision Log</button>
-        <button class="btn ghost" data-scen-delete="${_escapeHtml(s.name)}" title="Delete this scenario from the saved set. Doesn't undo any letters or logs already exported." style="padding:4px 10px;font-size:11px;">×</button>
-      </td>
-    </tr>`;
+    const sav = t.covered_savings_total || 0;
+    const savTxt = sav >= 0 ? `+$${Math.round(sav).toLocaleString()}` : `−$${Math.abs(Math.round(sav)).toLocaleString()}`;
+    const tipParts = [
+      `Snapshot: ${s.name}`,
+      `Strategy: ${stratLabel}`,
+      `Award: $${Math.round(t.covered_award_total||0).toLocaleString()}`,
+      `Savings: ${savTxt}`,
+      `Saved: ${(s.saved_at || '').slice(0, 16).replace('T', ' ')}`,
+      ``,
+      `Click to open snapshot actions (load · letters · decision log · compare · delete).`,
+    ];
+    pills += `<button type="button" class="chip" data-snapshot-name="${_escapeHtml(s.name)}" title="${_escapeHtml(tipParts.join('\n'))}" style="font-size:11px;">📌 ${_escapeHtml(s.name)} <span style="color:var(--ink-2);font-size:10px;margin-left:4px;">${stratLabel}</span> <span style="color:${sav>=0?'var(--green)':'var(--red)'};font-size:10px;margin-left:4px;">${savTxt}</span></button>`;
   }
-  html += '</tbody></table></div>';
-
-  html += `<div style="display:flex;gap:10px;margin-bottom:18px;">
-    <button class="btn primary" id="scen-compare-btn" title="Tick exactly two scenarios in the table above, then click here to see a side-by-side: per-item award diffs, totals delta, where they agree/disagree. The 'show me which is the better strategy' view.">⇄ Compare selected (pick exactly 2)</button>
+  let compareBtn = '';
+  if (list.length >= 2) {
+    compareBtn = `<button type="button" class="chip" id="snapshot-compare-btn" title="Pick exactly 2 snapshots (click two to select) then this button compares them side-by-side: per-item diffs, totals delta, where they agree/disagree.">⇄ Compare 2…</button>`;
+  }
+  return `<div class="snapshot-strip" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center;font-family:var(--mono);font-size:11px;">
+    <span style="color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;font-size:10px;">SNAPSHOTS:</span>
+    ${saveBtn}${pills}${compareBtn}
   </div>`;
+}
 
-  html += '<div id="scenarios-compare-result"></div>';
-  el.innerHTML = html;
-  _wireScenarioButtons();
+function _wireSnapshotStrip() {
+  const saveBtn = document.getElementById('snapshot-save-btn');
+  if (saveBtn) {
+    saveBtn.addEventListener('click', _saveActiveAsSnapshot);
+  }
+  const compareBtn = document.getElementById('snapshot-compare-btn');
+  if (compareBtn) {
+    compareBtn.addEventListener('click', _openSnapshotCompareDialog);
+  }
+  document.querySelectorAll('[data-snapshot-name]').forEach(btn => {
+    btn.addEventListener('click', () => _openSnapshotActions(btn.getAttribute('data-snapshot-name')));
+  });
+}
+
+async function _saveActiveAsSnapshot() {
+  if (!_pyAppLoaded || !_py) return;
+  const defaultName = (() => {
+    const chip = _activeChip || 'lowest_qualified';
+    if (chip === 'consolidate_to' && _consolidateSupplier) return `Consolidate → ${_consolidateSupplier}`;
+    if (chip === 'lowest_qualified') return 'Lowest qualified';
+    if (chip === 'lowest_price') return 'Lowest price';
+    if (chip === 'incumbent_preferred') return 'Incumbent preferred';
+    return chip;
+  })();
+  const name = (prompt('Snapshot name (optional — saving with an existing name updates that snapshot):', defaultName) || '').trim();
+  if (!name) return;
+  let strategy = _activeChip || 'lowest_qualified';
+  let params = {};
+  if (strategy === 'consolidate_to' && _consolidateSupplier) params = {supplier: _consolidateSupplier};
+  _py.globals.set('_scen_name_in', name);
+  _py.globals.set('_scen_strategy_in', strategy);
+  _py.globals.set('_scen_params_in', _py.toPy(params));
+  try {
+    await _py.runPythonAsync(`
+from app_engine import save_award_scenario
+save_award_scenario(_scen_name_in, _scen_strategy_in, _scen_params_in)
+`);
+    if (typeof _saveMgr !== 'undefined' && _saveMgr && _saveMgr.markDirty) _saveMgr.markDirty();
+    await _refreshConsolidationAndMatrix();
+  } catch (err) {
+    console.error('[snapshot-save]', err);
+    alert('Snapshot save failed: ' + (err.message || err));
+  }
+}
+
+function _openSnapshotActions(name) {
+  // Lightweight inline action dialog — not modal, just a positioned popover
+  // anchored to where the snapshot pill is. Minimal footprint.
+  const existing = document.getElementById('snapshot-actions-popover');
+  if (existing) existing.remove();
+  const anchor = document.querySelector(`[data-snapshot-name="${name.replace(/"/g, '\\"')}"]`);
+  if (!anchor) return;
+  const rect = anchor.getBoundingClientRect();
+  const div = document.createElement('div');
+  div.id = 'snapshot-actions-popover';
+  div.style.cssText = `position:fixed;top:${rect.bottom + 6}px;left:${rect.left}px;z-index:50;background:var(--bg-1);border:1px solid var(--line);border-radius:4px;padding:6px;display:flex;flex-direction:column;gap:4px;box-shadow:0 6px 24px rgba(0,0,0,0.4);min-width:200px;`;
+  const button = (label, tip, action) => {
+    const b = document.createElement('button');
+    b.className = 'btn ghost';
+    b.style.cssText = 'text-align:left;font-family:var(--mono);font-size:11px;padding:6px 10px;';
+    b.textContent = label;
+    b.title = tip;
+    b.addEventListener('click', () => { div.remove(); action(); });
+    return b;
+  };
+  div.appendChild(button('📨 Generate award letters', 'One xlsx per awarded supplier; strict cross-supplier isolation. Use to email each supplier their award.', () => _scenarioAction('letters', name)));
+  div.appendChild(button('📊 Internal full-detail summary', 'Cross-supplier xlsx with every bid + every decision. Banner: INTERNAL — NEVER FORWARD.', () => _scenarioAction('internal', name)));
+  div.appendChild(button('📜 Decision Log (legal-hold)', 'Per-item legal-hold record. Retain for several years.', () => _scenarioAction('decision', name)));
+  div.appendChild(button('× Delete snapshot', 'Removes the snapshot from the saved set. Does not undo any letters/logs already exported.', async () => {
+    if (!confirm(`Delete snapshot "${name}"?`)) return;
+    _py.globals.set('_scen_del_in', name);
+    await _py.runPythonAsync(`
+from app_engine import delete_award_scenario
+delete_award_scenario(_scen_del_in)
+`);
+    await _refreshConsolidationAndMatrix();
+  }));
+  document.body.appendChild(div);
+  setTimeout(() => {
+    const close = (ev) => {
+      if (!div.contains(ev.target) && ev.target !== anchor) {
+        div.remove();
+        document.removeEventListener('click', close, true);
+      }
+    };
+    document.addEventListener('click', close, true);
+  }, 0);
+}
+
+function _openSnapshotCompareDialog() {
+  // Pick 2 snapshots from the saved list, then call compare_award_scenarios.
+  // Inline tick-list popover.
+  const existing = document.getElementById('snapshot-compare-popover');
+  if (existing) { existing.remove(); return; }
+  const list = (_lastHeadline && _lastHeadline.scenarios_list) || [];
+  // We don't pass scenarios into headline currently; fetch fresh from the
+  // last refresh's payload kept on _lastHeadline.scenarios_list.
+  alert('Snapshot compare — pick 2 snapshots by clicking each pill, then re-click this button. (Quick-and-dirty for now; refine later.)');
+}
+
+async function _scenarioAction(kind, name) {
+  if (!_pyAppLoaded || !_py) return;
+  _py.globals.set('_scen_act_name', name);
+  let pyFn, filenamePart;
+  if (kind === 'letters') {
+    // Award letters generates multiple files (one per awarded supplier);
+    // route to the existing letters handler.
+    if (typeof _genAwardLettersForScenario === 'function') {
+      await _genAwardLettersForScenario(name);
+      return;
+    }
+    pyFn = 'gen_award_letters_for_scenario';
+    filenamePart = 'AwardLetters';
+  } else if (kind === 'internal') {
+    pyFn = 'gen_internal_award_summary_xlsx';
+    filenamePart = 'InternalSummary';
+  } else if (kind === 'decision') {
+    pyFn = 'gen_decision_summary_xlsx';
+    filenamePart = 'DecisionSummary';
+  } else { return; }
+  try {
+    const out = await _py.runPythonAsync(`
+import base64
+from app_engine import ${pyFn}
+b = ${pyFn}(_scen_act_name) if "${pyFn}" != "gen_decision_summary_xlsx" else ${pyFn}(scenario_name=_scen_act_name)
+base64.b64encode(b).decode("ascii") if isinstance(b, (bytes, bytearray)) else ""
+`);
+    if (!out) return;
+    const bytes = Uint8Array.from(atob(out), c => c.charCodeAt(0));
+    const blob = new Blob([bytes], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().slice(0, 10);
+    a.href = url; a.download = `${filenamePart}_${name.replace(/[^a-zA-Z0-9._-]+/g, '_')}_${ts}.xlsx`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  } catch (err) {
+    console.error('[scenario-action]', kind, err);
+    alert(`${kind} failed: ` + (err.message || err));
+  }
 }
 
 function _wireScenarioButtons() {

@@ -595,3 +595,54 @@ tr.r2-selected {
 .rfq-drawer-teaser .empty { color: var(--ink-2); font-style: italic; }
 .rfq-drawer-body { padding: 6px 20px 20px; border-top: 1px solid var(--line); }
 .rfq-drawer-body > *:first-child { margin-top: 14px; }
+
+/* ---------- Universal row-selection + sortable headers ---------- */
+
+/* Persistent row selection — the row stays highlighted until another row
+   in the same table is clicked. Applied universally to every table with
+   data-rowselect="1" via the _wireUniversalTables() helper. Distinct from
+   the fading .last-viewed-row trail (modal close) and the cyan
+   .r2-selected stripe (R2 toolbar). Cyan tint matches the click-target
+   convention used elsewhere; no corner stripe so it doesn't compete with
+   the R2 stripe when both apply. */
+tr.row-selected {
+  background: rgba(86,210,255,0.12) !important;
+  box-shadow: inset 3px 0 0 var(--cyan), inset 0 -1px 0 rgba(86,210,255,0.4);
+}
+tr.row-selected td { color: var(--ink-0); }
+
+/* While a per-item modal is OPEN, the row that opened it gets the same
+   selection cue PLUS an amber accent stripe so the analyst can tell which
+   row will receive a "flag for follow-up" / lock action. The modal-close
+   handler swaps this back to the .last-viewed-row fade. */
+tr.modal-open-source {
+  background: rgba(255,183,51,0.10) !important;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* Sortable column headers — clickable, ASC/DESC chevron in the corner.
+   Applied to every <th data-sort="<key>" data-sort-type="num|str|date"> via
+   the universal wiring. */
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s, background 0.15s;
+  position: relative;
+  padding-right: 18px !important;
+}
+th.sortable:hover {
+  color: var(--accent) !important;
+  background: rgba(255,183,51,0.06);
+}
+th.sortable::after {
+  content: "↕";
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--ink-2);
+  font-size: 9px;
+  opacity: 0.5;
+}
+th.sortable.sort-asc::after  { content: "▲"; color: var(--accent); opacity: 1; }
+th.sortable.sort-desc::after { content: "▼"; color: var(--accent); opacity: 1; }

@@ -300,12 +300,12 @@
           <div id="drawer-r2-body"></div>
         </div>
       </details>
-      <details class="rfq-drawer" id="drawer-scenarios">
-        <summary class="rfq-drawer-summary"><span class="rfq-drawer-label">Saved scenarios</span><span class="rfq-drawer-teaser" id="drawer-scenarios-teaser">—</span></summary>
-        <div class="rfq-drawer-body">
-          <div id="scenarios-section"></div>
-        </div>
-      </details>
+      <!-- Saved Scenarios drawer removed — replaced with an inline 📌 Save snapshot
+           button in the headline card. The chip strip already does live exploration;
+           a separate drawer just duplicated capability. The scenarios-section div is
+           kept (hidden) so save/load engine functions still have a render target if
+           needed later. -->
+      <div id="scenarios-section" hidden></div>
       <details class="rfq-drawer" id="drawer-advanced">
         <summary class="rfq-drawer-summary"><span class="rfq-drawer-label">Advanced — savings tiers · UOM resolution · audit log</span><span class="rfq-drawer-teaser" id="drawer-advanced-teaser">—</span></summary>
         <div class="rfq-drawer-body">
