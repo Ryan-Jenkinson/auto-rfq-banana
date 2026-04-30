@@ -4380,8 +4380,11 @@ function _ensureItemModal() {
   if (fsClose) fsClose.addEventListener('click', _exitChartFullscreen);
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
-      const wrap = document.getElementById('im-chart-wrap');
-      if (wrap && wrap.classList.contains('is-fullscreen')) _exitChartFullscreen();
+      const modal = document.getElementById('item-modal');
+      if (modal && modal.classList.contains('is-fullscreen')) {
+        ev.stopImmediatePropagation();
+        _exitChartFullscreen();
+      }
     }
   });
   m.addEventListener('click', (e) => { if (e.target === m) _closeItemModal(); });
@@ -5158,29 +5161,28 @@ function _renderEventsTable() {
 }
 
 function _enterChartFullscreen() {
-  const wrap = document.getElementById('im-chart-wrap');
-  if (!wrap) return;
-  wrap.classList.add('is-fullscreen');
+  // Fullscreen now expands the WHOLE per-item modal (so summary tiles,
+  // chart, bid cards, order lines all benefit from the extra space) rather
+  // than just the chart wrapper. The chart still grows to fill its share
+  // of the larger viewport.
+  const modal = document.getElementById('item-modal');
+  if (!modal) return;
+  modal.classList.add('is-fullscreen');
   const closeBtn = document.getElementById('im-chart-fullscreen-close');
   if (closeBtn) closeBtn.style.display = 'block';
-  // Bump the SVG to fill the viewport and redraw at new dimensions
   const svg = document.getElementById('im-chart');
-  if (svg) {
-    svg.style.height = 'calc(100vh - 80px)';
-  }
+  if (svg) svg.style.height = 'calc(60vh - 40px)';
   if (_currentItemHistory) _drawItemHistoryChart(_currentItemHistory);
 }
 
 function _exitChartFullscreen() {
-  const wrap = document.getElementById('im-chart-wrap');
-  if (!wrap) return;
-  wrap.classList.remove('is-fullscreen');
+  const modal = document.getElementById('item-modal');
+  if (!modal) return;
+  modal.classList.remove('is-fullscreen');
   const closeBtn = document.getElementById('im-chart-fullscreen-close');
   if (closeBtn) closeBtn.style.display = 'none';
   const svg = document.getElementById('im-chart');
-  if (svg) {
-    svg.style.height = '280px';
-  }
+  if (svg) svg.style.height = '280px';
   if (_currentItemHistory) _drawItemHistoryChart(_currentItemHistory);
 }
 
@@ -5232,11 +5234,14 @@ function _drawItemHistoryChart(h) {
 
   let s = '';
 
-  // Economic / tariff / commodity event overlays — rendered FIRST so other
-  // elements draw on top of them. Vertical line at the event date, with a
-  // small label rotated up the line. Filtered by _chartEventFilter category
-  // toggles. Click a line → scroll to + flash the matching row in the
-  // events table below the chart.
+  // Economic / tariff / commodity event overlays — clean vertical lines
+  // only, no inline labels (those overlapped into noise when many events
+  // landed in the same period). Hover the line for a tooltip with the
+  // full label + description; the events table below the chart carries
+  // the readable list. Color matches category. Wider hit-rect so clicks
+  // are easy. The label that does render is a small category dot at top
+  // of the line so the analyst can see which color goes to which category
+  // without having to mouse over.
   for (const ev of _CHART_EVENTS) {
     if (!_chartEventFilter[ev.category]) continue;
     if (!ev.date) continue;
@@ -5246,9 +5251,9 @@ function _drawItemHistoryChart(h) {
     const ex = padL + ((evMs - minDate) / dateRange) * innerW;
     const color = _EVENT_CATEGORY_COLORS[ev.category] || 'var(--ink-2)';
     s += `<g class="chart-event" data-event-date="${_escapeHtml(ev.date)}" style="cursor:pointer;">
-      <line x1="${ex}" y1="${padT}" x2="${ex}" y2="${padT + innerH}" stroke="${color}" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.55"/>
-      <rect x="${ex - 1}" y="${padT}" width="3" height="${innerH}" fill="transparent" pointer-events="all"/>
-      <text x="${ex + 4}" y="${padT + 12}" fill="${color}" font-family="var(--mono)" font-size="9" font-weight="600" letter-spacing="0.06em" text-rendering="geometricPrecision">${_escapeHtml(ev.label.length > 38 ? ev.label.slice(0, 36) + '…' : ev.label)}</text>
+      <line x1="${ex}" y1="${padT}" x2="${ex}" y2="${padT + innerH}" stroke="${color}" stroke-width="1.5" stroke-dasharray="4,3" opacity="0.45"/>
+      <rect x="${ex - 4}" y="${padT}" width="8" height="${innerH}" fill="transparent" pointer-events="all"/>
+      <circle cx="${ex}" cy="${padT + 4}" r="3" fill="${color}" opacity="0.85"/>
       <title>${_escapeHtml(ev.date)} · ${_escapeHtml(ev.category)} · ${_escapeHtml(ev.label)} — ${_escapeHtml(ev.description || '')}</title>
     </g>`;
   }

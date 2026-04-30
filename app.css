@@ -904,20 +904,24 @@ th.sortable.sort-desc::after { content: "▼"; color: var(--accent); opacity: 1;
 .all-fields-key { color: var(--ink-2); letter-spacing: 0.04em; text-transform: uppercase; font-size: 10px; align-self: center; }
 .all-fields-val { color: var(--ink-0); word-break: break-word; }
 
-/* Chart fullscreen toggle — applied to #im-chart-wrap */
-#im-chart-wrap.is-fullscreen {
-  position: fixed;
-  inset: 0;
-  z-index: 200;
-  background: var(--bg-0);
-  padding: 32px;
-  display: flex;
-  align-items: stretch;
-  justify-content: stretch;
+/* Fullscreen mode for the per-item modal — the FULLSCREEN button on the
+   chart toggles it. Affects the whole modal so summary tiles, chart, bid
+   cards, and order lines all benefit from the extra space. The exit
+   button is rendered inside the chart but the toggle target is the
+   entire modal. */
+#item-modal.is-fullscreen {
+  background: var(--bg-0) !important;
+  padding: 0 !important;
+  align-items: stretch !important;
+  justify-content: stretch !important;
 }
-#im-chart-wrap.is-fullscreen #im-chart {
-  width: 100%;
-  height: 100% !important;
+#item-modal.is-fullscreen > div {
+  max-width: none !important;
+  width: 100% !important;
+  max-height: 100vh !important;
+  height: 100vh !important;
+  border-radius: 0 !important;
+  border: none !important;
 }
 
 /* Persistence indicator on dropzones (last loaded file) */
