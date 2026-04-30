@@ -197,6 +197,25 @@
 
     <div id="kpi-row" class="kpi-row"></div>
 
+    <!-- Smart Trim moves to the top — it's the first decision: do you want
+         to bulk-trim the candidate list before browsing? Then below it,
+         the View filters change what you SEE without removing items. -->
+    <div class="actions" style="margin-top:0;margin-bottom:14px;">
+      <button class="btn ghost" id="smart-trim-toggle" title="Open the Smart Trim panel — pick a dormancy window (12 / 24 / 36 mo) and which classes of items to drop. Live preview shows what will be unticked before you commit. All unticks are reversible — the data stays, just the RFQ checkbox flips." style="padding:6px 12px;font-size:12px;">⚡ Smart trim ▾</button>
+      <span class="muted" id="trim-status"></span>
+    </div>
+
+    <!-- VIEW section — these controls change what's DISPLAYED in the table
+         below; they do NOT remove items from the RFQ. The RFQ-include
+         checkbox is the only thing that determines RFQ membership.
+         (Bulk-include / bulk-exclude buttons sit inside this section because
+         they act on the currently-visible subset — but they DO mutate the
+         RFQ-include checkbox.) -->
+    <div style="display:flex;align-items:baseline;gap:10px;margin-top:8px;margin-bottom:6px;flex-wrap:wrap;">
+      <span style="font-family:var(--mono);font-size:10px;font-weight:700;color:var(--ink-2);letter-spacing:0.16em;text-transform:uppercase;">View</span>
+      <span style="font-family:var(--ui);font-size:12px;color:var(--ink-2);" title="The filters below only change what you SEE in the table. They do NOT remove items from the RFQ — the RFQ-include checkbox on each row is the single source of truth for what gets sent to suppliers. Use Smart Trim above (or the bulk Include/Exclude buttons) to actually change RFQ membership.">these filters change what's shown — they do not remove items from the RFQ</span>
+    </div>
+
     <div class="filter-row">
       <label title="Which time window the qty + spend columns pivot to. 24 months is the default RFQ baseline. 'All time' shows every priced line ever seen in the export.">Window:
         <select id="active-window" title="12 / 24 / 36 months back from the dataset's most recent order date (not today's date — exports are often weeks stale).">
@@ -231,10 +250,8 @@
     </div>
 
     <div class="actions" style="margin-top:0;margin-bottom:14px;">
-      <button class="btn ghost" id="bulk-include-all" title="Tick every visible row at once — useful after narrowing the filter to a specific subset you want in the RFQ." style="padding:6px 12px;font-size:12px;">Include all visible</button>
-      <button class="btn ghost" id="bulk-exclude-all" title="Untick every visible row at once — useful after filtering to weak/SKIP tier or risky description patterns." style="padding:6px 12px;font-size:12px;">Exclude all visible</button>
-      <button class="btn ghost" id="smart-trim-toggle" title="Open the Smart Trim panel — pick a dormancy window (12 / 24 / 36 mo) and which classes of items to drop. Live preview shows what will be unticked before you commit. All unticks are reversible — the data stays, just the RFQ checkbox flips." style="padding:6px 12px;font-size:12px;">⚡ Smart trim ▾</button>
-      <span class="muted" id="trim-status"></span>
+      <button class="btn ghost" id="bulk-include-all" title="Tick every VISIBLE row's RFQ-include checkbox. Useful after narrowing View filters to a specific subset you want included. Note: this DOES mutate RFQ membership (unlike the View filters above)." style="padding:6px 12px;font-size:12px;">Include all visible</button>
+      <button class="btn ghost" id="bulk-exclude-all" title="Untick every VISIBLE row's RFQ-include checkbox. Useful after filtering to a slice you're confident shouldn't be in the RFQ. Note: this DOES mutate RFQ membership (unlike the View filters above)." style="padding:6px 12px;font-size:12px;">Exclude all visible</button>
     </div>
 
     <!-- Smart Trim panel — collapsible, hidden by default. Live summary recomputes as toggles flip. -->
