@@ -3585,7 +3585,14 @@ def recommend_for_item(matrix_row: dict) -> dict:
 # every project / supplier mix should be allowed to override.
 # ---------------------------------------------------------------------------
 DEFAULT_THRESHOLDS = {
-    "carve_out_min_savings_pct": 0.30,       # carve-out candidate if other supplier saves >= 30% of winner price
+    # Carve-out logic is OR between % and $/yr — a carve fires when EITHER the
+    # percent savings is structural (typical industry default 15-25%) OR the
+    # absolute annual dollar savings is large enough to justify a separate PO
+    # (typical $1K-5K/yr). This dual rule under-carves on long-tail items
+    # (where 50% of $200/yr is admin overhead) and catches high-volume items
+    # where 5% of $50K/yr is real money.
+    "carve_out_min_savings_pct": 0.20,                # 20% — fires on long-tail anomalies
+    "carve_out_min_savings_annual_dollar": 3000.0,    # $3K/yr — fires on high-volume rate plays
     "outlier_factor": 3.0,                   # bid is outlier if >= Nx median or <= 1/N of median
     "spike_factor": 1.5,                     # latest price is "spike" if >= 1.5x 90-day median
     "uom_suspect_ratio": 20.0,               # carve-out price ratio >= this → mark UOM-verify
@@ -3662,7 +3669,8 @@ DEFAULT_CARVE_OUT_THRESHOLD = 0.30
 
 
 def compute_consolidation_analysis(included_keys=None, carve_threshold: float = None,
-                                   uom_suspect_ratio: float = None) -> dict:
+                                   uom_suspect_ratio: float = None,
+                                   carve_threshold_dollar: float = None) -> dict:
     """Rank suppliers as candidate consolidation winners and quantify the
     impact of carving out exceptions where someone else is meaningfully
     cheaper on individual items.
@@ -3713,6 +3721,8 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
     th = get_thresholds()
     if carve_threshold is None:
         carve_threshold = th["carve_out_min_savings_pct"]
+    if carve_threshold_dollar is None:
+        carve_threshold_dollar = th["carve_out_min_savings_annual_dollar"]
     if uom_suspect_ratio is None:
         uom_suspect_ratio = th["uom_suspect_ratio"]
 
@@ -3796,9 +3806,22 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
                 if other_bids:
                     other_bids.sort(key=lambda t: t[1])
                     cheapest_other_sup, cheapest_other_price = other_bids[0]
-                    if cheapest_other_price < w_price * (1.0 - carve_threshold):
-                        savings_per_unit = w_price - cheapest_other_price
-                        savings_total = savings_per_unit * qty
+                    savings_per_unit = w_price - cheapest_other_price
+                    savings_total = savings_per_unit * qty                  # 24-mo total savings at the qty windowed in the RFQ
+                    annual_savings = savings_total / 2.0 if qty else 0.0    # 24-mo qty halved → ~annual run-rate
+                    pct_savings = (savings_per_unit / w_price) if w_price else 0.0
+                    fires_pct = pct_savings >= carve_threshold
+                    fires_dollar = annual_savings >= carve_threshold_dollar
+                    if fires_pct or fires_dollar:
+                        # Record which rule fired (or both) — drives the matrix
+                        # tooltip / decision-log explanation. Both is common
+                        # on big high-volume rate plays.
+                        if fires_pct and fires_dollar:
+                            carve_rule_fired = "BOTH"
+                        elif fires_pct:
+                            carve_rule_fired = "PCT"
+                        else:
+                            carve_rule_fired = "DOLLAR"
                         # UOM-discrepancy guard — if EITHER side has a UOM
                         # warning OR the price ratio is extreme (>20×), flag
                         # the carve-out as needing UOM verification before
@@ -3824,7 +3847,9 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
                             "carve_price": cheapest_other_price,
                             "savings_per_unit": savings_per_unit,
                             "savings_total": savings_total,
+                            "savings_annual": annual_savings,
                             "savings_pct": (savings_per_unit / w_price * 100.0) if w_price else 0.0,
+                            "carve_rule_fired": carve_rule_fired,   # "PCT", "DOLLAR", or "BOTH"
                             "verify_uom": verify_uom,
                             "carve_notes": (carve_bid_record or {}).get("notes", ""),
                             "winner_notes": (winner_bid_record or {}).get("notes", ""),
@@ -3893,6 +3918,7 @@ def compute_consolidation_analysis(included_keys=None, carve_threshold: float = 
             "n_suppliers": len(suppliers),
             "n_items": n_items,
             "carve_out_threshold_pct": carve_threshold * 100.0,
+            "carve_out_threshold_dollar": carve_threshold_dollar,
         },
     }
 
@@ -5113,6 +5139,7 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
     consolidate_supplier = parameters.get("supplier") if strategy == "consolidate_to" else None
     incumbent_threshold = parameters.get("incumbent_keep_threshold_pct", th["min_savings_pct_to_switch"])
     carve_threshold = parameters.get("carve_threshold", th["carve_out_min_savings_pct"])
+    carve_threshold_dollar = parameters.get("carve_threshold_dollar", th["carve_out_min_savings_annual_dollar"])
     exclude_uom = parameters.get("exclude_uom_disc", strategy == "lowest_qualified")
     exclude_subs = parameters.get("exclude_substitutes", strategy == "lowest_qualified")
 
@@ -5254,12 +5281,22 @@ def _evaluate_scenario(strategy: str, parameters: dict, overrides: dict, include
                     decision = f"INCUMBENT_KEPT (savings to switch < {incumbent_threshold*100:.0f}%)"
 
         elif strategy == "consolidate_to" and consolidate_supplier:
-            # Default to consolidate winner unless another supplier saves >= carve_threshold
+            # Default to consolidate winner unless another supplier saves enough
+            # to justify a carve. OR-logic — fires when EITHER pct savings is
+            # structural (>=carve_threshold) OR annual $ savings clears the
+            # absolute floor (>=carve_threshold_dollar). Mirrors the rule in
+            # compute_consolidation_analysis so the headline analysis and the
+            # saved-scenario evaluation never disagree.
             target_bid = next((c for c in candidates if c[0] == consolidate_supplier), None)
             if target_bid:
                 target_price = target_bid[1]
-                if chosen_price < target_price * (1 - carve_threshold):
-                    decision = f"CARVE: {chosen_sup} saves {((target_price-chosen_price)/target_price*100):.0f}% vs {consolidate_supplier}"
+                pct_savings = (target_price - chosen_price) / target_price if target_price else 0.0
+                annual_savings = (target_price - chosen_price) * (qty / 2.0) if qty else 0.0
+                fires_pct = pct_savings >= carve_threshold
+                fires_dollar = annual_savings >= carve_threshold_dollar
+                if fires_pct or fires_dollar:
+                    rule = "BOTH" if (fires_pct and fires_dollar) else ("PCT" if fires_pct else "DOLLAR")
+                    decision = f"CARVE[{rule}]: {chosen_sup} saves {pct_savings*100:.0f}% / ${annual_savings:,.0f}/yr vs {consolidate_supplier}"
                     n_carved += 1
                 else:
                     chosen_sup, chosen_price, chosen_status = target_bid
