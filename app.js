@@ -5059,21 +5059,47 @@ ${pyFn}(_item_num_in, _note_in)
 
 // ----- Economic / tariff / commodity events overlay -----
 //
-// A static list of events that overlay the per-item history chart as
-// vertical date markers + labels. Each event has a category so the analyst
-// can filter (toggle TARIFF / COMMODITY / ECONOMIC chips on/off). The list
-// is intentionally short and editable — replace with your org's actual
-// event ledger or wire to a JSON file when ready. Companion app
-// (tariff-impact) carries its own canonical list; this is the lite version
-// that ships in this app for the chart overlay.
+// Verified, public, MRO-relevant events that overlay the per-item history
+// chart as vertical date markers + labels. Each event has a category so
+// the analyst can filter (toggle TARIFF / COMMODITY / ECONOMIC on/off).
+// Sources: USTR press releases, White House fact sheets, Federal Register
+// notices, LME / FRED / FRB statements; cross-checked against major-outlet
+// reporting (CSIS, Tax Foundation, NPR, Reuters, Bloomberg, MINING.COM,
+// White & Case / Dorsey / Buchanan client alerts).
+//
+// Only known, verifiable events are listed. We can wire this to a JSON
+// feed (or pull from the tariff-impact sibling app) for live updates
+// during the integration sprint.
 const _CHART_EVENTS = [
-  // Examples — replace / extend with the real event timeline
-  {date: "2025-04-09", category: "TARIFF", label: "Section 301 tariff +10% (illustrative)", description: "Tariff schedule update increasing duties on selected industrial imports. Replace with real event when known."},
-  {date: "2024-11-01", category: "TARIFF", label: "Tariff schedule revision (illustrative)", description: "Adjustment to industrial-goods duty rates. Replace with real event."},
-  {date: "2024-08-15", category: "COMMODITY", label: "Aluminum supply tightening (illustrative)", description: "Supply-side pressure on aluminum stock; expect upstream cost pass-through. Replace with real event."},
-  {date: "2024-04-15", category: "COMMODITY", label: "Copper price spike (illustrative)", description: "Major copper price spike on supply concerns; affects motor / wiring / fastener costs. Replace with real event."},
-  {date: "2023-08-01", category: "ECONOMIC", label: "Fed rate hike cycle peak (illustrative)", description: "Macro tightening; pricing pressure in capital-intensive supplier categories. Replace with real event."},
-  {date: "2022-03-01", category: "ECONOMIC", label: "Inflation surge (illustrative)", description: "Broad-based PPI inflation; widespread mid-cycle supplier pass-through. Replace with real event."},
+  // ---- TARIFF ----
+  {date: "2018-03-23", category: "TARIFF", label: "Section 232 steel (25%) + aluminum (10%) tariffs take effect", description: "First Trump administration imposes Section 232 national-security tariffs on steel and aluminum imports. Initial broad scope with country-by-country exemptions negotiated subsequently."},
+  {date: "2018-07-06", category: "TARIFF", label: "Section 301 List 1 — China tariffs 25% on $34B take effect", description: "First tranche of Section 301 tariffs targeting Chinese industrial goods (industrial machinery, electrical equipment, instruments)."},
+  {date: "2018-09-24", category: "TARIFF", label: "Section 301 List 3 — 10% on $200B Chinese imports", description: "Third and largest tranche of Section 301 tariffs. Initial rate 10%, subsequently raised to 25% in May 2019."},
+  {date: "2019-05-10", category: "TARIFF", label: "Section 301 List 3 raised 10% → 25%", description: "Trump administration raised List 3 tariffs from 10% to 25% during stalled trade negotiations with China."},
+  {date: "2020-01-15", category: "TARIFF", label: "US-China Phase One trade deal signed", description: "Phase One agreement signed; List 4A tariffs reduced from 15% to 7.5%; List 4B suspended. China commits to additional US imports."},
+  {date: "2024-05-14", category: "TARIFF", label: "Biden announces Section 301 review tariff increases (proposed)", description: "USTR proposes increases on EVs (to 100%), batteries, semiconductors, steel/aluminum from China (to 25%), critical minerals, and medical equipment following the statutory four-year review."},
+  {date: "2024-09-13", category: "TARIFF", label: "USTR finalizes Section 301 tariff increases", description: "Final rule published after public comment period. All proposed increases adopted; effective dates staggered through 2024-2026."},
+  {date: "2024-09-27", category: "TARIFF", label: "Most Section 301 increases take effect", description: "Steel/aluminum from China to 25%, EVs to 100%, batteries 25%, syringes/needles 50%. Some categories deferred to Jan 2025 / Jan 2026."},
+  {date: "2025-03-12", category: "TARIFF", label: "Section 232 steel + aluminum 25% — all countries, no exemptions", description: "Trump second-term proclamation ends all country exemptions and General Approved Exclusions. Aluminum raised from 10% to 25%; coverage expanded to additional downstream products."},
+  {date: "2025-04-02", category: "TARIFF", label: "\"Liberation Day\" — reciprocal tariffs announced (EO 14257)", description: "Executive Order 14257: 10% baseline tariff on nearly all countries plus higher country-specific reciprocal rates (China 34%, EU 20%, Japan 24%, etc.). Largest unilateral tariff action in decades."},
+  {date: "2025-04-05", category: "TARIFF", label: "10% baseline reciprocal tariff takes effect", description: "Universal 10% baseline tariff component of EO 14257 implemented."},
+  {date: "2025-04-09", category: "TARIFF", label: "Country-specific reciprocal rates take effect; 90-day pause for non-China", description: "Higher country-specific rates implemented at 12:01 AM. Same day, after market sell-off, Trump announces 90-day pause for all countries except China; China rates escalate further."},
+  {date: "2025-04-10", category: "TARIFF", label: "Effective China tariff confirmed at 145%", description: "White House clarifies cumulative China tariff rate is 145% (combining IEEPA fentanyl tariffs plus reciprocal increases)."},
+  {date: "2025-05-14", category: "TARIFF", label: "US-China 90-day tariff de-escalation agreement", description: "Negotiated reduction: US tariffs on Chinese goods drop from 145% to 30%; China tariffs on US goods drop from 125% to 10% for an initial 90-day period."},
+  {date: "2025-06-04", category: "TARIFF", label: "Section 232 steel + aluminum doubled to 50%", description: "Trump proclamation increases Section 232 duties from 25% to 50% for all countries except UK (which remains at 25%). Effective 12:01 AM EDT."},
+
+  // ---- COMMODITY ----
+  {date: "2020-04-20", category: "COMMODITY", label: "WTI crude oil futures settle negative (first time)", description: "May WTI futures contract settles at -$37.63/barrel as COVID-driven demand collapse meets full storage capacity. Single-day extreme; physical oil quickly recovered."},
+  {date: "2022-03-08", category: "COMMODITY", label: "LME suspends nickel trading — short squeeze", description: "London Metal Exchange suspends nickel trading after a Chinese trader's short position triggers a >100% intraday spike. Trades cancelled; market closed for over a week. Major signal for stainless-steel and battery-input pricing."},
+  {date: "2024-05-20", category: "COMMODITY", label: "LME copper hits all-time high $11,104/ton", description: "Copper sets new all-time high amid supply concerns and AI/grid-related demand expectations. Pressure on motor, wiring, fastener, and electrical equipment categories."},
+
+  // ---- ECONOMIC ----
+  {date: "2020-03-15", category: "ECONOMIC", label: "Fed emergency cut to 0-0.25% + QE restart", description: "COVID response: Federal Reserve cuts policy rate to near zero in an emergency Sunday move and announces $700B quantitative easing. Beginning of pandemic-era easy money era."},
+  {date: "2022-03-16", category: "ECONOMIC", label: "Fed begins rate-hiking cycle (first 25 bps since 2018)", description: "Fed lifts policy rate from near zero with first hike of post-COVID tightening cycle. Marks pivot from easy money to inflation fight."},
+  {date: "2022-06-15", category: "ECONOMIC", label: "Fed 75 bps hike — first since 1994; cycle accelerates", description: "Federal Reserve raises rates by 75 bps for first time in 28 years as CPI hits 9.1% in June reading. Procurement-relevant: capital-intensive suppliers face rapidly rising financing costs."},
+  {date: "2023-03-10", category: "ECONOMIC", label: "Silicon Valley Bank fails", description: "SVB collapse triggers regional banking crisis. Procurement signal: smaller / privately-held suppliers in tech/industrial corridors face credit access pressure."},
+  {date: "2023-07-26", category: "ECONOMIC", label: "Fed reaches 5.25-5.50% — final hike of cycle", description: "Federal Reserve final rate increase of post-COVID tightening cycle, holding 5.25-5.50% range for ~14 months. Peak financing cost environment for suppliers."},
+  {date: "2024-09-18", category: "ECONOMIC", label: "Fed begins rate-cutting cycle (50 bps)", description: "First rate cut of new easing cycle, larger than market expected. Procurement signal: financing pressure on suppliers begins to ease; some price hikes from peak-rate era may begin to soften."},
 ];
 const _EVENT_CATEGORY_COLORS = {
   TARIFF:    "var(--red)",
