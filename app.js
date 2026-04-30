@@ -5135,15 +5135,24 @@ function _renderEventFilters() {
 function _renderEventsTable() {
   const el = document.getElementById('im-events-table');
   if (!el) return;
+  // Sticky header row inside the events panel: title + active-filter recap
+  // + a clear ✕ HIDE button. Clicking the button hides the table AND syncs
+  // the EVENTS toggle in the chart header so they don't get out of sync.
+  const closeHeader = `<div style="position:sticky;top:0;background:var(--bg-2);border-bottom:1px solid var(--line);padding:8px 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;z-index:1;">
+    <span style="font-family:var(--mono);font-size:10px;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;font-weight:600;">Economic events overlay</span>
+    <button id="im-events-hide-inline" type="button" title="Hide the events table. The vertical lines remain on the chart; show this list again any time via the EVENTS button in the chart header." style="background:transparent;border:1px solid var(--line);color:var(--ink-2);font-family:var(--mono);font-size:10px;padding:3px 8px;border-radius:3px;cursor:pointer;letter-spacing:0.06em;">✕ HIDE</button>
+  </div>`;
   const visibleEvents = _CHART_EVENTS.filter(e => _chartEventFilter[e.category]);
   if (!visibleEvents.length) {
-    el.innerHTML = '<div style="padding:14px;color:var(--ink-2);font-family:var(--mono);font-size:11px;text-align:center;">No events visible — toggle a category filter on.</div>';
+    el.innerHTML = closeHeader + '<div style="padding:14px;color:var(--ink-2);font-family:var(--mono);font-size:11px;text-align:center;">No events visible — toggle a category filter on.</div>';
+    _wireEventsHideBtn();
     return;
   }
   // Sort by date desc
   const sorted = [...visibleEvents].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-  let html = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono);">';
-  html += '<thead style="background:var(--bg-1);position:sticky;top:0;"><tr>';
+  let html = closeHeader;
+  html += '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono);">';
+  html += '<thead style="background:var(--bg-1);position:sticky;top:32px;"><tr>';
   html += '<th style="padding:6px 10px;text-align:left;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;font-weight:600;width:90px;">Date</th>';
   html += '<th style="padding:6px 10px;text-align:left;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;font-weight:600;width:90px;">Category</th>';
   html += '<th style="padding:6px 10px;text-align:left;color:var(--ink-2);text-transform:uppercase;letter-spacing:0.10em;font-weight:600;">Event</th>';
@@ -5158,6 +5167,20 @@ function _renderEventsTable() {
   }
   html += '</tbody></table>';
   el.innerHTML = html;
+  _wireEventsHideBtn();
+}
+
+function _wireEventsHideBtn() {
+  const btn = document.getElementById('im-events-hide-inline');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const tbl = document.getElementById('im-events-table');
+    if (tbl) tbl.hidden = true;
+    // Sync the chart-header EVENTS toggle button label so the two paths
+    // stay coherent
+    const headerBtn = document.getElementById('im-events-toggle');
+    if (headerBtn) headerBtn.textContent = 'EVENTS ▾';
+  });
 }
 
 function _enterChartFullscreen() {
