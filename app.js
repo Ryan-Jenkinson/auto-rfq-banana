@@ -1303,30 +1303,49 @@ function _renderCharts() {
 }
 
 function _drawTopBars() {
+  // Polished top-15 chart (#5 + #6):
+  //   - Label format: "<truncated description> · <part #>" — Coupa-style
+  //     leading, with the part number as a smaller dim suffix. The bare
+  //     part number alone meant nothing to most analysts.
+  //   - Visual: amber→deep-amber gradient fill (was flat amber); subtle
+  //     rounded right edge; thin baseline rule for visual anchoring;
+  //     value text uses tabular figures and stays mono. Bars proportionally
+  //     scaled with a min-width floor so #15 isn't invisible when #1
+  //     dominates.
   const svg = $('chart-top');
   if (!svg || !_rfqResult) return;
   const top = [..._rfqResult.items].sort((a, b) => (b.spend_24mo || 0) - (a.spend_24mo || 0)).slice(0, 15);
-  const W = svg.clientWidth || 500, H = 240;
+  const W = svg.clientWidth || 500, H = 280;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-  const padL = 110, padR = 12, padT = 10, padB = 24;
+  const padL = 240, padR = 80, padT = 8, padB = 20;
   const innerW = W - padL - padR, innerH = H - padT - padB;
   const max = Math.max(1, ...top.map(it => it.spend_24mo || 0));
-  let s = '';
-  const barH = innerH / Math.max(1, top.length) - 3;
-  // Each bar is wrapped in a <g data-bar-item="..."> so a delegated click
-  // handler below can route bar/label clicks to _openItemHistory. Hover
-  // cue: subtle accent fill so the user knows the bar is interactive.
+  const minBarPx = 4; // floor so #15 is visible
+  let defs = `<defs>
+    <linearGradient id="topbar-grad" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="var(--accent-deep)" stop-opacity="0.85"/>
+    </linearGradient>
+  </defs>`;
+  let s = defs;
+  const barH = innerH / Math.max(1, top.length) - 4;
+  // Subtle baseline rule
+  s += `<line x1="${padL}" x2="${padL}" y1="${padT}" y2="${padT + innerH}" stroke="var(--line)" stroke-width="1"/>`;
   top.forEach((it, i) => {
-    const w = (it.spend_24mo || 0) / max * innerW;
-    const y = padT + i * (barH + 3);
-    const lbl = _truncate(it.item_num, 14);
-    s += `<g class="top-bar-row" data-bar-item="${_escapeHtml(it.item_num)}" style="cursor:pointer;">`;
-    // Invisible full-row hit-box so the label text is also clickable.
+    const rawW = (it.spend_24mo || 0) / max * innerW;
+    const w = Math.max(minBarPx, rawW);
+    const y = padT + i * (barH + 4);
+    const desc = _truncate(it.description || '', 28);
+    const part = it.item_num || '';
+    s += `<g class="top-bar-row" data-bar-item="${_escapeHtml(part)}" style="cursor:pointer;">`;
     s += `<rect x="0" y="${y}" width="${W}" height="${barH.toFixed(1)}" fill="transparent" pointer-events="all"/>`;
-    s += `<rect class="bar" x="${padL}" y="${y}" width="${w.toFixed(1)}" height="${barH.toFixed(1)}" rx="2"/>`;
-    s += `<text x="${padL - 6}" y="${y + barH / 2 + 3}" text-anchor="end" font-size="10" fill="var(--ink-1)" font-family="var(--mono)">${_escapeHtml(lbl)}</text>`;
-    s += `<text x="${padL + w + 4}" y="${y + barH / 2 + 3}" font-size="10" fill="var(--ink-2)" font-family="var(--mono)">$${Math.round(it.spend_24mo || 0).toLocaleString()}</text>`;
-    s += `<title>${_escapeHtml(it.item_num)} — $${Math.round(it.spend_24mo || 0).toLocaleString()} 24-mo · click to drill in</title>`;
+    // Bar with gradient fill
+    s += `<rect class="bar" x="${padL + 0.5}" y="${y}" width="${w.toFixed(1)}" height="${barH.toFixed(1)}" rx="2" fill="url(#topbar-grad)"/>`;
+    // Two-part label: description (ink-0, primary) then part # (ink-2, smaller suffix)
+    s += `<text x="${padL - 8}" y="${y + barH / 2 + 3.5}" text-anchor="end" font-size="11" fill="var(--ink-0)" font-family="var(--ui)">${_escapeHtml(desc)}<tspan font-size="9" fill="var(--ink-2)" font-family="var(--mono)" dx="6">${_escapeHtml(part)}</tspan></text>`;
+    // Value text
+    s += `<text x="${padL + w + 6}" y="${y + barH / 2 + 3.5}" font-size="11" fill="var(--accent)" font-family="var(--mono)" font-weight="600">$${Math.round(it.spend_24mo || 0).toLocaleString()}</text>`;
+    s += `<title>${_escapeHtml(part)} — ${_escapeHtml(it.description || '')} — $${Math.round(it.spend_24mo || 0).toLocaleString()} 24-mo · click to drill in</title>`;
     s += `</g>`;
   });
   svg.innerHTML = s;
@@ -1345,15 +1364,32 @@ function _drawAnnualBars() {
   const innerW = W - padL - padR, innerH = H - padT - padB;
   if (!series.length) { svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--ink-2)">no data</text>`; return; }
   const max = Math.max(1, ...series.map(d => d.spend));
-  const bw = innerW / series.length - 6;
-  let s = '';
+  const bw = innerW / series.length - 10;
+  // Polished annual chart (#5):
+  //   - Vertical gradient fill (amber top → deep at base) for visual depth
+  //   - Subtle baseline rule + 25%/50%/75% dotted gridlines
+  //   - Value text bolded amber; year tick muted
+  let defs = `<defs>
+    <linearGradient id="annualbar-grad" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="var(--accent-deep)" stop-opacity="0.65"/>
+    </linearGradient>
+  </defs>`;
+  let s = defs;
+  // Gridlines (25 / 50 / 75% of max)
+  for (const frac of [0.25, 0.5, 0.75]) {
+    const yy = padT + innerH - (frac * innerH);
+    s += `<line x1="${padL}" x2="${W - padR}" y1="${yy}" y2="${yy}" stroke="var(--line)" stroke-width="1" stroke-dasharray="3 4" opacity="0.5"/>`;
+  }
+  // Baseline
+  s += `<line x1="${padL}" x2="${W - padR}" y1="${padT + innerH}" y2="${padT + innerH}" stroke="var(--line)" stroke-width="1"/>`;
   series.forEach((d, i) => {
     const h = d.spend / max * innerH;
-    const x = padL + i * (bw + 6);
+    const x = padL + i * (bw + 10) + 5;
     const y = padT + (innerH - h);
-    s += `<rect class="bar" x="${x}" y="${y}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2"/>`;
-    s += `<text x="${x + bw/2}" y="${H - 8}" text-anchor="middle" font-size="10" fill="var(--ink-2)" font-family="var(--mono)">${d.year}</text>`;
-    s += `<text x="${x + bw/2}" y="${y - 4}" text-anchor="middle" font-size="10" fill="var(--ink-1)" font-family="var(--mono)">$${(d.spend / 1000).toFixed(0)}k</text>`;
+    s += `<rect class="bar" x="${x}" y="${y}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="url(#annualbar-grad)"/>`;
+    s += `<text x="${x + bw/2}" y="${H - 6}" text-anchor="middle" font-size="11" fill="var(--ink-2)" font-family="var(--mono)" letter-spacing="0.04em">${d.year}</text>`;
+    s += `<text x="${x + bw/2}" y="${y - 6}" text-anchor="middle" font-size="11" fill="var(--accent)" font-family="var(--mono)" font-weight="600">$${(d.spend / 1000).toFixed(0)}k</text>`;
   });
   svg.innerHTML = s;
 }
