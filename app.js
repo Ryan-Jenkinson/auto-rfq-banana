@@ -1435,6 +1435,8 @@ $('gen-outbound-rfq').addEventListener('click', async () => {
   const btn = $('gen-outbound-rfq');
   btn.disabled = true;
   const orig = btn.textContent;
+  const saved = [];
+  const skipped = [];
   try {
     for (const sup of suppliers) {
       btn.textContent = `Building ${sup}…`;
@@ -1452,11 +1454,48 @@ base64.b64encode(_b).decode('ascii')
 `);
       const bytes = Uint8Array.from(atob(xlsxB64), c => c.charCodeAt(0));
       const safeSup = sup.replace(/[^a-zA-Z0-9_-]/g, '_');
-      await _saveFile(`${rfqId}_${safeSup}.xlsx`, bytes);
+      btn.textContent = `Pick save location for ${sup}…`;
+      const result = await _saveFile(`${rfqId}_${safeSup}.xlsx`, bytes);
+      if (result) {
+        saved.push({ supplier: sup, path: result });
+        console.log(`[outbound RFQ] saved ${sup} → ${result}`);
+      } else {
+        // User canceled the dialog (or save failed). Don't silently
+        // power through the remaining suppliers — confirm intent.
+        const choice = confirm(
+          `Save was canceled or failed for "${sup}".\n\n` +
+          `${saved.length} of ${suppliers.length} files saved so far.\n` +
+          `${suppliers.length - saved.length - 1} remaining.\n\n` +
+          `Continue with the next supplier?`
+        );
+        skipped.push(sup);
+        if (!choice) {
+          btn.textContent = orig;
+          btn.disabled = false;
+          // Report partial status so the analyst knows the state.
+          alert(
+            `Stopped after ${saved.length} saved, ${skipped.length} skipped.\n\n` +
+            (saved.length
+              ? `Saved:\n  ` + saved.map(s => `${s.supplier} → ${s.path}`).join('\n  ')
+              : 'No files were saved.')
+          );
+          return;
+        }
+      }
       // Stagger downloads slightly so the browser doesn't choke
       await new Promise(r => setTimeout(r, 300));
     }
-    btn.textContent = `✓ Sent ${suppliers.length} files`;
+    if (saved.length === suppliers.length) {
+      btn.textContent = `✓ Sent ${suppliers.length} files`;
+    } else {
+      btn.textContent = `${saved.length}/${suppliers.length} saved`;
+      // Make sure the user sees the partial status — alert + console.
+      alert(
+        `${saved.length} of ${suppliers.length} outbound RFQ files saved.\n` +
+        (skipped.length ? `\nSkipped: ${skipped.join(', ')}\n` : '') +
+        `\nSaved files:\n  ` + saved.map(s => `${s.supplier} → ${s.path}`).join('\n  ')
+      );
+    }
     setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2500);
   } catch (err) {
     console.error('[outbound RFQ]', err);
@@ -1905,6 +1944,25 @@ else:
 json.dumps(result, default=str)
 `);
     const parsed = JSON.parse(out);
+    // Loud failure if the bid file isn't recognized. Without this the
+    // file gets stored with an empty bids array + an error string in
+    // the intake card, which is easy to miss when the next supplier's
+    // file is dropped on top. Explicit alert + skip-store keeps the
+    // analyst from believing a non-template file was ingested.
+    if (parsed && parsed.error && (!parsed.bids || !parsed.bids.length)) {
+      console.error('[bid intake] parse returned error', parsed);
+      alert(
+        `Could not parse "${file.name}" as a supplier bid.\n\n` +
+        `Reason: ${parsed.error}\n\n` +
+        `The auto-detector looks for our template's header pattern ` +
+        `(Item # / Description / Last $/ea / Quote Price columns around row 7). ` +
+        `If the supplier sent back their own format, ask them to fill in the ` +
+        `outbound RFQ template you generated in Step 3 instead.\n\n` +
+        `(Manual column-mapping for native formats is on the roadmap — ` +
+        `tracked in flexible-bid-intake branch.)`
+      );
+      return;
+    }
     if (parsed.routed_via && parsed.routed_via.startsWith('round_') && parsed.routed_via !== 'round_1' && parsed.routed_via !== 'round_1_fallback_after_round_sniff') {
       // Round-N overwrite path — surface the result via a focused toast
       // (we don't replace _loadedBids since R2 is an overwrite, not a

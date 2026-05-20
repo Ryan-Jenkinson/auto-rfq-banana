@@ -141,7 +141,12 @@ def main() -> None:
         text_select=True,
         js_api=api,
     )
-    webview.start(debug=False, http_server=False)
+    # private_mode=False so localStorage persists across launches. The
+    # app stores saved scenarios, item locks, per-supplier saved bid
+    # mappings, and analyst preferences in localStorage. Without this
+    # flag pywebview defaults to an ephemeral webview profile that
+    # wipes all of that every relaunch.
+    webview.start(debug=False, http_server=False, private_mode=False)
 
 
 if __name__ == "__main__":
